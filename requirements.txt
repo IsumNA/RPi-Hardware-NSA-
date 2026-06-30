@@ -1,0 +1,15 @@
+# NSA Optimization Stack - prototype demo dependencies
+# Tested on Python 3.13 (CPU only)
+
+numpy>=2.0
+scipy>=1.11
+opencv-python>=4.8
+matplotlib>=3.8
+PyYAML>=6.0
+rich>=13.0
+torch>=2.2
+onnx>=1.15
+
+# Optional: enables running inference directly from the exported .onnx graph.
+# The demo falls back to the live torch runtime if this is not installed.
+# onnxruntime>=1.17

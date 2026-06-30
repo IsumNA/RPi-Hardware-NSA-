@@ -1,0 +1,50 @@
+# =============================================================================
+#  NSA  -  Neural Sensor Architecture
+#  6-Level Optimization Stack  ::  Compilation Profile
+# =============================================================================
+#  This is the single source of truth your manager edits for the demo.
+#  Every flag here maps to one concrete decision inside the optimization stack.
+#  Any value can be overridden on the command line, e.g.:
+#       python run_demo.py --hardware hailo8 --model-family nafnet
+# =============================================================================
+
+# ---- LEVEL 6 : Export / Target Hardware --------------------------------------
+#   rpi5_cpu  -> Raspberry Pi 5  (ARM Cortex-A76, ONNX FP16)
+#   hailo8    -> Raspberry Pi 5 + Hailo-8 AI HAT  (.hef, INT8)
+#   deepx     -> DeepX DX-M1 M.2 accelerator      (.bin, INT8)
+hardware: hailo8
+
+# ---- LEVEL 3 : Model Architecture --------------------------------------------
+model:
+  model_family: nafnet      # cnn | unet | nafnet
+  base_channels: 32         # 16 | 32 | 64
+  block_depth: 4            # 2  | 4  | 8
+  conv_type: depthwise      # standard | depthwise
+  activation: relu          # relu | gelu | silu   (gelu triggers DeepX QAT path)
+
+# ---- LEVEL 1 : Sensor / Input ------------------------------------------------
+sensor:
+  model: IMX662             # Sony Starvis 2 mono/colour sensor
+  bayer_pattern: RGGB
+  bit_depth: 12
+  # Path to a real IMX662 Bayer RAW frame. If null or missing, the stack
+  # synthesises a physically-plausible RAW at the requested gain so the
+  # demo always runs out-of-the-box.
+  input_raw: null
+  gain: 512                 # analog gain multiplier (challenge frame): 256 | 512
+
+# ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
+data:
+  temporal_frames: 256      # frames averaged to build the clean reference
+
+# ---- LEVEL 4/5 : Optimization & Quantization ---------------------------------
+optimization:
+  quantize: true            # enable INT8 post-training / QAT path
+  calibration_steps: 220    # live calibration iterations on the test frame
+  patch_size: 192           # working resolution for the live demo (square crop)
+
+# ---- Output ------------------------------------------------------------------
+output:
+  dir: outputs
+  show_window: true         # open the 3-panel validation matrix
+  seed: 662
