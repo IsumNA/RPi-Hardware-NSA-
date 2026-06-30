@@ -282,7 +282,10 @@ def main() -> int:
     # ===========================================================================
     # OUTPUT 4 - PARETO FITNESS REPORT
     # ===========================================================================
-    fit = compute_fitness(final_psnr, latency_ms, quant_drop)
+    fit = compute_fitness(final_psnr, latency_ms, quant_drop,
+                          weight_kb=info["total_bytes"] / 1024.0,
+                          act_kb=result.est_sram_kb,
+                          sram_budget_kb=result.sram_budget_kb)
     profile = (f"{cfg.model.model_family.upper()} · {cfg.model.base_channels}ch × "
                f"{cfg.model.block_depth} · {cfg.model.conv_type} · "
                f"{cfg.model.activation} · {meta['precision']}")
