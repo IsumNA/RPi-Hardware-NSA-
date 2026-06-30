@@ -27,7 +27,7 @@ import torch
 from rich.progress import (BarColumn, Progress, TextColumn, TimeElapsedColumn)
 
 from nsa import __version__
-from nsa.compiler import compile_stack
+from nsa.compiler import assess_targets, compile_stack
 from nsa.config import apply_overrides, build_parser, load_config, ConfigError
 from nsa.export import export_onnx, write_device_artifact
 from nsa.inference import (calibrate, calibrate_multi, estimate_device_latency_ms,
@@ -36,7 +36,7 @@ from nsa.models import build_model, count_params
 from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
                         list_frames)
 from nsa.sensors import get_sensor
-from nsa.report import compute_fitness, print_report
+from nsa.report import compute_fitness, print_report, print_target_suitability
 from nsa.theme import (RPI_GREEN, banner, console, kv_table, level_rule, log,
                        pause)
 from nsa.visualize import render_panel
@@ -338,6 +338,11 @@ def main() -> int:
                f"{cfg.model.activation} · {meta['precision']}")
     print_report(fit, cfg.hardware_name, profile)
 
+    # Cross-chip suitability: will this exact model run on each Pi-class target?
+    assessments = assess_targets(cfg, model, cfg.optimization.quantize,
+                                 chosen=cfg.hardware)
+    print_target_suitability(assessments, chosen=cfg.hardware)
+
     # Machine-readable summary so the GUI can render a rich results screen.
     summary = {
         "hardware": cfg.hardware,
@@ -378,6 +383,19 @@ def main() -> int:
         "fitness": fit.score,
         "grade": fit.grade,
         "warnings": result.warnings,
+        "targets": [
+            {
+                "key": a.key, "label": a.label, "precision": a.precision,
+                "format": a.format, "verdict": a.verdict,
+                "act_kb": round(a.act_kb, 0), "budget_kb": a.budget_kb,
+                "mem_frac": round(a.mem_frac, 4), "tiled": a.tiled,
+                "fits": a.fits, "fps": round(a.fps, 1),
+                "latency_ms": round(a.latency_ms, 1),
+                "act_native": a.act_native, "notes": a.notes,
+                "selected": a.key == cfg.hardware,
+            }
+            for a in assessments
+        ],
         "panel": str((out_dir / "validation_panel.png").resolve()),
         "artifacts": [str((out_dir / f).resolve()) for f in (
             "exported_model.onnx", f"hardware_ready{cfg.artifact_ext}",

@@ -60,15 +60,21 @@ class CompileResult:
         return self.tiled or self.est_sram_kb <= self.sram_budget_kb
 
 
-def _estimate_sram_kb(cfg: Config) -> float:
-    """Rough activation+weight footprint for the working patch, in KB."""
+def _estimate_sram_kb(cfg: Config, bytes_per: int | None = None) -> float:
+    """Rough activation+weight footprint for the working patch, in KB.
+
+    ``bytes_per`` overrides the per-element size (1 = INT8, 2 = FP16); when None
+    it follows the configured target. This lets us re-cost the same model for a
+    different chip's precision when assessing cross-target suitability.
+    """
     m = cfg.optimization
     mc = cfg.model
     px = m.patch_size * m.patch_size
     act = px * mc.base_channels * (mc.block_depth + 2)        # activation tensors
     weights = (mc.base_channels ** 2) * 9 * mc.block_depth     # 3x3 conv weights
     depthwise_factor = 0.45 if mc.conv_type == "depthwise" else 1.0
-    bytes_per = 1 if cfg.uses_accelerator else 2               # int8 vs fp16
+    if bytes_per is None:
+        bytes_per = 1 if cfg.uses_accelerator else 2          # int8 vs fp16
     return (act * bytes_per + weights * depthwise_factor * bytes_per) / 1024.0
 
 
@@ -177,3 +183,98 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
     res.passes.append(f"export:{caps['format']}")
     pause(0.2)
     return res
+
+
+# -- Cross-target suitability --------------------------------------------------
+@dataclass
+class TargetAssessment:
+    """Whether the chosen model is suitable to run on a given chip."""
+    key: str
+    label: str
+    precision: str
+    format: str
+    act_kb: float
+    budget_kb: float
+    fits: bool                # fits on-chip memory (after tiling, if applicable)
+    tiled: bool
+    mem_frac: float           # peak activation / budget (pre-tiling)
+    latency_ms: float
+    fps: float
+    act_native: bool
+    verdict: str              # "SUITABLE" | "CAVEATS" | "UNSUITABLE"
+    notes: list[str] = field(default_factory=list)
+
+
+_ACCELERATORS = ("hailo8", "deepx")
+
+
+def assess_targets(cfg: Config, model, quantize_enabled: bool,
+                   chosen: str | None = None) -> list[TargetAssessment]:
+    """Score the trained model against every Raspberry Pi-class target chip.
+
+    Looks at each chip's spec (precision, native ops, on-chip SRAM budget, the
+    compute/latency model) and returns a per-chip verdict so the operator can
+    see which silicon this exact network is suitable to deploy on.
+    """
+    # Local import keeps the compiler importable without torch present.
+    from .inference import estimate_device_latency_ms
+
+    patch = cfg.optimization.patch_size
+    out: list[TargetAssessment] = []
+    for key, caps in CAPS.items():
+        accel = key in _ACCELERATORS
+        bytes_per = 1 if accel else 2
+        act_kb = _estimate_sram_kb(cfg, bytes_per=bytes_per)
+        budget = float(caps["sram_kb"])
+        mem_frac = act_kb / budget if budget else 0.0
+        notes: list[str] = []
+
+        tiled = False
+        fits = act_kb <= budget
+        if not fits and accel:
+            tiled = True           # accelerators can spill to 2x2 spatial tiles
+            fits = True
+            notes.append("needs 2×2 spatial tiling to fit on-chip SRAM")
+        elif not fits:
+            notes.append("working set exceeds memory budget")
+
+        act_native = cfg.model.activation in caps["native_acts"]
+        if not act_native:
+            notes.append(f"'{cfg.model.activation}' not native → "
+                         f"PWL/QAT approximation")
+
+        quantized = accel and quantize_enabled
+        if accel and not quantize_enabled:
+            notes.append("INT8-only NPU but quantization is disabled")
+
+        if cfg.model.model_family == "unet" and accel:
+            notes.append("U-Net ConvTranspose rewritten to resize+conv")
+
+        latency = estimate_device_latency_ms(model, patch, key, quantized)
+        fps = 1000.0 / max(latency, 1e-6)
+
+        # -- verdict ---------------------------------------------------------
+        verdict = "SUITABLE"
+        if not fits or (accel and not quantize_enabled):
+            verdict = "UNSUITABLE"
+        elif tiled or not act_native or (cfg.model.model_family == "unet" and accel):
+            verdict = "CAVEATS"
+        if fps < 5.0:
+            notes.append(f"~{fps:.0f} FPS — well below real-time")
+            verdict = "UNSUITABLE" if verdict == "UNSUITABLE" else "CAVEATS"
+        elif fps < 15.0:
+            notes.append(f"~{fps:.0f} FPS — sub-real-time")
+            if verdict == "SUITABLE":
+                verdict = "CAVEATS"
+
+        out.append(TargetAssessment(
+            key=key, label=caps["label"], precision=caps["precision"].upper(),
+            format=caps["format"], act_kb=act_kb, budget_kb=budget, fits=fits,
+            tiled=tiled, mem_frac=mem_frac, latency_ms=latency, fps=fps,
+            act_native=act_native, verdict=verdict, notes=notes,
+        ))
+
+    # Put the chosen target first so the report reads naturally.
+    if chosen:
+        out.sort(key=lambda a: (a.key != chosen, a.key))
+    return out

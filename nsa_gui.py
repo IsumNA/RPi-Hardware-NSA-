@@ -1277,6 +1277,49 @@ class App(tk.Tk):
             tk.Label(inner, text=sub, bg=FIELD, fg=SUBTLE,
                      font=font(8)).pack(anchor="w")
 
+    def _target_card(self, parent, t):
+        """One per-chip suitability row in the results screen."""
+        verdict = t.get("verdict", "")
+        vcol, vtxt = {
+            "SUITABLE": (GREEN, "✓  SUITABLE"),
+            "CAVEATS": ("#C98A1B", "▲  WITH CAVEATS"),
+            "UNSUITABLE": (RASPBERRY, "✗  NOT RECOMMENDED"),
+        }.get(verdict, (INK, verdict))
+        selected = t.get("selected")
+        bg = "#FCEEF2" if selected else FIELD
+
+        card = tk.Frame(parent, bg=bg, highlightthickness=(2 if selected else 0),
+                        highlightbackground=RASPBERRY, highlightcolor=RASPBERRY)
+        card.pack(fill="x", pady=S(4))
+        inner = tk.Frame(card, bg=bg)
+        inner.pack(fill="x", padx=S(12), pady=S(8))
+        inner.columnconfigure(0, weight=1)
+
+        left = tk.Frame(inner, bg=bg); left.grid(row=0, column=0, sticky="w")
+        title = t.get("label", t.get("key", ""))
+        if selected:
+            title += "   ◀ selected"
+        tk.Label(left, text=title, bg=bg, fg=INK,
+                 font=font(11, "bold")).pack(anchor="w")
+        budget = t.get("budget_kb", 0)
+        if budget and budget < 500000:
+            mem = f"{100*t.get('mem_frac',0):.0f}% of {budget:,.0f} KB SRAM"
+            if t.get("tiled"):
+                mem += " (+tiling)"
+        else:
+            mem = "fits system RAM"
+        specs = (f"{t.get('precision','')}  ·  {mem}  ·  "
+                 f"~{t.get('fps','—')} FPS  ·  {t.get('format','')}")
+        tk.Label(left, text=specs, bg=bg, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w")
+        for n in t.get("notes", []):
+            tk.Label(left, text="· " + n, bg=bg, fg="#C98A1B", font=font(8),
+                     wraplength=S(440), justify="left").pack(anchor="w")
+
+        tk.Label(inner, text=vtxt, bg=bg, fg=vcol,
+                 font=font(10, "bold")).grid(row=0, column=1, sticky="e",
+                                             padx=(S(8), 0))
+
     def _show_result(self):
         s = self._load_summary()
         pad = S(34)
@@ -1408,6 +1451,16 @@ class App(tk.Tk):
                 tk.Label(r, text=k, bg=WHITE, fg=SUBTLE, font=font(10),
                          width=14, anchor="w").pack(side="left")
                 tk.Label(r, text=v, bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+
+            # -- Cross-chip suitability -------------------------------------
+            if s.get("targets"):
+                self._section(body, "RUNS ON THESE CHIPS")
+                tk.Label(body, text="     Will this exact model deploy on each "
+                         "Raspberry Pi-class target? (from each chip's specs)",
+                         bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                         justify="left").pack(anchor="w", pady=(0, S(6)))
+                for t in s["targets"]:
+                    self._target_card(body, t)
 
             if s.get("warnings"):
                 self._section(body, "COMPILER NOTES")

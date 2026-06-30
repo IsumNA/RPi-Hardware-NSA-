@@ -157,6 +157,13 @@ the results screen.
 4. **Pareto fitness report** — a scorecard balancing image quality, latency and
    INT8 robustness into a single `FINAL PARETO FITNESS SCORE`.
 
+5. **Target suitability matrix** — a cross-chip verdict (`✓ SUITABLE` /
+   `▲ WITH CAVEATS` / `✗ NOT RECOMMENDED`) telling you whether this exact model
+   is deployable on each Raspberry Pi-class target (Pi 5 CPU, Hailo-8, DeepX),
+   derived from each chip's specs: precision, native ops, on-chip SRAM budget
+   (with tiling), and estimated FPS. Shown in the terminal report, in the GUI
+   results screen, and in `outputs/summary.json` (`targets`).
+
 ---
 
 ## Running it in the terminal — Linux (primary)

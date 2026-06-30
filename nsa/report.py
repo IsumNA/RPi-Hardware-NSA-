@@ -181,3 +181,65 @@ def print_report(fit: Fitness, hardware_name: str, profile: str) -> None:
             padding=(1, 3),
         )
     )
+
+
+_VERDICT_STYLE = {
+    "SUITABLE": (RPI_GREEN, "\u2713 SUITABLE"),
+    "CAVEATS": ("#E8A33D", "\u25b2 CAVEATS"),
+    "UNSUITABLE": (RPI_RASPBERRY, "\u2717 NOT RECOMMENDED"),
+}
+
+_SHORT_LABEL = {
+    "hailo8": "Hailo-8",
+    "deepx": "DeepX DX-M1",
+    "rpi5_cpu": "Pi 5 (CPU)",
+}
+
+
+def print_target_suitability(assessments, chosen: str | None = None) -> None:
+    """Render a cross-chip 'will it run here?' matrix from assess_targets().
+
+    Composed as fixed-width lines so it stays readable at an 80-column width
+    (a Rich Table squeezes columns to nothing once the notes get long).
+    """
+    body = Table.grid(padding=(0, 0))
+    body.add_column()
+
+    header = Text(f"{'Target chip':<18}{'Prec':<6}{'Memory':<14}"
+                  f"{'Speed':<9}Verdict", style="muted")
+    body.add_row(header)
+    body.add_row(Text("\u2500" * 60, style="#444444"))
+
+    for a in assessments:
+        colour, label = _VERDICT_STYLE.get(a.verdict, ("white", a.verdict))
+        selected = bool(chosen and a.key == chosen)
+        name = _SHORT_LABEL.get(a.key, a.label)
+        if selected:
+            name = name + " \u25c0"
+        if a.budget_kb >= 500_000:
+            mem = "system RAM"
+        else:
+            mem = f"{100.0 * a.mem_frac:.0f}% SRAM" + ("+tile" if a.tiled else "")
+
+        line = Text()
+        line.append(f"{name:<18}",
+                    style="bold white" if selected else "white")
+        line.append(f"{a.precision:<6}", style="white")
+        line.append(f"{mem:<14}", style="white")
+        line.append(f"{a.fps:>4.0f} FPS ", style="white")
+        line.append(label, style=f"bold {colour}")
+        body.add_row(line)
+        for n in a.notes:
+            body.add_row(Text(f"   \u00b7 {n}", style="muted"))
+        body.add_row("")
+
+    console.print()
+    console.print(
+        Panel(
+            body,
+            title="[rpi]TARGET SUITABILITY  ·  Raspberry Pi deployment options[/rpi]",
+            title_align="left",
+            border_style="#5C6BC0",
+            padding=(1, 3),
+        )
+    )

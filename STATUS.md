@@ -77,6 +77,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Patch-cache training-set builder | ✅ | `cache.py`: detail-scored crops → `outputs/patch_cache/` (denoise-hw `dataset.py` idea) |
 | Deployment package builder | ✅ | `deploy.py`: bundles artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into a `.zip` (flashing still needs the vendor SDK + device) |
 | One-click compile & export | ✅ | `run_demo.py --export` (and the GUI *Compile & export* checkbox) builds the transferable hardware package automatically at the end of a compile |
+| Cross-chip suitability matrix | ✅ | `assess_targets()` scores the model against every Pi-class chip (precision, native ops, SRAM budget + tiling, est. FPS) → per-target verdict in the report, GUI and `summary.json` |
 | CLI | ✅ | Branded rich terminal UI |
 | Per-config evaluation | ✅ | Computes one Pareto point per run |
 | Reproducibility | ✅ | Seeded RNG (`output.seed`) |
