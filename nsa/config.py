@@ -45,6 +45,8 @@ class ModelConfig:
 class SensorConfig:
     sensor: str = "imx662"          # profile key from nsa.sensors
     input_raw: str | None = None
+    real_capture: bool = False      # load real frames instead of synthesising
+    dataset_path: str | None = None # folder/file of real captures (e.g. IMX219 repo)
     gain: int = 512
 
 
@@ -146,6 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sensor", choices=list(SENSOR_KEYS),
                    help="image sensor profile (Level 1)")
     p.add_argument("--input-raw", dest="input_raw", help="path to a Bayer RAW frame")
+    p.add_argument("--dataset", dest="dataset_path",
+                   help="folder/file of real captures (real-capture mode)")
+    p.add_argument("--real", dest="real_capture", action="store_true",
+                   help="use real captures from --dataset/dataset_path as the noisy input")
     p.add_argument("--gain", type=int, choices=GAINS, help="analog gain of the test frame")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
@@ -172,6 +178,10 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.sensor.sensor = args.sensor
     if args.input_raw:
         cfg.sensor.input_raw = args.input_raw
+    if args.dataset_path:
+        cfg.sensor.dataset_path = args.dataset_path
+    if getattr(args, "real_capture", False):
+        cfg.sensor.real_capture = True
     if args.gain:
         cfg.sensor.gain = args.gain
     if args.steps:

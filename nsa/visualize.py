@@ -92,10 +92,15 @@ def render_panel(
     # -- Panels ---------------------------------------------------------------
     gs = fig.add_gridspec(1, 3, left=0.018, right=0.982, top=0.78, bottom=0.06,
                           wspace=0.05)
+    real = meta.get("real_capture", False)
+    raw_sub = (f"{meta.get('sensor', 'sensor')}  ·  real capture" if real
+               else f"{meta.get('sensor', 'sensor')}  ·  {meta['gain']}× gain")
+    gt_title = "REFERENCE" if real else "GROUND TRUTH"
+    gt_sub = "NL-means reference" if real else f"temporal avg  ·  {meta['frames']} frames"
     panels = [
-        ("RAW INPUT", noisy, f"{meta.get('sensor', 'sensor')}  ·  {meta['gain']}× gain",
+        ("RAW INPUT", noisy, raw_sub,
          RASPBERRY, f"PSNR {meta['psnr_in']:.1f} dB", RASPBERRY),
-        ("GROUND TRUTH", ground_truth, f"temporal avg  ·  {meta['frames']} frames",
+        (gt_title, ground_truth, gt_sub,
          INK, None, None),
         ("MODEL OUTPUT", denoised, f"{meta['family'].upper()}  ·  {meta['precision']}",
          GREEN, f"PSNR {meta['psnr_out']:.1f} dB", GREEN),

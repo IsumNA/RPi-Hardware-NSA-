@@ -255,6 +255,7 @@ class App(tk.Tk):
         self.proc = None
         self.q: queue.Queue[str] = queue.Queue()
         self.input_raw = None
+        self.dataset_path = None
 
         self.sidebar = Sidebar(self)
         self.sidebar.pack(side="left", fill="y")
@@ -322,19 +323,27 @@ class App(tk.Tk):
         tk.Label(parent, text=f" {text} ", bg=bg, fg=fg,
                  font=font(8, "bold")).pack(side="left", padx=(S(10), 0))
 
-    def _radio(self, parent, text, value, enabled, badge=None):
+    def _radio(self, parent, text, value, enabled, badge=None,
+               variable=None, desc=None, command=None):
+        variable = variable if variable is not None else self.mode_var
         fr = tk.Frame(parent, bg=WHITE)
         fr.pack(fill="x", pady=S(4))
+        top = tk.Frame(fr, bg=WHITE); top.pack(fill="x")
         rb = tk.Radiobutton(
-            fr, text="  " + text, variable=self.mode_var, value=value,
+            top, text="  " + text, variable=variable, value=value,
             bg=WHITE, fg=(INK if enabled else "#B6B6B6"), selectcolor=WHITE,
             activebackground=WHITE, activeforeground=INK,
             font=font(11, "bold" if enabled else "normal"),
             state=("normal" if enabled else "disabled"),
-            anchor="w", highlightthickness=0, bd=0, takefocus=enabled)
+            anchor="w", highlightthickness=0, bd=0, takefocus=enabled,
+            command=command)
         rb.pack(side="left")
         if badge:
-            self._badge(fr, badge)
+            self._badge(top, badge)
+        if desc:
+            tk.Label(fr, text="     " + desc, bg=WHITE,
+                     fg=(SUBTLE if enabled else "#C4C4C4"),
+                     font=font(9)).pack(anchor="w")
 
     def _coming_soon(self, parent, text, desc, badge="COMING SOON"):
         fr = tk.Frame(parent, bg=WHITE)
@@ -391,13 +400,45 @@ class App(tk.Tk):
         self._radio(body, "Temporal Video Denoise", "temporal", enabled=False,
                     badge="PHASE 2")
 
-        # -- LEVEL 1: SENSOR --------------------------------------------------
-        self._section(body, "LEVEL 1 · IMAGE SENSOR")
-        add_rows([
-            ("sensor", "Sensor Profile", "imx219 legacy · imx662 Starvis 2 · imxng unreleased",
-             ["imx219", "imx662", "imxng"], "imx662"),
-            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
-        ])
+        # -- LEVEL 1: SENSOR / CAPTURE SOURCE --------------------------------
+        self._section(body, "LEVEL 1 · IMAGE SENSOR  ·  CAPTURE SOURCE")
+        self.source_var = tk.StringVar(value="sim_imx662")
+        self._radio(body, "Real IMX219", "real_imx219", enabled=True,
+                    variable=self.source_var, badge="REAL DATA",
+                    desc="Loads real captures from the repo dataset folder.",
+                    command=self._on_source_change)
+        self._radio(body, "Simulated IMX662", "sim_imx662", enabled=True,
+                    variable=self.source_var,
+                    desc="Synthesised Starvis 2 low-light physics (shot-noise limited).",
+                    command=self._on_source_change)
+        self._radio(body, "Simulated IMX-NG", "sim_imxng", enabled=True,
+                    variable=self.source_var, badge="UNRELEASED",
+                    desc="Physics model of an unreleased next-gen low-light sensor.",
+                    command=self._on_source_change)
+
+        # Repo dataset chooser (only meaningful for Real IMX219).
+        ds_row = tk.Frame(body, bg=WHITE)
+        ds_row.pack(fill="x", pady=(S(8), S(2)))
+        ds_row.columnconfigure(0, weight=1)
+        ds_left = tk.Frame(ds_row, bg=WHITE); ds_left.grid(row=0, column=0, sticky="w")
+        tk.Label(ds_left, text="Repo Dataset", bg=WHITE, fg=INK,
+                 font=font(11, "bold")).pack(anchor="w")
+        self.dataset_label = tk.Label(
+            ds_left, text="using config.yaml dataset_path", bg=WHITE,
+            fg=SUBTLE, font=font(9))
+        self.dataset_label.pack(anchor="w")
+        self.dataset_btn = RoundButton(ds_row, "CHOOSE FOLDER", self._choose_dataset,
+                                       kind="secondary", width=170, height=36)
+        self.dataset_btn.grid(row=0, column=1, sticky="e")
+
+        gain_only = tk.Frame(body, bg=WHITE)
+        gain_only.pack(fill="x")
+        add_rows_into = gain_only
+        row = ConfigRow(add_rows_into, "Sensor Gain",
+                        "Challenge-frame analog gain (simulated modes)", [256, 512], 512)
+        row.pack(fill="x", pady=S(6))
+        self.rows["gain"] = row
+        self._on_source_change()
 
         # -- LEVELS 2 & 3: MODEL ---------------------------------------------
         self._section(body, "LEVELS 2 & 3 · MODEL ARCHITECTURE")
@@ -455,6 +496,21 @@ class App(tk.Tk):
         self.run_btn = RoundButton(footer, "RUN COMPILE", self._run, kind="primary",
                                    width=180, height=44)
         self.run_btn.pack(side="right")
+
+    def _on_source_change(self):
+        real = self.source_var.get() == "real_imx219"
+        if hasattr(self, "dataset_btn"):
+            self.dataset_btn.set_enabled(real)
+        if hasattr(self, "dataset_label"):
+            self.dataset_label.config(fg=(SUBTLE if real else "#C4C4C4"))
+
+    def _choose_dataset(self):
+        if self.source_var.get() != "real_imx219":
+            return
+        path = filedialog.askdirectory(title="Select the repo dataset folder (real RAW captures)")
+        if path:
+            self.dataset_path = path
+            self.dataset_label.config(text=Path(path).name)
 
     def _choose_raw(self):
         path = filedialog.askopenfilename(
@@ -520,10 +576,21 @@ class App(tk.Tk):
 
     def _build_command(self):
         cmd = [sys.executable, str(ROOT / "run_demo.py"), "--no-window"]
-        for key in ("sensor", "hardware", "model_family", "base_channels",
+        source_map = {
+            "real_imx219": ("imx219", True),
+            "sim_imx662": ("imx662", False),
+            "sim_imxng": ("imxng", False),
+        }
+        sensor, real = source_map[self.source_var.get()]
+        cmd += ["--sensor", sensor]
+        for key in ("hardware", "model_family", "base_channels",
                     "block_depth", "conv_type", "activation", "gain", "steps"):
             flag = "--" + key.replace("_", "-")
             cmd += [flag, self.rows[key].get()]
+        if real:
+            cmd += ["--real"]
+            if self.dataset_path:
+                cmd += ["--dataset", self.dataset_path]
         if self.input_raw:
             cmd += ["--input-raw", self.input_raw]
         return cmd

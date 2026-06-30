@@ -112,25 +112,73 @@ def _demosaic(bayer: np.ndarray) -> np.ndarray:
     return (rgb.astype(np.float32) / 65535.0)
 
 
-def load_real_raw(path: str, patch: int) -> np.ndarray:
-    """Load a user-supplied RAW/image frame as normalised linear RGB."""
-    p = Path(path)
-    if p.suffix.lower() == ".npy":
-        arr = np.load(p).astype(np.float32)
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+RAW_EXTS = {".npy", ".dng", ".raw"}
+SUPPORTED_EXTS = IMAGE_EXTS | RAW_EXTS
+
+
+def resolve_dataset(path: str | None, seed: int) -> Path | None:
+    """Resolve a dataset path to a single frame.
+
+    Accepts a direct file, or a directory (searched recursively) from which one
+    supported frame is picked (seeded, so different seeds show different frames).
+    Returns ``None`` if nothing usable is found.
+    """
+    if not path:
+        return None
+    p = Path(path).expanduser()
+    if p.is_file():
+        return p
+    if p.is_dir():
+        files = sorted(f for f in p.rglob("*")
+                       if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS)
+        if not files:
+            return None
+        idx = int(np.random.default_rng(seed).integers(0, len(files)))
+        return files[idx]
+    return None
+
+
+def _load_any(path: Path) -> np.ndarray:
+    """Decode any supported frame file to normalised linear RGB [0, 1]."""
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        arr = np.load(path).astype(np.float32)
         if arr.ndim == 2:
-            arr = _demosaic(arr / max(arr.max(), 1e-6))
-        arr = arr / max(arr.max(), 1e-6)
-    else:
-        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(f"Could not read RAW frame: {path}")
-        if img.ndim == 2:
-            img = _demosaic(img.astype(np.float32) / max(float(img.max()), 1e-6))
-        else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
-            img = img / max(float(img.max()), 1e-6)
-        arr = img
-    return _center_crop(arr, patch)
+            arr = _demosaic(arr / max(float(arr.max()), 1e-6))
+        return arr / max(float(arr.max()), 1e-6)
+    if suffix == ".dng":
+        try:
+            import rawpy
+            with rawpy.imread(str(path)) as raw:
+                rgb = raw.postprocess(no_auto_bright=True, output_bps=16)
+            return rgb.astype(np.float32) / 65535.0
+        except Exception as exc:
+            raise RuntimeError(f"DNG support needs 'rawpy' (pip install rawpy): {exc}")
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Could not read frame: {path}")
+    if img.ndim == 2:
+        return _demosaic(img.astype(np.float32) / max(float(img.max()), 1e-6))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+    return img / max(float(img.max()), 1e-6)
+
+
+def load_real_raw(path: str, patch: int) -> np.ndarray:
+    """Load a frame file and fit it to the working patch (resize short side + crop)."""
+    arr = _load_any(Path(path))
+    return _fit_and_crop(arr, patch)
+
+
+def _fit_and_crop(img: np.ndarray, size: int) -> np.ndarray:
+    """Scale so the short side == size, then centre-crop a square patch."""
+    h, w = img.shape[:2]
+    s = size / float(min(h, w))
+    nh, nw = max(size, int(round(h * s))), max(size, int(round(w * s)))
+    if (nh, nw) != (h, w):
+        interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+        img = cv2.resize(img, (nw, nh), interpolation=interp)
+    return _center_crop(img, size)
 
 
 def _center_crop(img: np.ndarray, size: int) -> np.ndarray:
@@ -139,6 +187,18 @@ def _center_crop(img: np.ndarray, size: int) -> np.ndarray:
     y0 = (h - size) // 2
     x0 = (w - size) // 2
     return img[y0 : y0 + size, x0 : x0 + size]
+
+
+def _classical_reference(noisy: np.ndarray) -> np.ndarray:
+    """Build a clean reference for a single real capture (no temporal GT exists).
+
+    Uses non-local-means + edge-preserving smoothing so the network has a usable
+    supervised target and PSNR remains meaningful for real frames.
+    """
+    img8 = (np.clip(noisy, 0, 1) * 255.0).astype(np.uint8)
+    den = cv2.fastNlMeansDenoisingColored(img8, None, 9, 9, 7, 21)
+    den = cv2.bilateralFilter(den, 5, 45, 45)
+    return den.astype(np.float32) / 255.0
 
 
 class Frame:
@@ -161,13 +221,38 @@ def build_frame(
     patch: int,
     sensor: SensorProfile | str,
     seed: int,
+    real_capture: bool = False,
 ) -> Frame:
-    """Produce the (noisy, clean, bayer) frame bundle for the chosen sensor."""
+    """Produce the (noisy, reference, bayer) frame bundle for the chosen sensor.
+
+    Modes:
+      * real_capture=True  -> load a real frame (from a file or dataset folder)
+        and use it directly as the noisy input; a clean reference is synthesised
+        for it (single real frame has no temporal ground truth).
+      * input_raw set      -> treat the loaded image as a clean source and inject
+        the sensor's physical noise on top of it.
+      * neither            -> synthesise a clean scene and inject sensor noise.
+    """
     if isinstance(sensor, str):
         sensor = get_sensor(sensor)
     rng = np.random.default_rng(seed)
 
-    if input_raw:
+    if real_capture:
+        path = resolve_dataset(input_raw, seed)
+        if path is not None:
+            try:
+                noisy = load_real_raw(str(path), patch)
+                gt = _classical_reference(noisy)
+                bayer = _to_bayer(noisy, sensor.bayer)
+                return Frame(noisy, gt, bayer, gain, str(path), sensor)
+            except Exception:
+                real_capture = False  # fall back to synthetic below
+                input_raw = None
+        else:
+            real_capture = False
+            input_raw = None
+
+    if input_raw and not real_capture:
         clean = load_real_raw(input_raw, patch)
         source = input_raw
     else:

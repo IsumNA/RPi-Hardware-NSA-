@@ -8,6 +8,9 @@ venv/
 # Demo outputs (regenerated on every run)
 outputs/
 
+# Real-capture datasets (cloned/local RAW frames, not part of the repo)
+datasets/
+
 # OS / editor
 .DS_Store
 Thumbs.db

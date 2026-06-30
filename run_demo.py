@@ -81,7 +81,11 @@ def main() -> int:
             ("sensor", f"{sensor.label} — {sensor.family}  ·  "
                        f"{sensor.bayer}  {sensor.bit_depth}-bit"),
             ("gain", f"{cfg.sensor.gain}×"),
-            ("input_raw", cfg.sensor.input_raw or "synthetic (auto-generated)"),
+            ("input", (cfg.sensor.dataset_path or cfg.sensor.input_raw or
+                       "synthetic (auto-generated)") if cfg.sensor.real_capture
+                      else (cfg.sensor.input_raw or "synthetic (auto-generated)")),
+            ("capture_mode", "REAL (repo frames)" if cfg.sensor.real_capture
+                             else "simulated physics"),
             ("quantize", "INT8" if cfg.optimization.quantize else "off"),
         ],
         title="COMPILATION PROFILE  ·  selected inputs",
@@ -97,27 +101,46 @@ def main() -> int:
     log(f"Sensor profile: {sensor.label} — {sensor.family}  ·  "
         f"QE {sensor.qe:.0%}, read {sensor.read_noise:.1f}e-, "
         f"well {sensor.full_well:,.0f}e-", "step")
-    log(f"Reading {sensor.label} RAW @ {cfg.sensor.gain}× analog gain "
-        f"({sensor.bayer}, {sensor.bit_depth}-bit)", "step")
+    real_capture = bool(cfg.sensor.real_capture)
+    real_source = cfg.sensor.dataset_path or cfg.sensor.input_raw
+    if real_capture:
+        log(f"Real-capture mode: loading actual {sensor.label} frame from "
+            f"{real_source or '(unset)'}", "step")
+    else:
+        log(f"Reading {sensor.label} RAW @ {cfg.sensor.gain}× analog gain "
+            f"({sensor.bayer}, {sensor.bit_depth}-bit)", "step")
     frame = build_frame(
-        input_raw=cfg.sensor.input_raw,
+        input_raw=(real_source if real_capture else cfg.sensor.input_raw),
         gain=cfg.sensor.gain,
         temporal_frames=cfg.data.temporal_frames,
         patch=cfg.optimization.patch_size,
         sensor=sensor,
         seed=cfg.output.seed,
+        real_capture=real_capture,
     )
+    real_loaded = real_capture and frame.source != "synthetic"
+    if real_capture and not real_loaded:
+        log(f"No usable frames found at {real_source!r} — falling back to "
+            f"synthetic {sensor.label} capture", "warn")
     src = f"synthetic {sensor.label} capture" if frame.source == "synthetic" else frame.source
     log(f"Frame source: {src}", "info")
-    log(f"Noise model: {sensor.note}", "info")
+    if real_loaded:
+        log("Reference for real frame: NL-means + edge-preserving denoise "
+            "(single capture has no temporal GT)", "info")
+    else:
+        log(f"Noise model: {sensor.note}", "info")
     log(f"Working resolution: {frame.width}×{frame.height}  ·  demosaiced linear RGB", "ok")
 
     # ===========================================================================
     # LEVEL 2 - GROUND TRUTH / DATA
     # ===========================================================================
     level_rule(2, "DATA  ·  temporal ground-truth synthesis")
-    log(f"Averaging {cfg.data.temporal_frames} independent reads to build "
-        "clean reference", "step")
+    if real_loaded:
+        log("Real capture: deriving clean reference from the single frame "
+            "(no temporal stack available)", "step")
+    else:
+        log(f"Averaging {cfg.data.temporal_frames} independent reads to build "
+            "clean reference", "step")
     pause(0.2)
     psnr_in = psnr(frame.noisy_rgb, frame.clean_rgb)
     log(f"Input frame PSNR vs reference: {psnr_in:.2f} dB  "
@@ -210,6 +233,7 @@ def main() -> int:
         "sensor": sensor.label,
         "gain": cfg.sensor.gain,
         "frames": cfg.data.temporal_frames,
+        "real_capture": real_loaded,
         "family": cfg.model.model_family,
         "precision": "INT8" if quantized else result.precision.upper(),
         "hardware_name": cfg.hardware_name,

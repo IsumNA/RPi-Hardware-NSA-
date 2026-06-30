@@ -45,6 +45,24 @@ physical noise, auto-compile an ultra-light denoiser for it, and have a
 production-ready, hardware-accelerated pipeline the day the chip leaves the
 factory. (Add a new sensor by appending one entry to `nsa/sensors.py`.)
 
+### Real captures vs. simulated physics
+
+Two ways to feed Level 1:
+
+* **Simulated** (default) — `--sensor imx662` / `imxng`: the noisy frame is
+  synthesised from the sensor's physical noise profile, and the clean reference
+  is a temporal average of many independent reads.
+* **Real capture** — `--real --dataset <folder>` (or set `sensor.real_capture`
+  and `sensor.dataset_path` in `config.yaml`): an actual frame from the folder is
+  used **as** the noisy input. Since a single capture has no temporal ground
+  truth, a clean reference is derived from it (NL-means + edge-preserving
+  denoise) so calibration and PSNR still work. Supported files: `.npy`, common
+  images (`.png/.tif/.jpg/...`), and `.dng` (needs `rawpy`). Point `dataset_path`
+  at a cloned repo of IMX219 frames and they flow straight into the stack.
+
+In the GUI this is the **Capture Source** toggle at Level 1: *Real IMX219*,
+*Simulated IMX662*, or *Simulated IMX-NG*.
+
 ---
 
 ## Inputs
@@ -60,7 +78,9 @@ Edit `config.yaml`, or override any value on the command line.
 | `--block-depth` | `2` \| `4` \| `8` | Depth |
 | `--conv-type` | `standard` \| `depthwise` | Convolution style |
 | `--activation` | `relu` \| `gelu` \| `silu` | Activation (`gelu` on DeepX forces QAT) |
-| `--input-raw` | *path* | A real IMX662 Bayer RAW (`.npy` / image). Omitted ⇒ synthetic frame |
+| `--input-raw` | *path* | A real Bayer RAW (`.npy` / image). Omitted ⇒ synthetic frame |
+| `--dataset` | *path* | Folder (or file) of real captures for real-capture mode |
+| `--real` | — | Use real captures from `--dataset` / `dataset_path` as the noisy input |
 | `--gain` | `256` \| `512` | Analog gain of the challenge frame |
 | `--steps` | *int* | Calibration steps (lower = faster demo) |
 | `--no-window` | — | Skip the pop-up validation window |

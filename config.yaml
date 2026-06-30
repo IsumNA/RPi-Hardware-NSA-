@@ -32,6 +32,14 @@ sensor:
   # Path to a real Bayer RAW frame. If null or missing, the stack synthesises a
   # physically-plausible RAW for the chosen sensor so the demo runs out-of-the-box.
   input_raw: null
+  # Real-capture mode: load actual frames instead of synthesising noise.
+  #   real_capture: true  -> the frame from dataset_path/input_raw is used AS the
+  #                          noisy input (a clean reference is built for it).
+  #   dataset_path        -> a folder (or single file) of real RAW/image captures,
+  #                          e.g. a cloned repo of IMX219 frames. A frame is picked
+  #                          per-seed so re-runs can show different captures.
+  real_capture: false
+  dataset_path: null        # e.g. ./datasets/imx219_raws  (folder or file)
   gain: 512                 # analog gain multiplier (challenge frame): 256 | 512
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
