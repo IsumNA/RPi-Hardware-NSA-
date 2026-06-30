@@ -107,10 +107,32 @@ Edit `config.yaml`, or override any value on the command line.
 | `--simulate-noise` | — | Inject the selected sensor's noise on top of loaded frames |
 | `--filter` | *words* | Keyword filter for dataset folders (denoise-hw style, e.g. `imx219 ag12`) |
 | `--batch` | *int* | Batch mode: process up to N frames and average the metrics |
+| `--temporal` | — | Temporal video-denoise mode (recursive burst denoising) |
+| `--burst` | *int* | Frames in a temporal-denoise burst (default 8) |
 | `--frames` | *int* | Temporal frames averaged for the synthetic ground truth |
+| `--qat` | — | Quantization-aware training (fake-quant in the loop, STE) |
+| `--nafnet-enc` | *ints* | Custom NAFNet encoder block counts, e.g. `1 2 2` |
+| `--nafnet-middle` | *int* | Custom NAFNet bottleneck block count |
+| `--nafnet-dec` | *ints* | Custom NAFNet decoder block counts, e.g. `2 2 1` |
 | `--gain` | `256` \| `512` | Analog gain of the challenge frame |
 | `--steps` | *int* | Calibration steps (lower = faster demo) |
+| `--export` | — | **Compile & export**: after the run, bundle a transferable hardware package (`outputs/deployment/…zip`) |
 | `--no-window` | — | Skip the pop-up validation window |
+
+### Companion tools
+
+| Tool | What it does |
+|------|--------------|
+| `python search.py --hardware hailo8` | Automated **Pareto sweep** over the design space (grid, or `--optuna N` for a TPE search). Prints a Pareto front + winner and writes `outputs/pareto.json`. |
+| `python cache.py --dataset DIR --per-image 6` | **Patch-cache builder** — detail-scored crops → `outputs/patch_cache/` for full training runs (denoise-hw `dataset.py` idea). |
+| `python deploy.py` | **Deployment package** — bundles the compiled artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into `outputs/deployment/…zip` (flashing still needs the vendor SDK + device). Run automatically when you pass `--export` (or tick *Compile & export* in the GUI). |
+
+All of the above are also available as controls in the desktop GUI (mode radios,
+the QAT checkbox, the custom-NAFNet fields, the Pareto-sweep radio, and the
+*Build Cache* / *Build Package* buttons). The **Compile & export** checkbox makes
+the main run end-to-end — it compiles the model and writes the transferable
+hardware package in one click, with *Open Package* / *Export Package* buttons on
+the results screen.
 
 ---
 

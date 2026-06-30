@@ -36,7 +36,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | 2 | Data / Ground Truth | ✅ | Uses **real paired `gt`** when present (denoise-hw convention), else temporally averages N simulated reads, else derives an NL-means reference for a lone real frame. |
 | 3 | Architecture | ✅ | Builds a real PyTorch denoiser — CNN (DnCNN-style), U-Net (2-scale), or NAFNet (simplified NAF blocks) — honouring channels / depth / conv-type / activation. |
 | 4 | Compiler | ◐ | Runs hardware-aware passes: operator legalization, GELU→QAT / PWL handling, depthwise→grouped mapping, U-Net ConvTranspose rewrite, SRAM budgeting + tiling decision, PTQ-vs-QAT selection, export-format lock. Emits a live log. (Logic is real; it models the constraints rather than calling a vendor compiler.) |
-| 5 | Calibration / Quantization | ✅/◐ | **Real** on-frame training (random-crop, MSE, Adam, cosine LR) and **real** per-channel INT8 weight quant + per-tensor activation fake-quant with a measured FP32→INT8 PSNR drop. QAT is *emulated* (post-hoc), not true fake-quant-in-the-loop training. |
+| 5 | Calibration / Quantization | ✅ | **Real** on-frame training (random-crop, MSE, Adam, cosine LR) and **real** per-channel INT8 weight quant + per-tensor activation fake-quant with a measured FP32→INT8 PSNR drop. **True QAT** (fake-quant-in-the-loop with straight-through gradients) is available via `--qat` and is auto-enabled for non-native activations (e.g. gelu→DeepX). |
 | 6 | Export | ✅/◐ | Writes a **real, validated** `exported_model.onnx` and a **real, self-describing** INT8 binary (`.hef`/`.bin`/`.ort`: magic header + JSON manifest + packed int8 weights + per-channel scales). The binary is a stand-in container, not a vendor-runtime-loadable file. |
 
 ### Four delivered outputs
@@ -68,9 +68,15 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Upload images / choose folder | ✅ | GUI multi-file upload or folder picker |
 | Config via YAML **or** CLI flags | ✅ | `config.yaml` + full `--flag` overrides |
 | Calibration step count | ✅ | `--steps` (speed/quality trade-off) |
-| Desktop GUI | ✅ | Imager-styled, DPI-aware, live progress sidebar; comprehensive 6-level options panel |
-| Mode: Single Frame / Batch Folder | ✅ | Both working today (radio) |
-| Roadmap items shown greyed in UI | ✅ | Temporal Video Denoise, Pareto/Optuna sweep, Custom NAFNet topology, QAT, Live Silicon Deployment, patch-cache builder rendered as disabled "coming soon" controls |
+| Desktop GUI | ✅ | Imager-styled, DPI-aware, live progress sidebar; comprehensive 6-level options panel; rich results screen (model details + metrics + image + full log) |
+| Mode: Single / Batch / Temporal video | ✅ | All three working today (radio) |
+| Temporal video denoise | ✅ | `--temporal --burst N`: recursive IIR burst denoise, writes a denoised frame sequence to `outputs/video/` |
+| True QAT | ✅ | `--qat`: fake-quant-in-the-loop training (per-channel weights + per-tensor acts, STE gradients) |
+| Custom multi-scale NAFNet | ✅ | `--nafnet-enc 1 2 2 --nafnet-middle 4 --nafnet-dec 2 2 1`: U-shaped NAFNet with PixelShuffle up/down + skips |
+| Automated Pareto sweep | ✅ | `search.py`: grid (or `--optuna N` TPE) search; writes a Pareto front + winner to `outputs/pareto.json` |
+| Patch-cache training-set builder | ✅ | `cache.py`: detail-scored crops → `outputs/patch_cache/` (denoise-hw `dataset.py` idea) |
+| Deployment package builder | ✅ | `deploy.py`: bundles artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into a `.zip` (flashing still needs the vendor SDK + device) |
+| One-click compile & export | ✅ | `run_demo.py --export` (and the GUI *Compile & export* checkbox) builds the transferable hardware package automatically at the end of a compile |
 | CLI | ✅ | Branded rich terminal UI |
 | Per-config evaluation | ✅ | Computes one Pareto point per run |
 | Reproducibility | ✅ | Seeded RNG (`output.seed`) |
@@ -92,7 +98,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Model + forward/backward | ✅ | Genuine PyTorch graphs and training |
 | PSNR numbers | ✅ | Measured from the actual tensors |
 | INT8 quantization | ✅ | Real per-channel weight + per-tensor activation quant; measured drop |
-| QAT | ◐ | Emulated post-hoc, not fake-quant-in-the-loop |
+| QAT | ✅ | True fake-quant-in-the-loop training (STE); `--qat` or auto for non-native acts |
 | ONNX export | ✅ | Real, structurally valid graph (FP32) |
 | Device binary (.hef/.bin) | ◐ | Real self-describing container, **not** vendor-runtime loadable |
 | On-device latency / FPS | ◐ | Estimated from FLOPs + per-target cost model (clearly labelled) |
@@ -105,7 +111,10 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 
 ```
 config.yaml          # single source of truth for inputs
-run_demo.py          # CLI entry; orchestrates all 6 levels
+run_demo.py          # CLI entry; orchestrates all 6 levels (single/batch/temporal)
+search.py            # automated Pareto sweep (grid or Optuna TPE) over the design space
+cache.py             # patch-cache training-set builder (detail-scored crops)
+deploy.py            # deployment package builder (artifacts + flash instructions + zip)
 nsa_gui.py           # Raspberry Pi Imager-styled desktop UI (DPI-aware)
 requirements.txt
 nsa/
@@ -127,38 +136,45 @@ outputs/             # generated artifacts (gitignored)
 
 ## 6. Known limitations
 
-- **No vendor compilation.** Hailo Dataflow Compiler / DeepX SDK are not invoked;
-  `.hef`/`.bin` cannot yet be deployed to a device.
-- **No on-device measurement.** Latency/FPS/power are modelled, not benchmarked.
+- **No vendor compilation / flashing.** Hailo Dataflow Compiler / DeepX SDK are
+  not invoked. `deploy.py` packages everything up to the hand-off, but actually
+  flashing/booting `.hef`/`.bin` needs the vendor SDK + the physical accelerator.
+- **No on-device measurement.** Latency/FPS/power are modelled, not benchmarked
+  (needs the real device).
 - **Calibration, not full training.** Single-frame or small-batch on-frame fit;
-  no train/val split or large-dataset training run, no generalisation guarantees.
+  `cache.py` prepares a patch cache, but a full train/val training run over it is
+  still future work.
 - **Tiling is a decision only.** The inference path does not actually tile.
-- **INT8 is not exported.** The ONNX is FP32; quantized weights live only in the
-  custom binary (no QDQ ONNX, no `onnxruntime` path — not installed).
+- **INT8 is not exported to ONNX.** The ONNX is FP32; quantized weights live only
+  in the custom binary (no QDQ ONNX / `onnxruntime` path).
 - **Basic ISP.** Generic OpenCV demosaic; rawpy handles DNG decode, but no
   black-level/AWB/CCM/tone pipeline or EXIF metadata parsing of our own.
-- **No automated Pareto search.** One config → one score; nothing sweeps the
-  design space automatically yet.
 - **No tests / CI.**
 
 ---
 
 ## 7. Roadmap — what still needs to be implemented
 
-### Near term (makes the demo a tool)
+### Done since the first prototype
+- ✅ Multi-config **Pareto sweep** + auto-pick (`search.py`, grid or `--optuna` TPE; writes `outputs/pareto.json`).
+- ✅ **True QAT** (fake-quant-in-the-loop, STE) via `--qat` / auto for non-native acts.
+- ✅ **Custom multi-scale NAFNet** topology (`--nafnet-enc/--nafnet-middle/--nafnet-dec`).
+- ✅ **Temporal video denoise** (`--temporal --burst N`, recursive IIR, writes `outputs/video/`).
+- ✅ **Patch-cache builder** (`cache.py`) and **deployment package builder** (`deploy.py`).
+
+### Near term
 - ◐ DNG decode works via `rawpy`; still want full metadata (black level, WB, CFA) + green-equalisation like denoise-hw's `dng.py`.
-- ⬜ Multi-config **Pareto sweep** + auto-pick of the best point (the score function exists; add the search).
 - ⬜ Export a **quantized (QDQ) ONNX** and add an `onnxruntime` inference path.
+- ⬜ A full **train/val training run** over a patch cache (currently on-frame calibration).
 - ⬜ Unit tests for config validation, noise model, quant, export round-trip; CI.
 
 ### Medium term (toward real quality)
-- ◐ Real paired low-light RAW **datasets** are now ingested (denoise-hw `PI_RAW` layout: `noisy.dng`/`gt.dng`, keyword filter, detail scoring); next is a full train/val training run rather than on-frame calibration.
-- ⬜ **True QAT** (fake-quant nodes during training) + calibration dataset.
 - ⬜ Proper **ISP**: black-level subtraction, AWB, colour-correction matrix, tone curve.
 - ⬜ Implement **spatial tiling** in the inference path (not just the decision).
+- ⬜ Motion-compensated temporal denoise (current temporal mode assumes low motion).
 
-### Hardware integration (toward silicon)
-- ⬜ Wire the **Hailo Dataflow Compiler** backend → produce a loadable `.hef`.
+### Hardware integration (toward silicon — needs the physical accelerator + vendor SDK)
+- ⬜ Wire the **Hailo Dataflow Compiler** backend → produce a loadable `.hef` (`deploy.py` prepares the hand-off).
 - ⬜ Wire the **DeepX toolchain** backend → produce a loadable `.bin`.
 - ⬜ **On-device benchmarking** harness → replace estimated latency with measured ms / FPS / mW.
 - ⬜ End-to-end **camera capture → denoise → display** loop on a Raspberry Pi 5.
@@ -173,6 +189,25 @@ python run_demo.py --steps 70
 
 # the DeepX + GELU compiler path
 python run_demo.py --hardware deepx --activation gelu --steps 70
+
+# true QAT (fake-quant in the loop)
+python run_demo.py --hardware hailo8 --qat --steps 70
+
+# custom multi-scale NAFNet topology
+python run_demo.py --model-family nafnet --nafnet-enc 1 2 2 --nafnet-middle 2 --nafnet-dec 2 1 1 --steps 70
+
+# temporal video denoise (writes outputs/video/)
+python run_demo.py --temporal --burst 8 --steps 70
+
+# automated Pareto sweep (writes outputs/pareto.json); add --optuna 20 for TPE
+python search.py --hardware hailo8 --model-family cnn --search-steps 40 --no-final-run
+
+# one-click: compile AND export the transferable hardware package
+python run_demo.py --hardware hailo8 --export --no-window
+
+# build a patch cache, then a deployment package
+python cache.py --dataset ./datasets/imx219_raws --per-image 6
+python deploy.py
 
 # confirm the ONNX is structurally valid
 python -c "import onnx; onnx.checker.check_model(onnx.load('outputs/exported_model.onnx')); print('ONNX OK')"

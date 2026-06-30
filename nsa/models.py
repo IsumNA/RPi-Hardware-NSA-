@@ -98,6 +98,69 @@ class NAFNetDenoiser(nn.Module):
         return torch.clamp(x + self.tail(feat), 0.0, 1.0)
 
 
+class NAFNetUNetDenoiser(nn.Module):
+    """Multi-scale (U-shaped) NAFNet with a custom encoder/decoder topology.
+
+    Mirrors the official NAFNet layout (intro conv → encoder stages with 2×
+    downsamples → middle blocks → decoder stages with PixelShuffle upsamples +
+    skip connections → ending conv). The per-stage NAFBlock counts come from the
+    config (``nafnet_enc_blocks`` / ``nafnet_middle_blocks`` / ``nafnet_dec_blocks``),
+    so the manager can dial in topologies like ``encoders 1 2 2 · middle 4 ·
+    decoders 2 1 1`` exactly like denoise-hw's configurable NAFNet.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        enc = list(cfg.nafnet_enc_blocks) or [1, 1, 1]
+        dec = list(cfg.nafnet_dec_blocks) or enc[::-1]
+        mid = max(1, int(cfg.nafnet_middle_blocks))
+        if len(dec) != len(enc):
+            dec = enc[::-1]
+        self.levels = len(enc)
+
+        self.intro = nn.Conv2d(3, c, 3, padding=1)
+        self.ending = nn.Conv2d(c, 3, 3, padding=1)
+        self.encoders = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        self.ups = nn.ModuleList()
+
+        ch = c
+        for n in enc:
+            self.encoders.append(nn.Sequential(*[_NAFBlock(ch, cfg.conv_type) for _ in range(n)]))
+            self.downs.append(nn.Conv2d(ch, ch * 2, 2, stride=2))
+            ch *= 2
+        self.middle = nn.Sequential(*[_NAFBlock(ch, cfg.conv_type) for _ in range(mid)])
+        for n in dec:
+            self.ups.append(nn.Sequential(nn.Conv2d(ch, ch * 2, 1, bias=False),
+                                          nn.PixelShuffle(2)))
+            ch //= 2
+            self.decoders.append(nn.Sequential(*[_NAFBlock(ch, cfg.conv_type) for _ in range(n)]))
+
+    def forward(self, x):
+        # Pad so the input is divisible by 2**levels, then crop back.
+        _, _, h, w = x.shape
+        mod = 2 ** self.levels
+        ph = (mod - h % mod) % mod
+        pw = (mod - w % mod) % mod
+        xp = nn.functional.pad(x, (0, pw, 0, ph), mode="reflect")
+
+        feat = self.intro(xp)
+        skips = []
+        for enc, down in zip(self.encoders, self.downs):
+            feat = enc(feat)
+            skips.append(feat)
+            feat = down(feat)
+        feat = self.middle(feat)
+        for dec, up, skip in zip(self.decoders, self.ups, reversed(skips)):
+            feat = up(feat) + skip
+            feat = dec(feat)
+        out = xp + self.ending(feat)
+        out = out[..., :h, :w]
+        return torch.clamp(out, 0.0, 1.0)
+
+
 class UNetDenoiser(nn.Module):
     """Compact 2-scale U-Net encoder/decoder."""
 
@@ -122,6 +185,8 @@ class UNetDenoiser(nn.Module):
 
 
 def build_model(cfg: ModelConfig) -> nn.Module:
+    if cfg.model_family == "nafnet" and list(getattr(cfg, "nafnet_enc_blocks", []) or []):
+        return NAFNetUNetDenoiser(cfg)
     families = {"cnn": CNNDenoiser, "unet": UNetDenoiser, "nafnet": NAFNetDenoiser}
     return families[cfg.model_family](cfg)
 

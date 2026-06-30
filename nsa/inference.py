@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import copy
 import time
+import types
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Per-target latency model: (fixed per-frame overhead in ms, ms per GFLOP).
 # These constants are tuned to reproduce realistic on-device frame times for a
@@ -43,8 +45,74 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
     return 10.0 * np.log10(1.0 / mse)
 
 
+# ---------------------------------------------------------------------------
+# Quantization-Aware Training (true fake-quant-in-the-loop, STE gradients)
+# ---------------------------------------------------------------------------
+class _STEQuant(torch.autograd.Function):
+    """Symmetric INT8 fake-quant with a straight-through-estimator gradient."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        return torch.round(x / scale).clamp(-127, 127) * scale
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out, None      # STE: gradient passes through the round()
+
+
+def _fq_weight(w: torch.Tensor) -> torch.Tensor:
+    flat = w.reshape(w.shape[0], -1)
+    scale = flat.abs().amax(dim=1).clamp(min=1e-8) / 127.0
+    shape = [-1] + [1] * (w.dim() - 1)
+    return _STEQuant.apply(w, scale.reshape(shape))
+
+
+def _fq_act(t: torch.Tensor) -> torch.Tensor:
+    scale = t.detach().abs().amax().clamp(min=1e-8) / 127.0
+    return _STEQuant.apply(t, scale)
+
+
+def enable_qat(model: nn.Module) -> nn.Module:
+    """Insert fake-quant nodes into every conv so training sees INT8 rounding.
+
+    Weights are fake-quantized per output channel and activations per tensor,
+    both with straight-through gradients, so the optimizer learns weights that
+    survive INT8 deployment (this is what recovers the quantization loss).
+    """
+    def _conv_fwd(self, x):
+        wq = _fq_weight(self.weight)
+        out = F.conv2d(x, wq, self.bias, self.stride, self.padding,
+                       self.dilation, self.groups)
+        return _fq_act(out)
+
+    def _convT_fwd(self, x):
+        wq = _fq_weight(self.weight)
+        out = F.conv_transpose2d(x, wq, self.bias, self.stride, self.padding,
+                                 self.output_padding, self.groups, self.dilation)
+        return _fq_act(out)
+
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d) and not hasattr(m, "_orig_forward"):
+            m._orig_forward = m.forward
+            m.forward = types.MethodType(_conv_fwd, m)
+        elif isinstance(m, nn.ConvTranspose2d) and not hasattr(m, "_orig_forward"):
+            m._orig_forward = m.forward
+            m.forward = types.MethodType(_convT_fwd, m)
+    return model
+
+
+def disable_qat(model: nn.Module) -> nn.Module:
+    """Restore the original (non-fake-quant) conv forwards after QAT training."""
+    for m in model.modules():
+        if hasattr(m, "_orig_forward"):
+            m.forward = m._orig_forward
+            del m._orig_forward
+    return model
+
+
 def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
-              steps: int, seed: int, progress=None, crop: int = 128) -> nn.Module:
+              steps: int, seed: int, progress=None, crop: int = 128,
+              qat: bool = False) -> nn.Module:
     """Short supervised fit of the model on the live frame pair.
 
     Trains on random spatial crops (cheaper per step and translation-invariant,
@@ -61,6 +129,8 @@ def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
     opt = torch.optim.Adam(model.parameters(), lr=4e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps), eta_min=2e-4)
     loss_fn = nn.MSELoss()
+    if qat:
+        enable_qat(model)
     model.train()
     for i in range(max(1, steps)):
         if crop < h or crop < w:
@@ -77,12 +147,14 @@ def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
         sched.step()
         if progress is not None and (i % 4 == 0 or i == steps - 1):
             progress(i + 1, steps, float(loss.item()))
+    if qat:
+        disable_qat(model)
     model.eval()
     return model
 
 
 def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
-                    progress=None, crop: int = 128) -> nn.Module:
+                    progress=None, crop: int = 128, qat: bool = False) -> nn.Module:
     """Calibrate across a set of (noisy, clean) frames (batch / multi-image fit).
 
     Each step samples a random frame and a random crop from it - the same
@@ -91,7 +163,8 @@ def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
     if not pairs:
         raise ValueError("calibrate_multi needs at least one (noisy, clean) pair")
     if len(pairs) == 1:
-        return calibrate(model, pairs[0][0], pairs[0][1], steps, seed, progress, crop)
+        return calibrate(model, pairs[0][0], pairs[0][1], steps, seed,
+                         progress, crop, qat=qat)
 
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
@@ -100,6 +173,8 @@ def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
     opt = torch.optim.Adam(model.parameters(), lr=4e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps), eta_min=2e-4)
     loss_fn = nn.MSELoss()
+    if qat:
+        enable_qat(model)
     model.train()
     for i in range(max(1, steps)):
         xi, yi = tensors[int(torch.randint(0, len(tensors), (1,), generator=g))]
@@ -116,8 +191,37 @@ def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
         sched.step()
         if progress is not None and (i % 4 == 0 or i == steps - 1):
             progress(i + 1, steps, float(loss.item()))
+    if qat:
+        disable_qat(model)
     model.eval()
     return model
+
+
+def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):
+    """Recursive temporal video denoise over an ordered burst of noisy frames.
+
+    Runs the spatial denoiser per frame, then applies a first-order temporal
+    IIR blend ``out_t = a·model(x_t) + (1-a)·out_{t-1}`` (classic low-motion
+    video denoising). Returns ``(outputs, per_frame_ms)`` where ``outputs`` is a
+    list of denoised RGB frames in the input order.
+    """
+    model.eval()
+    outputs = []
+    prev = None
+    total_ms = 0.0
+    with torch.no_grad():
+        for noisy in burst:
+            spatial, dt = run(model, noisy)
+            total_ms += dt
+            if prev is None:
+                blended = spatial
+            else:
+                blended = alpha * spatial + (1.0 - alpha) * prev
+            blended = np.clip(blended, 0.0, 1.0)
+            outputs.append(blended)
+            prev = blended
+    per_frame = total_ms / max(1, len(burst))
+    return outputs, per_frame
 
 
 def run(model: nn.Module, noisy: np.ndarray) -> tuple[np.ndarray, float]:

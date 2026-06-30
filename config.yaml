@@ -21,6 +21,11 @@ model:
   block_depth: 4            # 2  | 4  | 8
   conv_type: depthwise      # standard | depthwise
   activation: relu          # relu | gelu | silu   (gelu triggers DeepX QAT path)
+  # Custom multi-scale NAFNet topology (nafnet family only). Leave empty for a
+  # flat NAFNet of block_depth blocks. e.g. encoders [1,2,2] / middle 4 / decoders [2,2,1]
+  nafnet_enc_blocks: []     # per-level encoder NAFBlock counts (U-shaped NAFNet)
+  nafnet_middle_blocks: 1   # bottleneck block count
+  nafnet_dec_blocks: []     # per-level decoder NAFBlock counts
 
 # ---- LEVEL 1 : Sensor / Input ------------------------------------------------
 sensor:
@@ -54,13 +59,16 @@ data:
 # ---- LEVEL 4/5 : Optimization & Quantization ---------------------------------
 optimization:
   quantize: true            # enable INT8 post-training / QAT path
+  qat: false                # true => fake-quant-in-the-loop training (STE)
   calibration_steps: 220    # live calibration iterations on the test frame
   patch_size: 192           # working resolution for the live demo (square crop)
 
 # ---- Run mode ----------------------------------------------------------------
 run:
-  mode: single              # single | batch
+  mode: single              # single | batch | temporal
   batch_size: 6             # frames processed + averaged in batch mode
+  burst: 8                  # frames in a temporal-denoise burst (mode: temporal)
+  temporal_alpha: 0.6       # IIR blend weight for temporal video denoise
 
 # ---- Output ------------------------------------------------------------------
 output:

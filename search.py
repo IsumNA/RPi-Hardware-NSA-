@@ -197,7 +197,10 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
     latency_ms = estimate_device_latency_ms(
         export_model, cfg.optimization.patch_size, cfg.hardware, quantized
     )
-    fit = compute_fitness(final_psnr, latency_ms, quant_drop)
+    weight_kb = n_params / 1024.0 if quantized else n_params * 4 / 1024.0
+    fit = compute_fitness(final_psnr, latency_ms, quant_drop,
+                          weight_kb=weight_kb, act_kb=result.est_sram_kb,
+                          sram_budget_kb=result.sram_budget_kb)
 
     return SearchResult(
         model_family=cfg.model.model_family,
@@ -214,6 +217,57 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         n_params=n_params,
         duration_s=time.perf_counter() - t0,
     )
+
+
+def _pareto_front(results: list[SearchResult]) -> list[SearchResult]:
+    """Non-dominated set maximizing PSNR while minimizing latency & params."""
+    front = []
+    for r in results:
+        dominated = False
+        for o in results:
+            if o is r:
+                continue
+            better_eq = (o.psnr_out >= r.psnr_out and o.latency_ms <= r.latency_ms
+                         and o.n_params <= r.n_params)
+            strictly = (o.psnr_out > r.psnr_out or o.latency_ms < r.latency_ms
+                        or o.n_params < r.n_params)
+            if better_eq and strictly:
+                dominated = True
+                break
+        if not dominated:
+            front.append(r)
+    front.sort(key=lambda r: r.latency_ms)
+    return front
+
+
+def _save_pareto(results: list[SearchResult], front: list[SearchResult],
+                 winner: SearchResult, caps: dict, args) -> Path:
+    out = Path("outputs")
+    out.mkdir(parents=True, exist_ok=True)
+
+    def _row(r: SearchResult) -> dict:
+        return {
+            "family": r.model_family, "base_channels": r.base_channels,
+            "block_depth": r.block_depth, "conv_type": r.conv_type,
+            "activation": r.activation, "params": r.n_params,
+            "psnr": round(r.psnr_out, 2), "latency_ms": round(r.latency_ms, 1),
+            "fitness": r.fitness, "grade": r.grade,
+            "pareto": r in front,
+        }
+
+    payload = {
+        "target": args.hardware, "target_label": caps["label"],
+        "sensor": args.sensor, "gain": args.gain,
+        "data_source": "real" if args.real_capture else "simulated",
+        "search_steps": args.search_steps,
+        "n_evaluated": len(results),
+        "winner": _row(winner),
+        "pareto_front": [_row(r) for r in front],
+        "all_results": [_row(r) for r in sorted(results, key=lambda r: r.fitness, reverse=True)],
+    }
+    path = out / "pareto.json"
+    path.write_text(__import__("json").dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
 def _grade_colour(grade: str) -> str:
@@ -310,6 +364,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="frames averaged for synthetic ground truth (default: 64)")
     p.add_argument("--top", type=int, default=5,
                    help="how many top results to show in the summary (default: 5)")
+    p.add_argument("--optuna", dest="optuna", type=int, default=0, metavar="TRIALS",
+                   help="use an Optuna TPE search of N trials instead of full grid "
+                        "(falls back to grid if optuna isn't installed)")
     p.add_argument("--no-final-run", dest="no_final_run", action="store_true",
                    help="skip the full pipeline run on the winner")
     p.add_argument("--seed", type=int, default=662)
@@ -393,34 +450,18 @@ def main() -> int:
     results: list[SearchResult] = []
     n = len(feasible)
 
-    console.print(f"  [{_MUTED}]Running {n} candidates...[/]\n")
-
-    for idx, (fam, ch, dep, ct, act) in enumerate(feasible, 1):
+    def _evaluate(fam, ch, dep, ct, act, tag):
         cfg = _build_search_cfg(
-            hardware=args.hardware,
-            sensor_key=args.sensor,
-            gain=args.gain,
-            patch_size=args.patch_size,
-            temporal_frames=args.temporal_frames,
-            calibration_steps=args.search_steps,
-            real_capture=args.real_capture,
-            dataset_path=args.dataset_path,
-            simulate_noise=args.simulate_noise,
-            filter_tokens=args.filter or [],
-            seed=args.seed,
-            model_family=fam,
-            base_channels=ch,
-            block_depth=dep,
-            conv_type=ct,
-            activation=act,
+            hardware=args.hardware, sensor_key=args.sensor, gain=args.gain,
+            patch_size=args.patch_size, temporal_frames=args.temporal_frames,
+            calibration_steps=args.search_steps, real_capture=args.real_capture,
+            dataset_path=args.dataset_path, simulate_noise=args.simulate_noise,
+            filter_tokens=args.filter or [], seed=args.seed,
+            model_family=fam, base_channels=ch, block_depth=dep,
+            conv_type=ct, activation=act,
         )
-
         label = f"{fam.upper()} {ch}ch×{dep} {ct[:3]} {act}"
-        console.print(
-            f"  [{_MUTED}][{idx:>3}/{n}][/]  {label:<34}",
-            end="",
-        )
-
+        console.print(f"  [{_MUTED}]{tag}[/]  {label:<34}", end="")
         try:
             sr = _run_candidate(cfg, frames)
             results.append(sr)
@@ -431,8 +472,51 @@ def main() -> int:
                 f"  {sr.latency_ms:>6.1f} ms"
                 f"  [{gc}]fit {sr.fitness:>5.1f}  {sr.grade}{warn}[/]"
             )
+            return sr
         except Exception as exc:
             console.print(f"  [{_RED}]ERROR: {exc}[/]")
+            return None
+
+    # -- Optuna TPE search (optional) ----------------------------------------
+    used_optuna = False
+    if args.optuna > 0:
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            used_optuna = True
+        except Exception:
+            console.print(f"  [{_AMBER}]optuna not installed — falling back to grid "
+                          f"(pip install optuna)[/]\n")
+
+    if used_optuna:
+        fam_opts = sorted({c[0] for c in feasible})
+        ch_opts = sorted({c[1] for c in feasible})
+        dep_opts = sorted({c[2] for c in feasible})
+        ct_opts = sorted({c[3] for c in feasible})
+        act_opts = sorted({c[4] for c in feasible})
+        console.print(f"  [{_MUTED}]Optuna TPE search: {args.optuna} trials...[/]\n")
+
+        def _objective(trial):
+            fam = trial.suggest_categorical("family", fam_opts)
+            ch = trial.suggest_categorical("base_channels", ch_opts)
+            dep = trial.suggest_categorical("block_depth", dep_opts)
+            ct = trial.suggest_categorical("conv_type", ct_opts)
+            act = trial.suggest_categorical("activation", act_opts)
+            ok, _ = _is_feasible(args.hardware, act, ch, dep, args.patch_size)
+            if not ok:
+                raise optuna.TrialPruned()
+            sr = _evaluate(fam, ch, dep, ct, act, f"[t{trial.number+1:>3}]")
+            if sr is None:
+                raise optuna.TrialPruned()
+            return sr.fitness
+
+        study = optuna.create_study(direction="maximize",
+                                    sampler=optuna.samplers.TPESampler(seed=args.seed))
+        study.optimize(_objective, n_trials=args.optuna)
+    else:
+        console.print(f"  [{_MUTED}]Running {n} candidates...[/]\n")
+        for idx, (fam, ch, dep, ct, act) in enumerate(feasible, 1):
+            _evaluate(fam, ch, dep, ct, act, f"[{idx:>3}/{n}]")
 
     if not results:
         console.print(f"\n[bold {_RED}]All candidates failed.[/]")
@@ -460,6 +544,16 @@ def main() -> int:
         border_style=_GREEN,
         padding=(0, 2),
     ))
+
+    # -- Pareto front + JSON -------------------------------------------------
+    front = _pareto_front(results)
+    if len(front) > 1:
+        console.print()
+        console.print(_results_table(
+            sorted(front, key=lambda r: r.latency_ms),
+            f"Pareto Front — {len(front)} non-dominated configs (PSNR ↑ / latency ↓ / params ↓)"))
+    pareto_path = _save_pareto(results, front, winner, caps, args)
+    console.print(f"\n  [{_MUTED}]Saved sweep results -> {pareto_path}[/]")
 
     if skipped:
         console.print(f"\n  [{_MUTED}]{len(skipped)} combinations skipped (infeasible SRAM):[/]")

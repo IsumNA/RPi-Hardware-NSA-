@@ -31,9 +31,10 @@ from nsa.compiler import compile_stack
 from nsa.config import apply_overrides, build_parser, load_config, ConfigError
 from nsa.export import export_onnx, write_device_artifact
 from nsa.inference import (calibrate, calibrate_multi, estimate_device_latency_ms,
-                           fake_quantize_int8, psnr, run)
+                           fake_quantize_int8, psnr, run, temporal_denoise)
 from nsa.models import build_model, count_params
-from nsa.raw_io import build_frame, build_frame_from_source, list_frames
+from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
+                        list_frames)
 from nsa.sensors import get_sensor
 from nsa.report import compute_fitness, print_report
 from nsa.theme import (RPI_GREEN, banner, console, kv_table, level_rule, log,
@@ -90,8 +91,10 @@ def main() -> int:
                              + (" + simulated noise" if cfg.sensor.simulate_noise else "")),
             ("dataset_filter", " ".join(cfg.sensor.filter) if cfg.sensor.filter else "—"),
             ("run_mode", f"batch ×{cfg.run.batch_size}" if cfg.run.mode == "batch"
-                         else "single frame"),
-            ("quantize", "INT8" if cfg.optimization.quantize else "off"),
+                         else (f"temporal burst ×{cfg.run.burst}"
+                               if cfg.run.mode == "temporal" else "single frame")),
+            ("quantize", ("INT8 (QAT)" if cfg.optimization.qat else "INT8")
+                         if cfg.optimization.quantize else "off"),
         ],
         title="COMPILATION PROFILE  ·  selected inputs",
     ))
@@ -177,9 +180,17 @@ def main() -> int:
     level_rule(3, "ARCHITECTURE  ·  building denoiser graph")
     model = build_model(cfg.model)
     n_params = count_params(model)
-    log(f"Instantiated {cfg.model.model_family.upper()} "
-        f"({cfg.model.conv_type} conv, {cfg.model.base_channels}ch × "
-        f"{cfg.model.block_depth} blocks, {cfg.model.activation})", "step")
+    custom_naf = bool(cfg.model.model_family == "nafnet" and cfg.model.nafnet_enc_blocks)
+    if custom_naf:
+        dec = cfg.model.nafnet_dec_blocks or cfg.model.nafnet_enc_blocks[::-1]
+        log(f"Instantiated multi-scale NAFNet (custom topology) "
+            f"({cfg.model.conv_type} conv, {cfg.model.base_channels}ch, "
+            f"encoders {cfg.model.nafnet_enc_blocks} · "
+            f"middle {cfg.model.nafnet_middle_blocks} · decoders {dec})", "step")
+    else:
+        log(f"Instantiated {cfg.model.model_family.upper()} "
+            f"({cfg.model.conv_type} conv, {cfg.model.base_channels}ch × "
+            f"{cfg.model.block_depth} blocks, {cfg.model.activation})", "step")
     log(f"Trainable parameters: {n_params:,}", "ok")
 
     # ===========================================================================
@@ -192,6 +203,11 @@ def main() -> int:
     # LEVEL 5 - CALIBRATION + QUANTIZATION
     # ===========================================================================
     level_rule(5, "CALIBRATION  ·  live fit + INT8 quantization")
+    use_qat = bool(cfg.uses_accelerator and cfg.optimization.quantize
+                   and (cfg.optimization.qat or result.quant_scheme == "QAT"))
+    if use_qat:
+        log("QAT enabled -> training with INT8 fake-quant in the loop "
+            "(straight-through estimator)", "step")
     with Progress(
         TextColumn("[muted]{task.description}"),
         BarColumn(complete_style=RPI_GREEN, finished_style=RPI_GREEN),
@@ -208,7 +224,7 @@ def main() -> int:
 
         pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
         calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
-                        cfg.output.seed, on_step)
+                        cfg.output.seed, on_step, qat=use_qat)
 
     fp32_out, fwd_ms = run(model, frame.noisy_rgb)
     psnr_fp32 = float(np.mean([psnr(run(model, f.noisy_rgb)[0], f.clean_rgb)
@@ -235,6 +251,36 @@ def main() -> int:
         export_model, cfg.optimization.patch_size, cfg.hardware, quantized)
     log(f"Estimated on-device latency ({cfg.hardware}): {latency_ms:.1f} ms "
         f"({1000.0/latency_ms:.0f} FPS)", "step")
+
+    # -- Temporal video-denoise pass (recursive burst denoising) --------------
+    temporal = cfg.run.mode == "temporal"
+    n_video = 0
+    if temporal:
+        if len(frames) >= 2 and real_loaded:
+            burst = [f.noisy_rgb for f in frames]           # real sequence
+        else:
+            burst = build_burst(frame.clean_rgb, cfg.sensor.gain, sensor,
+                                cfg.run.burst, cfg.output.seed)
+        outputs, per_frame_ms = temporal_denoise(export_model, burst,
+                                                 cfg.run.temporal_alpha)
+        video_dir = out_dir / "video"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        import cv2
+        for i, out in enumerate(outputs):
+            bgr = cv2.cvtColor((np.clip(out, 0, 1) * 255).astype(np.uint8),
+                               cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(video_dir / f"frame_{i:03d}.png"), bgr)
+        n_video = len(outputs)
+        tpsnr = float(np.mean([psnr(o, frame.clean_rgb) for o in outputs]))
+        # Per-frame PSNR vs the single noisy read shows the temporal gain.
+        single_psnr = psnr(burst[0], frame.clean_rgb)
+        log(f"Temporal denoise: {n_video} frames  ·  alpha {cfg.run.temporal_alpha}  "
+            f"·  PSNR {single_psnr:.2f} -> {tpsnr:.2f} dB (recursive IIR)", "ok")
+        log(f"Wrote {n_video} denoised frames -> {video_dir}", "ok")
+        final_out, final_psnr = outputs[-1], tpsnr
+        frame_noisy_for_panel = burst[0]
+    else:
+        frame_noisy_for_panel = frame.noisy_rgb
 
     # ===========================================================================
     # LEVEL 6 - EXPORT PROFILE
@@ -271,7 +317,7 @@ def main() -> int:
         "psnr_in": psnr_in,
         "psnr_out": final_psnr,
     }
-    render_panel(frame.noisy_rgb, frame.clean_rgb, final_out, meta,
+    render_panel(frame_noisy_for_panel, frame.clean_rgb, final_out, meta,
                  panel_path, show=cfg.output.show_window)
     log(f"Saved validation matrix -> {panel_path}", "ok")
     if cfg.output.show_window:
@@ -303,6 +349,10 @@ def main() -> int:
             "conv_type": cfg.model.conv_type,
             "activation": cfg.model.activation,
             "params": n_params,
+            "custom_nafnet": custom_naf,
+            "nafnet_enc": list(cfg.model.nafnet_enc_blocks),
+            "nafnet_middle": cfg.model.nafnet_middle_blocks,
+            "nafnet_dec": list(cfg.model.nafnet_dec_blocks),
         },
         "sensor": sensor.label,
         "sensor_key": cfg.sensor.sensor,
@@ -312,6 +362,9 @@ def main() -> int:
         "gt_kind": gt_kind,
         "run_mode": cfg.run.mode,
         "frames": len(frames),
+        "quant_scheme": result.quant_scheme,
+        "qat": use_qat,
+        "temporal_frames_out": n_video,
         "precision": meta["precision"],
         "psnr_in": round(psnr_in, 2),
         "psnr_out": round(final_psnr, 2),
@@ -335,6 +388,21 @@ def main() -> int:
                                               encoding="utf-8")
     except Exception:
         pass
+
+    # -- Optional: build a transferable hardware deployment package -----------
+    if cfg.output.export:
+        try:
+            from deploy import build_package
+            res = build_package(summary, out_dir, make_zip=True)
+            summary["package_dir"] = str(Path(res["pkg"]).resolve())
+            summary["package_zip"] = str(Path(res["zip"]).resolve()) if res["zip"] else None
+            (out_dir / "summary.json").write_text(json.dumps(summary, indent=2),
+                                                  encoding="utf-8")
+            log(f"Exported transferable package -> {res['zip'] or res['pkg']}", "ok")
+            log(f"Flash steps in {Path(res['pkg']).name}/FLASH_INSTRUCTIONS.md "
+                f"({res['label']})", "info")
+        except Exception as exc:
+            log(f"Deployment export failed: {exc}", "warn")
 
     if result.warnings:
         console.print()

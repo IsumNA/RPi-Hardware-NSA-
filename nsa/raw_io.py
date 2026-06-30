@@ -357,6 +357,20 @@ def _synth_noisy_gt(clean, gain, sensor, temporal_frames, seed):
     return noisy, acc / max(1, temporal_frames)
 
 
+def build_burst(clean, gain, sensor, n: int, seed: int):
+    """Generate an ordered burst of independent noisy reads of one clean scene.
+
+    Used by the temporal video-denoise mode: the scene is fixed, only the
+    sensor noise differs frame-to-frame (the low-motion video case).
+    """
+    if isinstance(sensor, str):
+        sensor = get_sensor(sensor)
+    rng = np.random.default_rng(seed)
+    prnu = (1.0 + np.random.default_rng(seed + 777).normal(
+        0.0, sensor.prnu, size=clean.shape)).astype(np.float32)
+    return [_capture(clean, gain, sensor, rng, prnu) for _ in range(max(2, n))]
+
+
 def _load_pair(noisy_path: Path, gt_path: Path, patch: int):
     """Load a paired noisy/gt capture and crop both at the same detailed window."""
     noisy = _fit_min_side(_load_any(noisy_path), patch)

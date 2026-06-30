@@ -147,6 +147,11 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
     # -- Pass 4: quantization scheme ------------------------------------------
     if cfg.uses_accelerator and cfg.optimization.quantize:
         res.quantize = True
+        if cfg.optimization.qat and res.quant_scheme != "QAT":
+            res.quant_scheme = "QAT"
+            log("QAT requested -> inserting fake-quant nodes for "
+                "quantization-aware training", "info")
+            res.passes.append("quant:QAT-int8(user)")
         if res.quant_scheme != "QAT":
             res.quant_scheme = "PTQ"
             log("Selecting INT8 post-training quantization (PTQ) with "

@@ -39,6 +39,10 @@ class ModelConfig:
     block_depth: int = 4
     conv_type: str = "depthwise"
     activation: str = "relu"
+    # Custom multi-scale NAFNet topology (empty => flat NAFNet of block_depth).
+    nafnet_enc_blocks: list = field(default_factory=list)   # e.g. [1, 2, 2]
+    nafnet_middle_blocks: int = 1
+    nafnet_dec_blocks: list = field(default_factory=list)   # e.g. [2, 2, 1]
 
 
 @dataclass
@@ -60,6 +64,7 @@ class DataConfig:
 @dataclass
 class OptimizationConfig:
     quantize: bool = True
+    qat: bool = False               # true fake-quant-in-the-loop training
     calibration_steps: int = 220
     patch_size: int = 256
 
@@ -69,12 +74,15 @@ class OutputConfig:
     dir: str = "outputs"
     show_window: bool = True
     seed: int = 662
+    export: bool = False        # build a transferable hardware package at the end
 
 
 @dataclass
 class RunConfig:
-    mode: str = "single"            # single | batch
+    mode: str = "single"            # single | batch | temporal
     batch_size: int = 6             # frames processed in batch mode
+    burst: int = 8                  # frames in a temporal-denoise burst
+    temporal_alpha: float = 0.6     # IIR blend weight for temporal denoise
 
 
 @dataclass
@@ -117,6 +125,16 @@ class Config:
                 raise ConfigError(
                     f"Invalid value for '{name}': {got!r}. Allowed: {list(allowed)}"
                 )
+        # Custom NAFNet topology is only honoured for the nafnet family.
+        if m.nafnet_enc_blocks and m.model_family != "nafnet":
+            raise ConfigError(
+                "Custom NAFNet topology (nafnet_enc_blocks) requires model_family='nafnet'."
+            )
+        if m.nafnet_enc_blocks:
+            if any(int(n) < 1 for n in m.nafnet_enc_blocks):
+                raise ConfigError("nafnet_enc_blocks must be positive integers.")
+            if m.nafnet_dec_blocks and len(m.nafnet_dec_blocks) != len(m.nafnet_enc_blocks):
+                raise ConfigError("nafnet_dec_blocks must match the length of nafnet_enc_blocks.")
 
 
 def _merge(dc, data: dict) -> None:
@@ -155,6 +173,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--block-depth", dest="block_depth", type=int, choices=BLOCK_DEPTHS)
     p.add_argument("--conv-type", dest="conv_type", choices=CONV_TYPES)
     p.add_argument("--activation", choices=ACTIVATIONS)
+    p.add_argument("--nafnet-enc", dest="nafnet_enc", nargs="*", type=int,
+                   help="custom NAFNet encoder block counts, e.g. 1 2 2")
+    p.add_argument("--nafnet-middle", dest="nafnet_middle", type=int,
+                   help="custom NAFNet middle block count")
+    p.add_argument("--nafnet-dec", dest="nafnet_dec", nargs="*", type=int,
+                   help="custom NAFNet decoder block counts, e.g. 2 2 1")
     p.add_argument("--sensor", choices=list(SENSOR_KEYS),
                    help="image sensor profile (Level 1)")
     p.add_argument("--input-raw", dest="input_raw", help="path to a Bayer RAW frame")
@@ -168,12 +192,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="keyword filter for dataset folders (denoise-hw style, e.g. imx219 ag12)")
     p.add_argument("--batch", dest="batch", type=int,
                    help="batch mode: process up to N frames and average the metrics")
+    p.add_argument("--temporal", dest="temporal", action="store_true",
+                   help="temporal video-denoise mode (recursive burst denoising)")
+    p.add_argument("--burst", dest="burst", type=int,
+                   help="frames in a temporal-denoise burst (default 8)")
+    p.add_argument("--qat", dest="qat", action="store_true",
+                   help="quantization-aware training (fake-quant in the loop)")
     p.add_argument("--gain", type=int, choices=GAINS, help="analog gain of the test frame")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
     p.add_argument("--frames", dest="frames", type=int,
                    help="temporal frames averaged for the synthetic ground truth")
     p.add_argument("--no-quantize", action="store_true", help="disable the INT8 path")
+    p.add_argument("--export", dest="export", action="store_true",
+                   help="build a transferable hardware deployment package (.zip) at the end")
     p.add_argument("--no-window", action="store_true", help="do not open the validation window")
     p.add_argument("--seed", type=int)
     return p
@@ -192,6 +224,12 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.model.conv_type = args.conv_type
     if args.activation:
         cfg.model.activation = args.activation
+    if getattr(args, "nafnet_enc", None):
+        cfg.model.nafnet_enc_blocks = list(args.nafnet_enc)
+    if getattr(args, "nafnet_middle", None):
+        cfg.model.nafnet_middle_blocks = int(args.nafnet_middle)
+    if getattr(args, "nafnet_dec", None):
+        cfg.model.nafnet_dec_blocks = list(args.nafnet_dec)
     if args.sensor:
         cfg.sensor.sensor = args.sensor
     if args.input_raw:
@@ -207,6 +245,12 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     if getattr(args, "batch", None):
         cfg.run.mode = "batch"
         cfg.run.batch_size = max(1, int(args.batch))
+    if getattr(args, "temporal", False):
+        cfg.run.mode = "temporal"
+    if getattr(args, "burst", None):
+        cfg.run.burst = max(2, int(args.burst))
+    if getattr(args, "qat", False):
+        cfg.optimization.qat = True
     if args.gain:
         cfg.sensor.gain = args.gain
     if args.steps:
@@ -215,6 +259,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.data.temporal_frames = args.frames
     if args.no_quantize:
         cfg.optimization.quantize = False
+    if getattr(args, "export", False):
+        cfg.output.export = True
     if args.no_window:
         cfg.output.show_window = False
     if args.seed is not None:

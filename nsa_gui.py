@@ -175,6 +175,10 @@ class RoundButton(tk.Canvas):
         self._enabled = on
         self._draw()
 
+    def set_text(self, text: str):
+        self.text = text
+        self._draw()
+
 
 class Sidebar(tk.Canvas):
     """Branded, live pipeline-progress sidebar (Canvas-drawn for rounded pills)."""
@@ -268,6 +272,9 @@ class ConfigRow(tk.Frame):
 
     def get(self):
         return self.var.get()
+
+    def set(self, value):
+        self.var.set(str(value))
 
 
 class App(tk.Tk):
@@ -465,6 +472,9 @@ class App(tk.Tk):
         self.source_var = tk.StringVar(value="sim")
         self.sim_noise_var = tk.BooleanVar(value=False)
         self.quantize_var = tk.BooleanVar(value=True)
+        self.qat_var = tk.BooleanVar(value=False)
+        self.eval_var = tk.StringVar(value="single")   # single | sweep
+        self.export_var = tk.BooleanVar(value=True)    # build transferable package
 
         def add_rows(specs):
             for key, title, desc, values, default in specs:
@@ -481,11 +491,14 @@ class App(tk.Tk):
                     badge="MULTI-IMAGE",
                     desc="Train across many frames in a folder; metrics are averaged.",
                     command=self._on_mode_change)
-        self._radio(body, "Temporal Video Denoise", "temporal", enabled=False,
-                    badge="COMING SOON",
-                    desc="Multi-frame temporal denoising of video sequences.")
+        self._radio(body, "Temporal Video Denoise", "temporal", enabled=True,
+                    badge="VIDEO",
+                    desc="Recursive burst denoising of a frame sequence (IIR blend).",
+                    command=self._on_mode_change)
         self.batch_var = self._entry_row(
             body, "batch", "Batch Size", "Frames to load in batch mode", "6")
+        self.burst_var = self._entry_row(
+            body, "burst", "Temporal Burst", "Frames in a temporal-denoise burst", "8")
 
         # -- LEVEL 1: CAPTURE SOURCE -----------------------------------------
         self._section(body, "LEVEL 1 · CAPTURE SOURCE")
@@ -545,6 +558,11 @@ class App(tk.Tk):
 
         # -- LEVEL 3: MODEL --------------------------------------------------
         self._section(body, "LEVEL 3 · MODEL ARCHITECTURE")
+        tk.Label(body, text="     These are the STARTING parameters for a single "
+                 "compile. Turn on the Pareto sweep (below) to train many "
+                 "variations and rank them.", bg=WHITE, fg=RASPBERRY,
+                 font=font(9, "bold"), wraplength=S(560), justify="left").pack(
+                     anchor="w", pady=(0, S(4)))
         add_rows([
             ("model_family", "Model Family", "CNN · U-Net · NAFNet",
              ["cnn", "unet", "nafnet"], "nafnet"),
@@ -555,9 +573,17 @@ class App(tk.Tk):
             ("activation", "Activation", "gelu on DeepX forces QAT injection",
              ["relu", "gelu", "silu"], "relu"),
         ])
-        self._coming_soon(body, "Custom NAFNet topology (scaling / encoders)",
-                          "Per-level downscale + NAFBlock counts, e.g. scaling "
-                          "2 2 1 · encoders 1 2 2 (denoise-hw style).")
+        tk.Label(body, text="     Custom NAFNet topology (NAFNet family only) — "
+                 "leave blank for a flat NAFNet.", bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w", pady=(S(6), 0))
+        self.naf_enc_var = self._entry_row(
+            body, "naf_enc", "NAFNet Encoders",
+            "Per-level encoder block counts, e.g. 1 2 2", "")
+        self.naf_mid_var = self._entry_row(
+            body, "naf_mid", "NAFNet Middle", "Bottleneck block count, e.g. 4", "")
+        self.naf_dec_var = self._entry_row(
+            body, "naf_dec", "NAFNet Decoders",
+            "Per-level decoder block counts, e.g. 2 2 1", "")
 
         # -- LEVELS 4 & 6: HARDWARE ------------------------------------------
         self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
@@ -565,9 +591,22 @@ class App(tk.Tk):
             ("hardware", "Target Hardware", "Pi 5 CPU · Hailo-8 (est.) · DeepX (est.)",
              ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
         ])
-        self._coming_soon(body, "Live Silicon Deployment",
-                          "Flash the compiled .hef/.bin to real hardware "
-                          "(requires Hailo / DeepX vendor SDK).")
+        dep_row = tk.Frame(body, bg=WHITE)
+        dep_row.pack(fill="x", pady=S(6))
+        dep_row.columnconfigure(0, weight=1)
+        dep_left = tk.Frame(dep_row, bg=WHITE); dep_left.grid(row=0, column=0, sticky="w")
+        tk.Label(dep_left, text="Deployment Package", bg=WHITE, fg=INK,
+                 font=font(11, "bold")).pack(anchor="w")
+        tk.Label(dep_left, text="Bundle artifacts + flash instructions "
+                 "(device SDK still needed to flash).", bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w")
+        RoundButton(dep_row, "BUILD PACKAGE", self._build_deploy, kind="secondary",
+                    width=170, height=36).grid(row=0, column=1, sticky="e")
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
+        self._check(body, "Compile & export transferable package (.zip)",
+                    "End-to-end: after compiling, bundle the device binary + ONNX "
+                    "+ manifest + flash steps into a transferable .zip for the target.",
+                    self.export_var, command=self._on_eval_change)
 
         # -- LEVEL 5: CALIBRATION / QUANTIZATION -----------------------------
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
@@ -589,20 +628,38 @@ class App(tk.Tk):
         self.raw_label.pack(anchor="w")
         RoundButton(raw_row, "CHOOSE RAW", self._choose_raw, kind="secondary",
                     width=140, height=36).grid(row=0, column=1, sticky="e")
-        self._coming_soon(body, "Quantization-Aware Training (QAT)",
-                          "Fine-tune with simulated INT8 to recover quantization loss.")
+        self._check(body, "Quantization-Aware Training (QAT)",
+                    "Train with INT8 fake-quant in the loop (STE) to recover "
+                    "quantization loss. Auto-on for gelu→DeepX / non-native acts.",
+                    self.qat_var)
 
-        # -- EVALUATION (roadmap) --------------------------------------------
+        # -- EVALUATION ------------------------------------------------------
         self._section(body, "EVALUATION")
-        self._coming_soon(body, "Automated Pareto Space Sweep / Optuna Loop",
-                          "Auto-search the 6-level design space for the optimal "
-                          "accuracy / latency trade-off.")
-        self._coming_soon(body, "Patch-cache training set builder",
-                          "Pre-scan a dataset into detail-scored patches for full "
-                          "training runs (denoise-hw dataset.py).")
+        self._radio(body, "Compile this single model", "single", enabled=True,
+                    variable=self.eval_var, badge="TEST ONE",
+                    desc="Run the exact config above and produce artifacts + report.",
+                    command=self._on_eval_change)
+        self._radio(body, "Sweep & rank models (find the best)", "sweep",
+                    enabled=True, variable=self.eval_var, badge="COMPARE",
+                    desc="Train many variants (families × widths × depths) and show "
+                         "a ranked leaderboard + Pareto front. Takes a few minutes; "
+                         "your starting conv/activation are kept fixed.",
+                    command=self._on_eval_change)
+        cache_row = tk.Frame(body, bg=WHITE)
+        cache_row.pack(fill="x", pady=S(6))
+        cache_row.columnconfigure(0, weight=1)
+        cache_left = tk.Frame(cache_row, bg=WHITE); cache_left.grid(row=0, column=0, sticky="w")
+        tk.Label(cache_left, text="Patch-cache training set builder", bg=WHITE, fg=INK,
+                 font=font(11, "bold")).pack(anchor="w")
+        tk.Label(cache_left, text="Pre-scan the chosen dataset into detail-scored "
+                 "patches (needs a real dataset/folder).", bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w")
+        RoundButton(cache_row, "BUILD CACHE", self._build_cache, kind="secondary",
+                    width=160, height=36).grid(row=0, column=1, sticky="e")
 
         self._on_mode_change()
         self._on_source_change()
+        self._on_eval_change()
 
     def _build_footer(self):
         pad = S(34)
@@ -626,6 +683,16 @@ class App(tk.Tk):
     def _on_mode_change(self):
         # Batch size only matters in batch mode (kept editable, just a hint).
         pass
+
+    def _on_eval_change(self):
+        if not hasattr(self, "run_btn"):
+            return
+        if self.eval_var.get() == "sweep":
+            self.run_btn.set_text("RUN SWEEP")
+        elif self.export_var.get():
+            self.run_btn.set_text("COMPILE & EXPORT")
+        else:
+            self.run_btn.set_text("RUN COMPILE")
 
     def _choose_dataset(self):
         if self.source_var.get() != "real":
@@ -739,6 +806,15 @@ class App(tk.Tk):
 
     # -- Run view -------------------------------------------------------------
     def _run(self):
+        if self.eval_var.get() == "sweep":
+            self._run_command(self._build_sweep_command(), "Searching…",
+                              "Training & ranking model variants for this target")
+        else:
+            self._run_command(self._build_command(), "Compiling…",
+                              "Running the 6-level optimization stack")
+
+    def _run_command(self, cmd, title="Working…", subtitle=""):
+        self._run_cmd = cmd
         pad = S(34)
         try:
             self.unbind_all("<MouseWheel>")
@@ -750,9 +826,9 @@ class App(tk.Tk):
 
         header = tk.Frame(self.main, bg=WHITE)
         header.pack(fill="x", padx=pad, pady=(S(28), S(4)))
-        tk.Label(header, text="Compiling…", bg=WHITE, fg=INK,
+        tk.Label(header, text=title, bg=WHITE, fg=INK,
                  font=font(19, "bold")).pack(anchor="w")
-        self.status = tk.Label(header, text="Running the 6-level optimization stack",
+        self.status = tk.Label(header, text=subtitle or "Working",
                                bg=WHITE, fg=SUBTLE, font=font(10))
         self.status.pack(anchor="w", pady=(S(2), 0))
 
@@ -797,10 +873,31 @@ class App(tk.Tk):
 
         if not self.quantize_var.get():
             cmd += ["--no-quantize"]
+        if self.qat_var.get():
+            cmd += ["--qat"]
+        if self.export_var.get():
+            cmd += ["--export"]
 
-        if self.mode_var.get() == "batch":
+        mode = self.mode_var.get()
+        if mode == "batch":
             bs = (self.batch_var.get() or "6").strip()
             cmd += ["--batch", bs if bs.isdigit() else "6"]
+        elif mode == "temporal":
+            cmd += ["--temporal"]
+            bu = (self.burst_var.get() or "8").strip()
+            cmd += ["--burst", bu if bu.isdigit() else "8"]
+
+        # Custom NAFNet topology (nafnet family only).
+        if self.rows["model_family"].get() == "nafnet":
+            enc = (self.naf_enc_var.get() or "").split()
+            mid = (self.naf_mid_var.get() or "").strip()
+            dec = (self.naf_dec_var.get() or "").split()
+            if enc and all(t.isdigit() for t in enc):
+                cmd += ["--nafnet-enc", *enc]
+                if mid.isdigit():
+                    cmd += ["--nafnet-middle", mid]
+                if dec and all(t.isdigit() for t in dec):
+                    cmd += ["--nafnet-dec", *dec]
 
         if self.source_var.get() == "real":
             cmd += ["--real"]
@@ -817,6 +914,91 @@ class App(tk.Tk):
             cmd += ["--input-raw", self.input_raw]
         return cmd
 
+    def _build_sweep_command(self):
+        # Search families × widths × depths; keep the chosen conv/activation fixed
+        # (keeps the space bounded so a GUI sweep finishes in a couple of minutes).
+        cmd = [sys.executable, str(ROOT / "search.py"),
+               "--hardware", self.rows["hardware"].get(),
+               "--sensor", self.rows["sensor"].get(),
+               "--gain", self.rows["gain"].get(),
+               "--conv-type", self.rows["conv_type"].get(),
+               "--activation", self.rows["activation"].get(),
+               "--search-steps", "30",
+               "--patch-size", "128",
+               "--top", "8",
+               "--no-final-run"]
+        if self.source_var.get() == "real":
+            dataset = self.dataset_path or self._materialise_uploads()
+            if dataset:
+                cmd += ["--real", "--dataset", dataset]
+            if self.sim_noise_var.get():
+                cmd += ["--simulate-noise"]
+            tokens = (self.filter_var.get() or "").split()
+            if tokens:
+                cmd += ["--filter", *tokens]
+        return cmd
+
+    def _build_cache(self):
+        dataset = self.dataset_path or self._materialise_uploads()
+        if not dataset:
+            messagebox.showinfo(
+                "Patch-cache builder",
+                "Pick a dataset first: set Capture Source to 'Real captures' and "
+                "choose a folder or upload images, then click BUILD CACHE.")
+            return
+        cmd = [sys.executable, str(ROOT / "cache.py"), "--dataset", dataset,
+               "--sensor", self.rows["sensor"].get(),
+               "--gain", self.rows["gain"].get(),
+               "--patch", "128", "--per-image", "6"]
+        if self.sim_noise_var.get():
+            cmd += ["--simulate-noise"]
+        tokens = (self.filter_var.get() or "").split()
+        if tokens:
+            cmd += ["--filter", *tokens]
+        self._run_command(cmd, "Building patch cache…",
+                          "Scanning the dataset into detail-scored patches")
+
+    def _build_deploy(self):
+        if not (ROOT / "outputs" / "summary.json").exists():
+            messagebox.showinfo(
+                "Deployment package",
+                "Run a compile first (RUN COMPILE) so there are artifacts to "
+                "package, then click BUILD PACKAGE.")
+            return
+        self._run_command([sys.executable, str(ROOT / "deploy.py")],
+                          "Building deployment package…",
+                          "Bundling artifacts + flash instructions")
+
+    def _export_package(self):
+        """Build the transferable hardware package from the last compile."""
+        if not (ROOT / "outputs" / "summary.json").exists():
+            messagebox.showinfo(
+                "Export package",
+                "Compile a model first, then export the transferable package.")
+            return
+        self._run_command([sys.executable, str(ROOT / "deploy.py")],
+                          "Exporting transferable package…",
+                          "Bundling device binary + ONNX + flash instructions (.zip)")
+
+    def _reveal(self, target):
+        """Open the folder containing ``target`` (a file or dir path)."""
+        path = Path(target)
+        path = path.parent if path.suffix else path
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            return
+        except Exception:
+            pass
+        try:
+            messagebox.showinfo("Package", f"Transferable package:\n{target}")
+        except Exception:
+            pass
+
     def _start_process(self):
         env = dict(os.environ)
         env["PYTHONUTF8"] = "1"
@@ -824,10 +1006,12 @@ class App(tk.Tk):
         env["NO_COLOR"] = "1"
         env["TERM"] = "dumb"
 
+        cmd = getattr(self, "_run_cmd", None) or self._build_command()
+
         def worker():
             try:
                 self.proc = subprocess.Popen(
-                    self._build_command(), stdout=subprocess.PIPE,
+                    cmd, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                     errors="replace", bufsize=1, env=env, cwd=str(ROOT))
                 for line in self.proc.stdout:
@@ -875,13 +1059,27 @@ class App(tk.Tk):
         self.pbar.stop()
         self.pbar.pack_forget()
         self.sidebar.all_done()
-        self.status.config(text="Compilation complete — artifacts written to outputs/")
         # Stash the full streamed log before we rebuild the view.
         try:
             self._full_log = self.log.get("1.0", "end").strip()
         except Exception:
             self._full_log = ""
-        self._show_result()
+        cmd = getattr(self, "_run_cmd", []) or []
+        is_compile = any("run_demo.py" in str(c) for c in cmd)
+        is_sweep = any("search.py" in str(c) for c in cmd)
+        self.status.config(
+            text="Compilation complete — artifacts written to outputs/" if is_compile
+            else ("Sweep complete — ranked leaderboard below" if is_sweep
+                  else "Done — see the log above and outputs/ for results"))
+        if is_compile:
+            self._show_result()
+        elif is_sweep:
+            self._show_ranking()
+        else:
+            try:
+                self.open_btn.set_enabled(True)
+            except Exception:
+                pass
 
     def _load_summary(self) -> dict:
         try:
@@ -940,6 +1138,13 @@ class App(tk.Tk):
                     width=170, height=44).pack(side="left", padx=(S(8), 0))
         RoundButton(footer, "FULL LOG", self._show_log, kind="primary",
                     width=140, height=44).pack(side="right")
+        if s and s.get("package_zip"):
+            RoundButton(footer, "OPEN PACKAGE",
+                        lambda: self._reveal(s.get("package_zip")), kind="primary",
+                        width=170, height=44).pack(side="right", padx=(0, S(8)))
+        else:
+            RoundButton(footer, "EXPORT PACKAGE", self._export_package, kind="primary",
+                        width=180, height=44).pack(side="right", padx=(0, S(8)))
 
         outer = tk.Frame(self.main, bg=WHITE)
         outer.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
@@ -998,14 +1203,29 @@ class App(tk.Tk):
 
             # -- Config / data details --------------------------------------
             self._section(body, "CONFIGURATION")
+            m = s.get("model", {})
+            run_mode = s.get("run_mode", "")
+            if run_mode == "batch":
+                run_txt = f"batch  ·  {s.get('frames','')} frame(s)"
+            elif run_mode == "temporal":
+                run_txt = f"temporal video  ·  {s.get('temporal_frames_out','')} frames denoised"
+            else:
+                run_txt = "single frame"
+            quant_txt = s.get("quant_scheme", "")
+            if s.get("qat"):
+                quant_txt += " (QAT, fake-quant in the loop)"
             details = [
                 ("Sensor", f"{s.get('sensor','')}  ({s.get('sensor_key','')})  ·  {s.get('gain','')}× gain"),
                 ("Capture", s.get("capture_mode", "")),
                 ("Ground truth", s.get("gt_kind", "")),
-                ("Run mode", f"{s.get('run_mode','')}"
-                             + (f"  ·  {s.get('frames','')} frame(s)" if s.get('run_mode')=='batch' else "")),
+                ("Run mode", run_txt),
+                ("Quantization", quant_txt or "—"),
                 ("Target", f"{s.get('hardware_name','')}  [{s.get('precision','')}]"),
             ]
+            if m.get("custom_nafnet"):
+                details.append(("NAFNet topology",
+                                f"enc {m.get('nafnet_enc')} · mid {m.get('nafnet_middle')} "
+                                f"· dec {m.get('nafnet_dec')}"))
             for k, v in details:
                 r = tk.Frame(body, bg=WHITE); r.pack(fill="x", pady=S(2))
                 tk.Label(r, text=k, bg=WHITE, fg=SUBTLE, font=font(10),
@@ -1017,6 +1237,23 @@ class App(tk.Tk):
                 for w in s["warnings"]:
                     tk.Label(body, text="▲  " + w, bg=WHITE, fg="#C98A1B",
                              font=font(9), wraplength=S(560), justify="left").pack(anchor="w")
+
+            # -- Transferable deployment package ----------------------------
+            self._section(body, "TRANSFERABLE PACKAGE")
+            if s.get("package_zip"):
+                tk.Label(body, text="✓  Hardware-ready package exported",
+                         bg=WHITE, fg=GREEN, font=font(11, "bold")).pack(anchor="w")
+                tk.Label(body, text=s["package_zip"], bg=WHITE, fg=INK,
+                         font=font(9), wraplength=S(580), justify="left").pack(anchor="w")
+                tk.Label(body, text="Contains the device binary, ONNX, manifest.json "
+                         "and FLASH_INSTRUCTIONS.md — copy the .zip to the target and "
+                         "follow the flash steps.", bg=WHITE, fg=SUBTLE,
+                         font=font(9), wraplength=S(580), justify="left").pack(anchor="w",
+                                                                              pady=(S(2), 0))
+            else:
+                tk.Label(body, text="Not exported yet — click EXPORT PACKAGE to bundle a "
+                         "transferable .zip for the target device.", bg=WHITE, fg=SUBTLE,
+                         font=font(9), wraplength=S(580), justify="left").pack(anchor="w")
 
         # -- Validation panel image -----------------------------------------
         self._section(body, "VALIDATION MATRIX")
@@ -1034,6 +1271,115 @@ class App(tk.Tk):
         else:
             tk.Label(body, text="validation_panel.png not found in outputs/",
                      bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+
+    def _show_ranking(self):
+        """Leaderboard of every model the sweep trained (from outputs/pareto.json)."""
+        try:
+            data = json.loads((ROOT / "outputs" / "pareto.json").read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        rows = data.get("all_results", [])
+        winner = data.get("winner", {})
+        pad = S(34)
+        try:
+            self.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+        for w in self.main.winfo_children():
+            w.destroy()
+
+        header = tk.Frame(self.main, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(22), S(2)))
+        tk.Label(header, text="Model Ranking", bg=WHITE, fg=INK,
+                 font=font(19, "bold")).pack(anchor="w")
+        tk.Label(header, text=f"{data.get('target_label','')}  ·  "
+                 f"{len(rows)} models trained & ranked by Pareto fitness  ·  "
+                 f"✦ = Pareto-optimal", bg=WHITE, fg=SUBTLE,
+                 font=font(10)).pack(anchor="w", pady=(S(2), 0))
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
+
+        # Footer (pinned).
+        footer = tk.Frame(self.main, bg=WHITE)
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
+        tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
+        RoundButton(footer, "BACK", self._back, kind="secondary",
+                    width=120, height=44).pack(side="left")
+        RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
+                    width=170, height=44).pack(side="left", padx=(S(8), 0))
+        RoundButton(footer, "FULL LOG", self._show_log, kind="secondary",
+                    width=130, height=44).pack(side="left", padx=(S(8), 0))
+        if winner:
+            RoundButton(footer, "USE WINNER", lambda: self._use_winner(winner),
+                        kind="primary", width=170, height=44).pack(side="right")
+
+        outer = tk.Frame(self.main, bg=WHITE)
+        outer.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
+        body = self._make_scrollable(outer)
+
+        if not rows:
+            tk.Label(body, text="No ranking found. See the full log for details.",
+                     bg=WHITE, fg=SUBTLE, font=font(11)).pack(anchor="w", pady=S(10))
+            return
+
+        # Column header.
+        cols = [("#", 3), ("MODEL", 20), ("PARAMS", 9), ("PSNR", 9),
+                ("LATENCY", 10), ("FITNESS", 9), ("GRADE", 12)]
+        hrow = tk.Frame(body, bg=WHITE); hrow.pack(fill="x", pady=(S(6), S(2)))
+        for label, w in cols:
+            tk.Label(hrow, text=label, bg=WHITE, fg=SUBTLE, font=font(8, "bold"),
+                     width=w, anchor="w").pack(side="left")
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(0, S(2)))
+
+        gcol = {"OPTIMAL": GREEN, "BALANCED": "#C98A1B",
+                "SUBOPTIMAL": "#C98A1B", "INFEASIBLE": RASPBERRY}
+        for i, r in enumerate(rows, 1):
+            best = (i == 1)
+            bg = FIELD if best else WHITE
+            row = tk.Frame(body, bg=bg); row.pack(fill="x", pady=1)
+            star = "✦ " if r.get("pareto") else "  "
+            model = (f"{r.get('family','').upper()} {r.get('base_channels')}ch×"
+                     f"{r.get('block_depth')} {r.get('conv_type','')[:2]}")
+            g = r.get("grade", "")
+            cells = [
+                (f"{i}", 3, INK),
+                (star + model, 20, INK if not best else RASPBERRY),
+                (f"{r.get('params',0)/1000:.1f}K", 9, SUBTLE),
+                (f"{r.get('psnr','—')} dB", 9, INK),
+                (f"{r.get('latency_ms','—')} ms", 10, SUBTLE),
+                (f"{r.get('fitness','—')}", 9, gcol.get(g, INK)),
+                (g, 12, gcol.get(g, INK)),
+            ]
+            for text, w, fg in cells:
+                tk.Label(row, text=text, bg=bg, fg=fg,
+                         font=font(9, "bold" if best else "normal"),
+                         width=w, anchor="w").pack(side="left")
+
+        # Winner call-out.
+        if winner:
+            self._section(body, "RECOMMENDED (rank 1)")
+            tk.Label(body, text=f"{winner.get('family','').upper()}  "
+                     f"{winner.get('base_channels')}ch × depth {winner.get('block_depth')}  ·  "
+                     f"{winner.get('conv_type')}  ·  {winner.get('activation')}",
+                     bg=WHITE, fg=GREEN, font=font(13, "bold")).pack(anchor="w")
+            tk.Label(body, text=f"PSNR {winner.get('psnr')} dB   ·   "
+                     f"{winner.get('latency_ms')} ms   ·   "
+                     f"fitness {winner.get('fitness')} / 100 ({winner.get('grade')})",
+                     bg=WHITE, fg=INK, font=font(10)).pack(anchor="w", pady=(S(2), 0))
+            tk.Label(body, text="Click USE WINNER to load this config into the form, "
+                     "then RUN COMPILE for the full pipeline + artifacts.",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(4), S(10)))
+
+    def _use_winner(self, winner: dict):
+        self.sidebar.reset()
+        self._build_form()                     # rebuilds self.rows with defaults
+        self.eval_var.set("single")
+        self._on_eval_change()
+        for key in ("model_family", "base_channels", "block_depth",
+                    "conv_type", "activation"):
+            jkey = "family" if key == "model_family" else key
+            val = winner.get(jkey)
+            if val is not None and key in self.rows:
+                self.rows[key].set(val)
 
     def _show_log(self):
         win = tk.Toplevel(self)
