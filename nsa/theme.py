@@ -17,6 +17,17 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# Make the process DPI-aware on Windows so the matplotlib validation window
+# renders crisp (not bitmap-stretched) on high-DPI displays.
+try:
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 from rich.align import Align
 from rich.console import Console, Group
 from rich.panel import Panel

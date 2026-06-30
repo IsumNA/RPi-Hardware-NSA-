@@ -26,6 +26,44 @@ try:
 except Exception:  # pragma: no cover
     Image = ImageTk = None
 
+
+# -- High-DPI awareness (crisp text on scaled Windows displays) ----------------
+def _detect_scale() -> float:
+    """Make the process DPI-aware and return the display scale factor."""
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor v2
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+        try:
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+        except Exception:
+            dpi = 96
+        return max(1.0, dpi / 96.0)
+    except Exception:
+        return 1.0
+
+
+SCALE = _detect_scale()
+
+
+def S(x: float) -> int:
+    """Scale a pixel dimension for the current display."""
+    return int(round(x * SCALE))
+
+
+def FT(size: float) -> int:
+    """Scale a font point size for the current display."""
+    return int(round(size * SCALE))
+
+
+def font(size: float, weight: str = "normal", family: str = "Segoe UI"):
+    if weight == "normal":
+        return (family, FT(size))
+    return (family, FT(size), weight)
+
+
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "rpi_logo.png"
 PANEL_PATH = ROOT / "outputs" / "validation_panel.png"
@@ -63,12 +101,13 @@ class RoundButton(tk.Canvas):
     """Flat rounded button matching the Imager's primary/secondary styles."""
 
     def __init__(self, parent, text, command, kind="primary", width=170, height=44):
-        super().__init__(parent, width=width, height=height, bg=parent["bg"],
+        w, h = S(width), S(height)
+        super().__init__(parent, width=w, height=h, bg=parent["bg"],
                          highlightthickness=0, bd=0)
         self.command = command
         self.kind = kind
         self.text = text
-        self.w, self.h = width, height
+        self.w, self.h = w, h
         self._enabled = True
         self.bind("<Button-1>", self._click)
         self.bind("<Enter>", lambda e: self._draw(hover=True))
@@ -81,7 +120,6 @@ class RoundButton(tk.Canvas):
             if not self._enabled:
                 fill = "#E2A9B8"
             return fill, fill, "white"
-        # secondary / outline
         return (HOVER if hover else WHITE), RASPBERRY, RASPBERRY
 
     def _draw(self, hover=False):
@@ -90,8 +128,8 @@ class RoundButton(tk.Canvas):
         r = self.h // 2
         self.create_polygon(_round_points(2, 2, self.w - 2, self.h - 2, r),
                             smooth=True, fill=fill, outline=border, width=1.5)
-        font = ("Segoe UI Semibold", 11) if "Segoe UI Semibold" in tkfont.families() else ("Segoe UI", 11, "bold")
-        self.create_text(self.w / 2, self.h / 2, text=self.text, fill=fg, font=font)
+        self.create_text(self.w / 2, self.h / 2, text=self.text, fill=fg,
+                        font=font(11, "bold"))
 
     def _click(self, _e):
         if self._enabled and self.command:
@@ -105,9 +143,8 @@ class RoundButton(tk.Canvas):
 class Sidebar(tk.Canvas):
     """Branded, live pipeline-progress sidebar (Canvas-drawn for rounded pills)."""
 
-    WIDTH = 220
-
     def __init__(self, parent):
+        self.WIDTH = S(220)
         super().__init__(parent, width=self.WIDTH, bg=WHITE, highlightthickness=0, bd=0)
         self.states = ["pending"] * len(LEVELS)
         self._logo_img = None
@@ -119,12 +156,7 @@ class Sidebar(tk.Canvas):
 
     def set_active(self, idx):
         for i in range(len(LEVELS)):
-            if i < idx:
-                self.states[i] = "done"
-            elif i == idx:
-                self.states[i] = "active"
-            else:
-                self.states[i] = "pending"
+            self.states[i] = "done" if i < idx else ("active" if i == idx else "pending")
         self.redraw()
 
     def all_done(self):
@@ -133,52 +165,49 @@ class Sidebar(tk.Canvas):
 
     def redraw(self):
         self.delete("all")
-        h = self.winfo_height() or 600
-        # right divider
+        h = self.winfo_height() or S(600)
         self.create_line(self.WIDTH - 1, 0, self.WIDTH - 1, h, fill=LINE)
 
-        # logo
         if ImageTk and LOGO_PATH.exists():
             if self._logo_img is None:
-                im = Image.open(LOGO_PATH).convert("RGBA").resize((58, 58), Image.LANCZOS)
+                im = Image.open(LOGO_PATH).convert("RGBA").resize((S(58), S(58)), Image.LANCZOS)
                 self._logo_img = ImageTk.PhotoImage(im)
-            self.create_image(34, 46, image=self._logo_img)
-            tx = 70
+            self.create_image(S(34), S(46), image=self._logo_img)
+            tx = S(70)
         else:
-            tx = 22
-        self.create_text(tx, 36, text="NSA", anchor="w", fill=RASPBERRY,
-                        font=("Segoe UI", 20, "bold"))
-        self.create_text(tx, 58, text="compiler", anchor="w", fill=SUBTLE,
-                        font=("Segoe UI", 10))
+            tx = S(22)
+        self.create_text(tx, S(36), text="NSA", anchor="w", fill=RASPBERRY,
+                        font=font(20, "bold"))
+        self.create_text(tx, S(58), text="compiler", anchor="w", fill=SUBTLE,
+                        font=font(10))
 
-        self.create_text(22, 108, text="PIPELINE", anchor="w", fill=RASPBERRY,
-                        font=("Segoe UI", 9, "bold"))
+        self.create_text(S(22), S(108), text="PIPELINE", anchor="w", fill=RASPBERRY,
+                        font=font(9, "bold"))
 
-        y = 134
+        y = S(134)
+        step = S(46)
+        rad = S(11)
         for i, (num, name) in enumerate(LEVELS):
             state = self.states[i]
+            cx = S(37)
             if state == "active":
-                self.create_polygon(_round_points(14, y - 15, self.WIDTH - 16, y + 15, 14),
+                self.create_polygon(_round_points(S(14), y - S(15), self.WIDTH - S(16), y + S(15), S(14)),
                                     smooth=True, fill=RASPBERRY, outline=RASPBERRY)
-                badge_fg, name_fg, badge_bg = "white", "white", RASPBERRY
-                self.create_oval(26, y - 11, 48, y + 11, fill="white", outline="")
-                self.create_text(37, y, text=num, fill=RASPBERRY, font=("Segoe UI", 10, "bold"))
-                self.create_text(60, y, text=name, anchor="w", fill="white",
-                                font=("Segoe UI", 11, "bold"))
+                self.create_oval(cx - rad, y - rad, cx + rad, y + rad, fill="white", outline="")
+                self.create_text(cx, y, text=num, fill=RASPBERRY, font=font(10, "bold"))
+                self.create_text(S(60), y, text=name, anchor="w", fill="white", font=font(11, "bold"))
             elif state == "done":
-                self.create_oval(26, y - 11, 48, y + 11, fill=GREEN, outline="")
-                self.create_text(37, y, text="✓", fill="white", font=("Segoe UI", 10, "bold"))
-                self.create_text(60, y, text=name, anchor="w", fill=INK,
-                                font=("Segoe UI", 11))
+                self.create_oval(cx - rad, y - rad, cx + rad, y + rad, fill=GREEN, outline="")
+                self.create_text(cx, y, text="✓", fill="white", font=font(10, "bold"))
+                self.create_text(S(60), y, text=name, anchor="w", fill=INK, font=font(11))
             else:
-                self.create_oval(26, y - 11, 48, y + 11, fill=FIELD, outline=LINE)
-                self.create_text(37, y, text=num, fill=SUBTLE, font=("Segoe UI", 10))
-                self.create_text(60, y, text=name, anchor="w", fill=SUBTLE,
-                                font=("Segoe UI", 11))
-            y += 46
+                self.create_oval(cx - rad, y - rad, cx + rad, y + rad, fill=FIELD, outline=LINE)
+                self.create_text(cx, y, text=num, fill=SUBTLE, font=font(10))
+                self.create_text(S(60), y, text=name, anchor="w", fill=SUBTLE, font=font(11))
+            y += step
 
-        self.create_text(22, h - 24, text="Raspberry Pi 5  ·  Hailo-8  ·  DeepX",
-                        anchor="w", fill="#BDBDBD", font=("Segoe UI", 8))
+        self.create_text(S(22), h - S(24), text="Raspberry Pi 5  ·  Hailo-8  ·  DeepX",
+                        anchor="w", fill="#BDBDBD", font=font(8))
 
 
 class ConfigRow(tk.Frame):
@@ -189,17 +218,17 @@ class ConfigRow(tk.Frame):
         self.columnconfigure(0, weight=1)
         left = tk.Frame(self, bg=WHITE)
         left.grid(row=0, column=0, sticky="w")
-        tk.Label(left, text=title, bg=WHITE, fg=INK,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE,
-                 font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(left, text=title, bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
+        tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
 
         self.var = tk.StringVar(value=str(default))
-        self.combo = ttk.Combobox(self, textvariable=self.var, values=[str(v) for v in values],
-                                  state="readonly", width=14, style="Rpi.TCombobox")
-        self.combo.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.combo = ttk.Combobox(self, textvariable=self.var,
+                                  values=[str(v) for v in values],
+                                  state="readonly", width=14, font=font(10),
+                                  style="Rpi.TCombobox")
+        self.combo.grid(row=0, column=1, sticky="e", padx=(S(8), 0))
         tk.Frame(self, bg=LINE, height=1).grid(row=1, column=0, columnspan=2,
-                                               sticky="ew", pady=(12, 0))
+                                               sticky="ew", pady=(S(12), 0))
 
     def get(self):
         return self.var.get()
@@ -210,8 +239,12 @@ class App(tk.Tk):
         super().__init__()
         self.title("NSA — Neural Sensor Architecture")
         self.configure(bg=WHITE)
-        self.geometry("960x660")
-        self.minsize(900, 620)
+        self.geometry(f"{S(960)}x{S(660)}")
+        self.minsize(S(900), S(620))
+        try:
+            self.tk.call("tk", "scaling", SCALE * 1.0)
+        except Exception:
+            pass
         try:
             if LOGO_PATH.exists() and ImageTk:
                 self.iconphoto(True, ImageTk.PhotoImage(Image.open(LOGO_PATH)))
@@ -239,30 +272,32 @@ class App(tk.Tk):
             pass
         style.configure("Rpi.TCombobox", fieldbackground=FIELD, background=FIELD,
                         foreground=INK, arrowcolor=RASPBERRY, bordercolor=LINE,
-                        lightcolor=LINE, darkcolor=LINE, relief="flat", padding=6)
+                        lightcolor=LINE, darkcolor=LINE, relief="flat", padding=S(6))
         style.map("Rpi.TCombobox",
                   fieldbackground=[("readonly", FIELD)],
                   selectbackground=[("readonly", FIELD)],
                   selectforeground=[("readonly", INK)])
         style.configure("Rpi.Horizontal.TProgressbar", troughcolor=FIELD,
-                        background=RASPBERRY, bordercolor=FIELD, thickness=6)
+                        background=RASPBERRY, bordercolor=FIELD, thickness=S(6))
+        self.option_add("*TCombobox*Listbox.font", font(10))
 
     # -- Form view ------------------------------------------------------------
     def _build_form(self):
         for w in self.main.winfo_children():
             w.destroy()
 
+        pad = S(34)
         header = tk.Frame(self.main, bg=WHITE)
-        header.pack(fill="x", padx=34, pady=(28, 4))
+        header.pack(fill="x", padx=pad, pady=(S(28), S(4)))
         tk.Label(header, text="Compilation Profile", bg=WHITE, fg=INK,
-                 font=("Segoe UI", 19, "bold")).pack(anchor="w")
+                 font=font(19, "bold")).pack(anchor="w")
         tk.Label(header, text="Select the target hardware and model architecture, "
                  "then compile a hardware-ready denoiser.",
-                 bg=WHITE, fg=SUBTLE, font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
-        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=34, pady=(14, 6))
+                 bg=WHITE, fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(14), S(6)))
 
         body = tk.Frame(self.main, bg=WHITE)
-        body.pack(fill="both", expand=True, padx=34, pady=(6, 0))
+        body.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
 
         self.rows = {}
         specs = [
@@ -270,10 +305,8 @@ class App(tk.Tk):
              ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
             ("model_family", "Model Family", "Denoiser architecture",
              ["cnn", "unet", "nafnet"], "nafnet"),
-            ("base_channels", "Base Channels", "Network width",
-             [16, 32, 64], 32),
-            ("block_depth", "Block Depth", "Network depth",
-             [2, 4, 8], 4),
+            ("base_channels", "Base Channels", "Network width", [16, 32, 64], 32),
+            ("block_depth", "Block Depth", "Network depth", [2, 4, 8], 4),
             ("conv_type", "Convolution", "Standard or depthwise-separable",
              ["standard", "depthwise"], "depthwise"),
             ("activation", "Activation", "gelu on DeepX forces QAT injection",
@@ -285,18 +318,16 @@ class App(tk.Tk):
         ]
         for key, title, desc, values, default in specs:
             row = ConfigRow(body, title, desc, values, default)
-            row.pack(fill="x", pady=8)
+            row.pack(fill="x", pady=S(7))
             self.rows[key] = row
 
-        # input raw row (with browse)
         raw_row = tk.Frame(body, bg=WHITE)
-        raw_row.pack(fill="x", pady=8)
+        raw_row.pack(fill="x", pady=S(7))
         raw_row.columnconfigure(0, weight=1)
         left = tk.Frame(raw_row, bg=WHITE); left.grid(row=0, column=0, sticky="w")
-        tk.Label(left, text="Input RAW", bg=WHITE, fg=INK,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(left, text="Input RAW", bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
         self.raw_label = tk.Label(left, text="synthetic (auto-generated)", bg=WHITE,
-                                  fg=SUBTLE, font=("Segoe UI", 9))
+                                  fg=SUBTLE, font=font(9))
         self.raw_label.pack(anchor="w")
         RoundButton(raw_row, "CHOOSE RAW", self._choose_raw, kind="secondary",
                     width=140, height=36).grid(row=0, column=1, sticky="e")
@@ -304,9 +335,10 @@ class App(tk.Tk):
         self._build_footer()
 
     def _build_footer(self):
-        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=34)
+        pad = S(34)
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad)
         footer = tk.Frame(self.main, bg=WHITE)
-        footer.pack(fill="x", padx=34, pady=18)
+        footer.pack(fill="x", padx=pad, pady=S(18))
         RoundButton(footer, "APP OPTIONS", self._noop, kind="secondary",
                     width=150, height=44).pack(side="left")
         self.run_btn = RoundButton(footer, "RUN COMPILE", self._run, kind="primary",
@@ -327,29 +359,29 @@ class App(tk.Tk):
 
     # -- Run view -------------------------------------------------------------
     def _run(self):
+        pad = S(34)
         self.sidebar.reset()
         for w in self.main.winfo_children():
             w.destroy()
 
         header = tk.Frame(self.main, bg=WHITE)
-        header.pack(fill="x", padx=34, pady=(28, 4))
+        header.pack(fill="x", padx=pad, pady=(S(28), S(4)))
         tk.Label(header, text="Compiling…", bg=WHITE, fg=INK,
-                 font=("Segoe UI", 19, "bold")).pack(anchor="w")
+                 font=font(19, "bold")).pack(anchor="w")
         self.status = tk.Label(header, text="Running the 6-level optimization stack",
-                               bg=WHITE, fg=SUBTLE, font=("Segoe UI", 10))
-        self.status.pack(anchor="w", pady=(2, 0))
+                               bg=WHITE, fg=SUBTLE, font=font(10))
+        self.status.pack(anchor="w", pady=(S(2), 0))
 
         self.pbar = ttk.Progressbar(self.main, mode="indeterminate",
                                     style="Rpi.Horizontal.TProgressbar")
-        self.pbar.pack(fill="x", padx=34, pady=(12, 6))
+        self.pbar.pack(fill="x", padx=pad, pady=(S(12), S(6)))
         self.pbar.start(12)
 
-        # console
         con = tk.Frame(self.main, bg=FIELD)
-        con.pack(fill="both", expand=True, padx=34, pady=(6, 6))
+        con.pack(fill="both", expand=True, padx=pad, pady=(S(6), S(6)))
+        mono = "Cascadia Mono" if "Cascadia Mono" in tkfont.families() else "Consolas"
         self.log = tk.Text(con, bg=FIELD, fg=INK, bd=0, relief="flat",
-                           font=("Cascadia Mono", 9) if "Cascadia Mono" in tkfont.families()
-                           else ("Consolas", 9), wrap="none", padx=14, pady=12)
+                           font=(mono, FT(9)), wrap="none", padx=S(14), pady=S(12))
         sb = ttk.Scrollbar(con, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -358,10 +390,9 @@ class App(tk.Tk):
         self.log.tag_configure("ok", foreground=GREEN)
         self.log.tag_configure("rasp", foreground=RASPBERRY)
 
-        # footer
-        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=34)
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad)
         footer = tk.Frame(self.main, bg=WHITE)
-        footer.pack(fill="x", padx=34, pady=16)
+        footer.pack(fill="x", padx=pad, pady=S(16))
         self.back_btn = RoundButton(footer, "BACK", self._back, kind="secondary",
                                     width=130, height=44)
         self.back_btn.pack(side="left")
@@ -418,21 +449,20 @@ class App(tk.Tk):
         self.after(60, self._drain)
 
     def _append(self, line: str):
-        # update sidebar progress from the log
         for i, (num, _name) in enumerate(LEVELS[:6]):
             if f"LEVEL {num} " in line or f"LEVEL {num}  " in line:
                 self.sidebar.set_active(i)
-                self.status.config(text=line.split("·")[-1].strip()[:80] or "Compiling…")
+                tail = line.split("·")[-1].strip()
+                self.status.config(text=tail[:80] or "Compiling…")
         if "PROTOTYPE PERFORMANCE REPORT" in line:
             self.sidebar.all_done()
 
         tag = None
-        low = line
-        if "▲" in low or "WARNING" in low:
+        if "▲" in line or "WARNING" in line:
             tag = "warn"
-        elif "✓" in low:
+        elif "✓" in line:
             tag = "ok"
-        elif "LEVEL" in low or "FINAL PARETO" in low:
+        elif "LEVEL" in line or "FINAL PARETO" in line:
             tag = "rasp"
         self.log.insert("end", line + "\n", tag)
         self.log.see("end")
@@ -448,20 +478,16 @@ class App(tk.Tk):
     def _show_result(self):
         if not (ImageTk and PANEL_PATH.exists()):
             return
-        # replace console with the validation image
-        for w in self.main.winfo_children():
-            info = w.pack_info() if w.winfo_manager() == "pack" else {}
-        # find the console frame (the FIELD-colored Frame) and clear it
         try:
             im = Image.open(PANEL_PATH)
-            target_w = max(640, self.main.winfo_width() - 80)
+            target_w = S(900)
             ratio = target_w / im.width
             im = im.resize((int(im.width * ratio), int(im.height * ratio)), Image.LANCZOS)
             self._result_img = ImageTk.PhotoImage(im)
             top = tk.Toplevel(self)
             top.title("NSA — Validation Matrix")
             top.configure(bg=WHITE)
-            tk.Label(top, image=self._result_img, bg=WHITE).pack(padx=10, pady=10)
+            tk.Label(top, image=self._result_img, bg=WHITE).pack(padx=S(10), pady=S(10))
         except Exception:
             pass
 
@@ -475,9 +501,8 @@ class App(tk.Tk):
         self._build_form()
 
     def _open_outputs(self):
-        out = ROOT / "outputs"
         try:
-            os.startfile(str(out))  # type: ignore[attr-defined]
+            os.startfile(str(ROOT / "outputs"))  # type: ignore[attr-defined]
         except Exception:
             pass
 

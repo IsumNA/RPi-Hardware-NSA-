@@ -118,7 +118,7 @@ def render_panel(
                     ha="left", va="top",
                     bbox=dict(boxstyle="round,pad=0.35", fc=badge_c, ec="none"))
 
-    fig.savefig(save_path, dpi=130, facecolor=WHITE)
+    fig.savefig(save_path, dpi=170, facecolor=WHITE)
     if show:
         try:
             mng = plt.get_current_fig_manager()

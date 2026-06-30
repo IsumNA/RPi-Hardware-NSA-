@@ -68,30 +68,91 @@ Edit `config.yaml`, or override any value on the command line.
 
 ---
 
-## Quick start
+## Running it in the terminal — step by step
 
-```bash
+### 1. Open a terminal in the project folder
+
+```powershell
+cd "C:\Users\isump\Downloads\RPi-Hardware-NSA-"
+```
+
+### 2. (First time only) install the dependencies
+
+```powershell
 pip install -r requirements.txt
+```
 
-# Desktop UI (Raspberry Pi Imager styling) - recommended for the demo
+### 3. (Windows only) enable UTF-8 for the current session
+
+The live log uses Raspberry Pi glyphs (✓, ▲, ·, box characters). Run this once
+per terminal session so they render instead of erroring on the legacy console:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+```
+
+> On macOS / Linux you can skip this step.
+
+### 4. Launch it
+
+**Option A — Desktop UI (recommended for the demo):**
+
+```powershell
 python nsa_gui.py
+```
 
-# Or the CLI:
-# Default demo (Raspberry Pi 5 + Hailo-8, NAFNet, 512x gain)
+Pick your options in the window, then press **RUN COMPILE**. The sidebar lights
+up level-by-level and the validation matrix opens at the end.
+
+**Option B — Command line:** run the full pipeline with the defaults in
+`config.yaml`:
+
+```powershell
 python run_demo.py
+```
 
-# Show the DeepX + GELU -> forced QAT compiler path
+You'll see Levels 1–6 stream live, a calibration progress bar, the saved
+artifacts, and finally the Pareto scorecard. A 3-panel window opens at the end
+(close it to let the script finish).
+
+### 5. Drive it with flags
+
+Override any option from `config.yaml` on the command line:
+
+```powershell
+# The DeepX + GELU -> forced QAT compiler path (great talking point)
 python run_demo.py --hardware deepx --activation gelu --model-family nafnet
 
 # Lightweight CNN for the Pi 5 CPU at 256x gain
 python run_demo.py --hardware rpi5_cpu --model-family cnn --gain 256
 
-# Fast run for a quick demo (fewer calibration steps)
-python run_demo.py --steps 80
+# Heavy model that overflows DeepX SRAM -> automatic tiling kicks in
+python run_demo.py --hardware deepx --base-channels 64 --block-depth 8
+
+# Fast run (fewer calibration steps) and no pop-up window
+python run_demo.py --steps 70 --no-window
+
+# Feed a real IMX662 Bayer RAW frame instead of the synthetic one
+python run_demo.py --input-raw "path\to\frame.npy"
+
+# See every available flag
+python run_demo.py --help
 ```
 
-> On Windows, run with UTF-8 so the Raspberry Pi glyphs render:
-> `$env:PYTHONUTF8=1; python run_demo.py`
+### 6. Find the results
+
+Everything is written to the `outputs/` folder:
+
+| File | What it is |
+|------|------------|
+| `exported_model.onnx` | FP32 baseline graph (ONNX) |
+| `hardware_ready.hef` / `.bin` / `.ort` | hardware-ready INT8 artifact for the chosen target |
+| `validation_panel.png` | the 3-panel before / ground-truth / after image |
+
+```powershell
+# Open the outputs folder
+explorer outputs
+```
 
 ---
 
