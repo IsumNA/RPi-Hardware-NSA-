@@ -34,6 +34,11 @@ except Exception:  # pragma: no cover
 # AND "Segoe UI" is absent on Linux). Override anytime with NSA_UI_SCALE=1.5.
 USE_TK_SCALING = False  # set True only on the Windows DPI path
 
+# Default text/UI size. "Large" in App Options == 1.6×; we ship that as the
+# out-of-the-box default so the interface is comfortably readable everywhere.
+# Override anytime with NSA_UI_SCALE, or pick another size in App Options.
+BASE_SCALE = 1.6
+
 
 def _detect_scale() -> float:
     global USE_TK_SCALING
@@ -55,11 +60,12 @@ def _detect_scale() -> float:
             except Exception:
                 dpi = 96
             USE_TK_SCALING = True
-            return max(1.0, dpi / 96.0)
+            # Never smaller than "Large"; go bigger still on hi-DPI displays.
+            return max(BASE_SCALE, dpi / 96.0)
         except Exception:
-            return 1.0
-    # Linux / macOS: enlarge by default so the UI is readable out of the box.
-    return 1.35 if sys.platform.startswith("linux") else 1.2
+            return BASE_SCALE
+    # Linux / macOS: ship the "Large" default so the UI is readable out of the box.
+    return BASE_SCALE
 
 
 SCALE = _detect_scale()
@@ -397,18 +403,30 @@ class SensorSelector(tk.Frame):
                        font=font(7, "bold"))
         tag.pack(side="right")
         fam = tk.Label(pad, text=c["family"], bg=WHITE, fg=RASPBERRY,
-                       font=font(9, "bold"))
-        fam.pack(anchor="w")
-        specs = tk.Label(pad, text=c["specs"], bg=WHITE, fg=INK, font=font(8))
-        specs.pack(anchor="w", pady=(S(2), 0))
+                       font=font(9, "bold"), wraplength=S(150), justify="left",
+                       anchor="w")
+        fam.pack(anchor="w", fill="x")
+        specs = tk.Label(pad, text=c["specs"], bg=WHITE, fg=INK, font=font(8),
+                         wraplength=S(150), justify="left", anchor="w")
+        specs.pack(anchor="w", fill="x", pady=(S(2), 0))
         blurb = tk.Label(pad, text=c["blurb"], bg=WHITE, fg=SUBTLE,
-                         font=font(8), wraplength=S(150), justify="left")
-        blurb.pack(anchor="w", pady=(S(4), 0))
+                         font=font(8), wraplength=S(150), justify="left",
+                         anchor="w")
+        blurb.pack(anchor="w", fill="x", pady=(S(4), 0))
 
         self._frames[key] = card
         self._inner[key] = {"pad": pad, "thumb_bg": thumb_bg, "img": lbl,
                             "head": head, "name": name, "fam": fam,
                             "specs": specs, "blurb": blurb, "tag": tag}
+
+        # Keep wrap width in sync with the actual card width so long spec strings
+        # always wrap instead of being clipped (which made text look blank/white
+        # on narrow cards at large UI scales).
+        def _wrap(_e, k=key):
+            w = max(self._frames[k].winfo_width() - S(34), S(80))
+            for nm in ("fam", "specs", "blurb"):
+                self._inner[k][nm].configure(wraplength=w)
+        card.bind("<Configure>", _wrap)
 
         for w in (card, pad, thumb_bg, lbl, head, name, fam, specs, blurb):
             w.bind("<Button-1>", lambda _e, k=key: self._select(k))
@@ -444,14 +462,291 @@ class SensorSelector(tk.Frame):
             self._refresh()
 
 
+class LiveView(tk.Toplevel):
+    """In-app live camera testing, styled to match the rest of the UI.
+
+    Runs the compiled denoiser on a real camera frame-by-frame and shows the raw
+    sensor feed beside the cleaned output, with live FPS / latency / noise-drop.
+    Capture + inference run on a worker thread; the Tk thread only paints the
+    latest frames, so the window stays responsive and looks like the rest of the
+    app (white surface, raspberry accents, official logo, clean type).
+    """
+
+    PANEL_W = 372  # logical px per video panel (scaled by S)
+
+    def __init__(self, master, source="auto"):
+        super().__init__(master, bg=WHITE)
+        self.title("NSA  ·  Live Testing")
+        self.configure(bg=WHITE)
+        self.source = source
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest = None            # (raw_rgb, out_rgb, stats)
+        self._status = "Loading compiled model…"
+        self._model_name = "MODEL"
+        self._imgs = {}                # keep PhotoImage refs alive
+        self._logo_img = None
+        self.panels = {}
+        self.stat_vals = {}
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Escape>", lambda _e: self._on_close())
+
+        self.update_idletasks()
+        w, h = S(840), S(660)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(w, sw - 40), min(h, sh - 80)
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 3)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(S(620), S(520))
+        try:
+            self.transient(master)
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+        self.after(80, self._paint)
+
+    # -- layout --------------------------------------------------------------
+    def _build_ui(self):
+        pad = S(24)
+        header = tk.Frame(self, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(18), S(2)))
+        if ImageTk and LOGO_PATH.exists():
+            try:
+                im = Image.open(LOGO_PATH).convert("RGBA").resize(
+                    (S(40), S(40)), Image.LANCZOS)
+                self._logo_img = ImageTk.PhotoImage(im)
+                tk.Label(header, image=self._logo_img, bg=WHITE).pack(
+                    side="left", padx=(0, S(12)))
+            except Exception:  # noqa: BLE001
+                pass
+        htext = tk.Frame(header, bg=WHITE)
+        htext.pack(side="left")
+        tk.Label(htext, text="Live testing", bg=WHITE, fg=INK,
+                 font=font(19, "bold")).pack(anchor="w")
+        self.src_lbl = tk.Label(htext, text=self._status, bg=WHITE, fg=SUBTLE,
+                                font=font(10))
+        self.src_lbl.pack(anchor="w", pady=(S(1), 0))
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
+
+        # -- Footer (pinned) -------------------------------------------------
+        footer = tk.Frame(self, bg=WHITE)
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
+        tk.Frame(self, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
+        RoundButton(footer, "CLOSE", self._on_close, kind="secondary",
+                    width=120, height=42).pack(side="left")
+        RoundButton(footer, "SAVE SNAPSHOT", self._save_snapshot, kind="primary",
+                    width=180, height=42).pack(side="right")
+
+        # -- Stat chips (above footer) --------------------------------------
+        stats = tk.Frame(self, bg=WHITE)
+        stats.pack(side="bottom", fill="x", padx=pad, pady=(0, S(2)))
+        self._chip(stats, "MODEL", "model", "—")
+        self._chip(stats, "LATENCY", "ms", "—")
+        self._chip(stats, "THROUGHPUT", "fps", "—")
+        self._chip(stats, "NOISE vs RAW", "drop", "—", accent=GREEN)
+
+        # -- Video panels ----------------------------------------------------
+        body = tk.Frame(self, bg=WHITE)
+        body.pack(fill="both", expand=True, padx=pad, pady=(S(14), S(6)))
+        body.columnconfigure(0, weight=1, uniform="vid")
+        body.columnconfigure(1, weight=1, uniform="vid")
+        self._panel(body, 0, "raw", "RAW SENSOR", "noisy input", SUBTLE)
+        self._panel(body, 1, "out", "NSA DENOISED", "optimised output", GREEN)
+
+    def _panel(self, parent, col, key, title, sub, accent):
+        card = tk.Frame(parent, bg=WHITE, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=LINE)
+        card.grid(row=0, column=col, sticky="nsew", padx=S(6))
+        head = tk.Frame(card, bg=WHITE)
+        head.pack(fill="x", padx=S(12), pady=(S(10), S(6)))
+        tk.Label(head, text=title, bg=WHITE, fg=accent,
+                 font=font(12, "bold")).pack(side="left")
+        tk.Label(head, text=sub, bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(side="right")
+        stage = tk.Frame(card, bg="#0F0F0F")
+        stage.pack(fill="both", expand=True, padx=S(12), pady=(0, S(12)))
+        lbl = tk.Label(stage, bg="#0F0F0F", fg="#BDBDBD",
+                       text="Connecting to camera…", font=font(10))
+        lbl.pack(fill="both", expand=True)
+        self.panels[key] = lbl
+
+    def _chip(self, parent, label, key, value, accent=INK):
+        chip = tk.Frame(parent, bg=FIELD)
+        chip.pack(side="left", padx=(0, S(8)))
+        inner = tk.Frame(chip, bg=FIELD)
+        inner.pack(padx=S(12), pady=S(7))
+        tk.Label(inner, text=label, bg=FIELD, fg=SUBTLE,
+                 font=font(8, "bold")).pack(anchor="w")
+        val = tk.Label(inner, text=value, bg=FIELD, fg=accent,
+                       font=font(13, "bold"))
+        val.pack(anchor="w")
+        self.stat_vals[key] = val
+
+    # -- worker (capture + inference) ---------------------------------------
+    def _set_status(self, text):
+        with self._lock:
+            self._status = text
+
+    def _run(self):
+        try:
+            import live as _live
+            import cv2
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Live module unavailable: {exc}")
+            return
+        # Make checkpoint/output paths absolute so it works regardless of cwd.
+        _live.OUT = ROOT / "outputs"
+        _live.CKPT = _live.OUT / "model.pt"
+
+        args = _live.make_args(source=self.source)
+        try:
+            self._set_status("Loading compiled model…")
+            model, ck = _live.load_model(args)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Could not load model: {exc}")
+            return
+        model_name = str(ck.get("model", {}).get("family", "model")).upper()
+        self._model_name = model_name
+        sensor_key = ck.get("sensor", args.sensor)
+        gain = int(ck.get("gain", args.gain))
+
+        self._set_status("Connecting to camera…")
+        try:
+            cam = _live.open_camera(args, sensor_key, gain)
+        except SystemExit as exc:
+            self._set_status(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Camera error: {exc}")
+            return
+
+        import time as _t
+        is_sim = cam.__class__.__name__ == "SimCam"
+        src_desc = ("Simulated low-light stream (no camera found)  ·  "
+                    f"{sensor_key.upper()}") if is_sim else f"Live: {cam.name}"
+        self._set_status(src_desc)
+
+        fps = 0.0
+        t_prev = _t.perf_counter()
+        try:
+            while not self._stop.is_set():
+                raw = cam.read()
+                if raw is None:
+                    self._set_status("Camera returned no frame — stopped.")
+                    break
+                if raw.ndim == 2:
+                    raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+                elif raw.shape[2] == 4:
+                    raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+                h, w = raw.shape[:2]
+                tw = 432
+                if w > tw:
+                    raw = cv2.resize(raw, (tw, int(round(h * tw / w))))
+
+                out, dt_ms = _live.denoise_bgr(model, raw)
+                n_in, n_out = _live.noise_level(raw), _live.noise_level(out)
+
+                now = _t.perf_counter()
+                inst = 1.0 / max(now - t_prev, 1e-6)
+                fps = inst if fps == 0 else 0.9 * fps + 0.1 * inst
+                t_prev = now
+                drop = max(0.0, (1.0 - n_out / n_in) * 100.0) if n_in > 1e-6 else 0.0
+
+                raw_rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+                out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                with self._lock:
+                    self._latest = (raw_rgb, out_rgb,
+                                    {"fps": fps, "ms": dt_ms, "drop": drop,
+                                     "model": model_name})
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Live testing error: {exc}")
+        finally:
+            try:
+                cam.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- painting (Tk thread) -----------------------------------------------
+    def _paint(self):
+        if self._stop.is_set() or not self.winfo_exists():
+            return
+        with self._lock:
+            latest = self._latest
+            status = self._status
+        try:
+            self.src_lbl.config(text=status)
+        except Exception:  # noqa: BLE001
+            return
+        if latest is not None and Image is not None:
+            raw_rgb, out_rgb, st = latest
+            self._set_panel("raw", raw_rgb)
+            self._set_panel("out", out_rgb)
+            self.stat_vals["model"].config(text=st["model"])
+            self.stat_vals["ms"].config(text=f"{st['ms']:.0f} ms")
+            self.stat_vals["fps"].config(text=f"{st['fps']:.1f} FPS")
+            self.stat_vals["drop"].config(text=f"-{st['drop']:.0f}%")
+        self.after(45, self._paint)
+
+    def _set_panel(self, key, rgb):
+        try:
+            im = Image.fromarray(rgb)
+            pw = S(self.PANEL_W)
+            ph = max(1, int(round(pw * im.height / im.width)))
+            im = im.resize((pw, ph), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(im)
+            self._imgs[key] = photo
+            self.panels[key].config(image=photo, text="")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _save_snapshot(self):
+        with self._lock:
+            latest = self._latest
+        if latest is None or Image is None:
+            messagebox.showinfo("Snapshot", "No frame yet — wait for the stream to "
+                                "start, then try again.")
+            return
+        raw_rgb, out_rgb, _ = latest
+        try:
+            a, b = Image.fromarray(raw_rgb), Image.fromarray(out_rgb)
+            gap = 6
+            combo = Image.new("RGB", (a.width + gap + b.width, a.height), RASPBERRY)
+            combo.paste(a, (0, 0))
+            combo.paste(b, (a.width + gap, 0))
+            out_dir = ROOT / "outputs"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / "live_preview.png"
+            combo.save(path)
+            messagebox.showinfo("Snapshot saved",
+                                f"Saved the raw-vs-denoised frame to:\n{path}")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Snapshot", str(exc))
+
+    def _on_close(self):
+        self._stop.set()
+        try:
+            if getattr(self, "_worker", None):
+                self._worker.join(timeout=1.5)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         _resolve_font_family()
         self.title("NSA — Neural Sensor Architecture")
         self.configure(bg=WHITE)
-        self.geometry(f"{S(980)}x{S(680)}")
-        self.minsize(S(900), S(620))
+        self._apply_geometry()
         # On Windows we already scale fonts via FT(); applying Tk's own scaling on
         # top double-counts on Linux, so only enable it on the Windows DPI path.
         try:
@@ -1195,8 +1490,22 @@ class App(tk.Tk):
             self.tk.call("tk", "scaling", SCALE if USE_TK_SCALING else 1.0)
         except Exception:
             pass
-        self.geometry(f"{S(980)}x{S(680)}")
+        self._apply_geometry()
         self._build_chrome()
+
+    def _apply_geometry(self):
+        """Size the window to the preferred dims, clamped to the screen so the
+        pinned footer stays visible even at large text scales."""
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        w = min(S(980), sw - S(40))
+        h = min(S(680), sh - S(80))
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 3)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(min(S(820), w), min(S(560), h))
 
     def _app_options(self):
         win = tk.Toplevel(self)
@@ -1620,7 +1929,7 @@ class App(tk.Tk):
             messagebox.showerror("Lock file", str(exc))
 
     def _live_test(self):
-        """Launch live camera testing (raw vs denoised) in its own window."""
+        """Open in-app live camera testing (raw vs denoised), styled like the UI."""
         if not (ROOT / "outputs" / "model.pt").exists():
             if not messagebox.askyesno(
                 "Live testing",
@@ -1628,23 +1937,10 @@ class App(tk.Tk):
                 "Live testing will rebuild and quick-calibrate a model first "
                 "(a few seconds). Continue?"):
                 return
-        cmd = [sys.executable, str(ROOT / "live.py"), "--source", "auto"]
         try:
-            kwargs = {"cwd": str(ROOT)}
-            if sys.platform.startswith("win"):
-                kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
-            subprocess.Popen(cmd, **kwargs)
+            LiveView(self, source="auto")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Live testing", str(exc))
-            return
-        messagebox.showinfo(
-            "Live testing",
-            "Opening the live camera view in a new window.\n\n"
-            "It connects to the Raspberry Pi camera (or a USB webcam) and shows "
-            "the raw sensor feed beside the denoised output in real time, with "
-            "live latency / FPS and a noise-reduction readout. With no camera it "
-            "falls back to a simulated low-light stream.\n\n"
-            "Press 'q' or ESC in that window to stop.")
 
     def _build_deploy(self):
         if not (ROOT / "outputs" / "summary.json").exists():

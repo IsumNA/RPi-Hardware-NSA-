@@ -173,13 +173,17 @@ front-end — the on-device 6-level compile still targets the built-in denoisers
 
 ### Live testing on the Pi camera
 
-After a compile, the results screen has a **LIVE TESTING** button (or run
-`python live.py`). It loads the exact model just compiled (`outputs/model.pt`)
-and runs it on a live camera stream, showing the **raw sensor feed beside the
-denoised output** in real time — the on-device proof that the optimization
-actually cleans up the low-light camera. The overlay reports per-frame latency,
-FPS, and a live noise-reduction percentage (high-frequency noise of the raw vs
-denoised frame).
+After a compile, the results screen has a **LIVE TESTING** button that opens an
+**in-app live view styled like the rest of the UI** (white surface, raspberry
+accents, the official logo) — no separate OpenCV window. It loads the exact model
+just compiled (`outputs/model.pt`) and runs it on a live camera stream, showing
+the **raw sensor feed beside the denoised output** in real time — the on-device
+proof that the optimization actually cleans up the low-light camera. The header
+shows which camera is active, and themed stat chips report per-frame latency,
+throughput (FPS), and a live noise-reduction percentage (high-frequency noise of
+the raw vs denoised frame). **SAVE SNAPSHOT** writes the current raw-vs-denoised
+frame to `outputs/live_preview.png`. (You can also run it standalone with
+`python live.py`, which uses an OpenCV window.)
 
 Camera backends are auto-detected (override with `--source`):
 
@@ -190,8 +194,14 @@ Camera backends are auto-detected (override with `--source`):
    (`--source sim --sensor imx662`), so the feature is demonstrable on a dev
    machine with no camera attached.
 
-Press `q` or `ESC` in the window to stop. On a headless box it saves a
+In the GUI view, click **CLOSE** (or press `ESC`) to stop. With the standalone
+`python live.py`, press `q` or `ESC` in the window; on a headless box it saves a
 side-by-side sample to `outputs/live_preview.png` instead of opening a window.
+
+On Windows the webcam is opened via the DirectShow backend (the default MSMF
+backend often opens the device but never delivers frames); the opener probes
+camera indices 0–2 and verifies a real frame arrives before using a camera, so
+it only falls back to the simulated stream when there is genuinely no camera.
 
 The Level-3 options are also **contextual**: pick a model family first and only
 the parameters that apply appear (e.g. NAFNet and Restormer hide the activation

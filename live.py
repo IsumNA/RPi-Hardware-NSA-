@@ -141,22 +141,69 @@ class PiCam:
 
 
 class CvCam:
-    name = "USB / V4L2 camera (OpenCV)"
-
-    def __init__(self, cap, args):
+    def __init__(self, cap, args, index=0):
         self.cap = cap
+        self.index = index
+        self.name = f"USB / webcam (OpenCV, index {index})"
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
     def read(self):
         ok, frame = self.cap.read()
-        return frame if ok else None
+        if not ok or frame is None:
+            # Some webcams drop an occasional frame; retry briefly before giving up.
+            for _ in range(3):
+                time.sleep(0.01)
+                ok, frame = self.cap.read()
+                if ok and frame is not None:
+                    return frame
+            return None
+        return frame
 
     def close(self):
         try:
             self.cap.release()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _cv_backends() -> list:
+    """Platform-appropriate OpenCV capture backends, best first.
+
+    On Windows the default (MSMF) backend frequently opens a device but never
+    delivers a frame; DirectShow is far more reliable, so we try it first.
+    """
+    if sys.platform.startswith("win"):
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    if sys.platform == "darwin":
+        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+    return [cv2.CAP_V4L2, cv2.CAP_ANY]
+
+
+def _open_cv_capture(index: int, args):
+    """Open a webcam at ``index``, trying each backend and verifying it streams.
+
+    Returns an opened, frame-delivering ``cv2.VideoCapture`` or ``None``.
+    """
+    for be in _cv_backends():
+        try:
+            cap = cv2.VideoCapture(index, be)
+        except Exception:  # noqa: BLE001
+            continue
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        # Warm up: cameras (esp. on Windows) need a few reads before frames flow.
+        for _ in range(8):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap
+            time.sleep(0.06)
+        cap.release()
+    return None
 
 
 class SimCam:
@@ -201,21 +248,35 @@ def open_camera(args, sensor_key, gain):
             log(f"picamera2 unavailable ({exc}); trying a USB/V4L2 camera…", "warn")
 
     if src in ("auto", "opencv"):
-        cap = cv2.VideoCapture(args.camera_index)
-        if cap is not None and cap.isOpened():
-            cam = CvCam(cap, args)
-            log(f"Camera: {cam.name} (index {args.camera_index})", "ok")
-            return cam
-        if cap is not None:
-            cap.release()
+        # Probe the requested index first, then the usual fallbacks (0-2).
+        indices = [args.camera_index] + [i for i in (0, 1, 2)
+                                         if i != args.camera_index]
+        for idx in indices:
+            cap = _open_cv_capture(idx, args)
+            if cap is not None:
+                cam = CvCam(cap, args, idx)
+                log(f"Camera: {cam.name}", "ok")
+                return cam
+            if src == "opencv":
+                break
         if src == "opencv":
-            raise SystemExit(f"no OpenCV camera at index {args.camera_index}")
+            raise SystemExit(
+                f"no working OpenCV camera at index {args.camera_index} "
+                f"(tried backends: DSHOW/MSMF/V4L2). Is another app using it?")
         log("No physical camera detected — using the simulated low-light stream.",
             "warn")
 
     cam = SimCam(args, sensor_key, gain)
     log(f"Camera: {cam.name}  [{sensor_key} @ {gain}×]", "ok")
     return cam
+
+
+def make_args(**overrides):
+    """Build a default argument namespace (for embedding live testing in the GUI)."""
+    args = build_parser().parse_args([])
+    for k, v in overrides.items():
+        setattr(args, k, v)
+    return args
 
 
 # ---------------------------------------------------------------------------
