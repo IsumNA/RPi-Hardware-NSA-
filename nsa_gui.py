@@ -729,8 +729,9 @@ class App(tk.Tk):
                  font=font(9, "bold"), wraplength=S(560), justify="left").pack(
                      anchor="w", pady=(0, S(4)))
         add_rows([
-            ("model_family", "Model Family", "CNN · U-Net · NAFNet",
-             ["cnn", "unet", "nafnet"], "nafnet"),
+            ("model_family", "Model Family",
+             "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet",
+             ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet"], "nafnet"),
             ("base_channels", "Base Channels", "Network width", [16, 32, 64], 32),
             ("block_depth", "Block Depth", "Network depth", [2, 4, 8], 4),
             ("conv_type", "Convolution", "Standard or depthwise-separable",
@@ -806,9 +807,10 @@ class App(tk.Tk):
                     command=self._on_eval_change)
         self._radio(body, "Sweep & rank models (find the best)", "sweep",
                     enabled=True, variable=self.eval_var, badge="COMPARE",
-                    desc="Train many variants (families × widths × depths) and show "
-                         "a ranked leaderboard + Pareto front. Takes a few minutes; "
-                         "your starting conv/activation are kept fixed.",
+                    desc="Train every model family at each depth (your chosen "
+                         "width/conv/activation are kept fixed) and show a ranked, "
+                         "clickable leaderboard + Pareto front. Takes a couple of "
+                         "minutes; click any row to run that exact model.",
                     command=self._on_eval_change)
         cache_row = tk.Frame(body, bg=WHITE)
         cache_row.pack(fill="x", pady=S(6))
@@ -1085,17 +1087,21 @@ class App(tk.Tk):
         return cmd
 
     def _build_sweep_command(self):
-        # Search families × widths × depths; keep the chosen conv/activation fixed
-        # (keeps the space bounded so a GUI sweep finishes in a couple of minutes).
+        # Search all model families × depths at the chosen width, keeping the
+        # chosen conv/activation/width fixed. This bounds the grid to ~18 configs
+        # and uses enough calibration steps that PSNR actually separates the
+        # models (too few steps floors quality and the sweep just picks the
+        # fastest model). Change the width and re-sweep to explore other widths.
         cmd = [sys.executable, str(ROOT / "search.py"),
                "--hardware", self.rows["hardware"].get(),
                "--sensor", self.rows["sensor"].get(),
                "--gain", self.rows["gain"].get(),
+               "--base-channels", self.rows["base_channels"].get(),
                "--conv-type", self.rows["conv_type"].get(),
                "--activation", self.rows["activation"].get(),
-               "--search-steps", "30",
+               "--search-steps", "45",
                "--patch-size", "128",
-               "--top", "8",
+               "--top", "10",
                "--no-final-run"]
         if self.source_var.get() == "real":
             dataset = self.dataset_path or self._materialise_uploads()
@@ -1517,8 +1523,8 @@ class App(tk.Tk):
                  font=font(19, "bold")).pack(anchor="w")
         tk.Label(header, text=f"{data.get('target_label','')}  ·  "
                  f"{len(rows)} models trained & ranked by Pareto fitness  ·  "
-                 f"✦ = Pareto-optimal", bg=WHITE, fg=SUBTLE,
-                 font=font(10)).pack(anchor="w", pady=(S(2), 0))
+                 f"✦ = Pareto-optimal  ·  click any row to run it", bg=WHITE,
+                 fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))
         tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
 
         # Footer (pinned).
@@ -1558,7 +1564,7 @@ class App(tk.Tk):
         for i, r in enumerate(rows, 1):
             best = (i == 1)
             bg = FIELD if best else WHITE
-            row = tk.Frame(body, bg=bg); row.pack(fill="x", pady=1)
+            row = tk.Frame(body, bg=bg, cursor="hand2"); row.pack(fill="x", pady=1)
             star = "✦ " if r.get("pareto") else "  "
             model = (f"{r.get('family','').upper()} {r.get('base_channels')}ch×"
                      f"{r.get('block_depth')} {r.get('conv_type','')[:2]}")
@@ -1572,10 +1578,18 @@ class App(tk.Tk):
                 (f"{r.get('fitness','—')}", 9, gcol.get(g, INK)),
                 (g, 12, gcol.get(g, INK)),
             ]
+            cell_widgets = [row]
             for text, w, fg in cells:
-                tk.Label(row, text=text, bg=bg, fg=fg,
-                         font=font(9, "bold" if best else "normal"),
-                         width=w, anchor="w").pack(side="left")
+                lbl = tk.Label(row, text=text, bg=bg, fg=fg,
+                               font=font(9, "bold" if best else "normal"),
+                               width=w, anchor="w")
+                lbl.pack(side="left")
+                cell_widgets.append(lbl)
+            hi = "#F0F2F8"
+            for wdg in cell_widgets:
+                wdg.bind("<Button-1>", lambda _e, rr=r: self._ranking_row_clicked(rr))
+                wdg.bind("<Enter>", lambda _e, ws=cell_widgets: [x.configure(bg=hi) for x in ws])
+                wdg.bind("<Leave>", lambda _e, ws=cell_widgets, b=bg: [x.configure(bg=b) for x in ws])
 
         # Winner call-out.
         if winner:
@@ -1593,6 +1607,10 @@ class App(tk.Tk):
                      bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(4), S(10)))
 
     def _use_winner(self, winner: dict):
+        self._use_config(winner)
+
+    def _use_config(self, r: dict):
+        """Load a ranking row's parameters into the form (single-compile mode)."""
         self.sidebar.reset()
         self._build_form()                     # rebuilds self.rows with defaults
         self.eval_var.set("single")
@@ -1600,9 +1618,72 @@ class App(tk.Tk):
         for key in ("model_family", "base_channels", "block_depth",
                     "conv_type", "activation"):
             jkey = "family" if key == "model_family" else key
-            val = winner.get(jkey)
+            val = r.get(jkey)
             if val is not None and key in self.rows:
                 self.rows[key].set(val)
+
+    def _ranking_row_clicked(self, r: dict):
+        """Popup: show a clicked model's config + options to run it."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Run this model")
+        dlg.configure(bg=WHITE)
+        dlg.transient(self)
+        dlg.grab_set()
+        try:
+            dlg.geometry(f"{S(470)}x{S(380)}+{self.winfo_rootx()+S(120)}"
+                         f"+{self.winfo_rooty()+S(120)}")
+        except Exception:
+            pass
+
+        pad = tk.Frame(dlg, bg=WHITE)
+        pad.pack(fill="both", expand=True, padx=S(22), pady=S(18))
+        tk.Label(pad, text="Run this configuration", bg=WHITE, fg=INK,
+                 font=font(15, "bold")).pack(anchor="w")
+        title = (f"{r.get('family','').upper()}  {r.get('base_channels')}ch × "
+                 f"depth {r.get('block_depth')}")
+        tk.Label(pad, text=title, bg=WHITE, fg=RASPBERRY,
+                 font=font(13, "bold")).pack(anchor="w", pady=(S(8), 0))
+        tk.Label(pad, text=f"{r.get('conv_type','')} conv  ·  "
+                 f"{r.get('activation','')} activation",
+                 bg=WHITE, fg=INK, font=font(10)).pack(anchor="w")
+
+        g = r.get("grade", "")
+        gcol = {"OPTIMAL": GREEN, "BALANCED": "#C98A1B",
+                "SUBOPTIMAL": "#C98A1B", "INFEASIBLE": RASPBERRY}.get(g, INK)
+        for label, val, col in [
+            ("Sweep PSNR", f"{r.get('psnr','—')} dB", INK),
+            ("Sweep latency", f"{r.get('latency_ms','—')} ms", INK),
+            ("Parameters", f"{r.get('params',0):,}", INK),
+            ("Sweep fitness", f"{r.get('fitness','—')} / 100  ({g})", gcol),
+        ]:
+            rr = tk.Frame(pad, bg=WHITE); rr.pack(fill="x", pady=S(2))
+            tk.Label(rr, text=label, bg=WHITE, fg=SUBTLE, font=font(9),
+                     width=14, anchor="w").pack(side="left")
+            tk.Label(rr, text=val, bg=WHITE, fg=col,
+                     font=font(10, "bold")).pack(side="left")
+
+        tk.Label(pad, text="Sweep values come from a fast calibration. Run the full "
+                 "pipeline to get final artifacts, the validation panel and the "
+                 "per-chip suitability report.", bg=WHITE, fg=SUBTLE, font=font(8),
+                 wraplength=S(410), justify="left").pack(anchor="w", pady=(S(8), S(12)))
+
+        btns = tk.Frame(pad, bg=WHITE); btns.pack(fill="x", side="bottom")
+
+        def _run_now():
+            dlg.destroy()
+            self._use_config(r)
+            self._run()
+
+        def _load_only():
+            dlg.destroy()
+            self._use_config(r)
+
+        RoundButton(btns, "CANCEL", dlg.destroy, kind="secondary",
+                    width=110, height=40).pack(side="left")
+        RoundButton(btns, "LOAD INTO FORM", _load_only, kind="secondary",
+                    width=170, height=40).pack(side="left", padx=(S(8), 0))
+        RoundButton(btns, "RUN THIS", _run_now, kind="primary",
+                    width=130, height=40).pack(side="right")
 
     def _show_log(self):
         win = tk.Toplevel(self)

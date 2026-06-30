@@ -340,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter", nargs="*", default=[],
                    help="keyword filter for dataset folders (e.g. imx219 ag12)")
     # Search space constraints (pin parts of the space to search within)
-    p.add_argument("--model-family", dest="model_family", choices=["cnn", "unet", "nafnet"],
+    p.add_argument("--model-family", dest="model_family", choices=list(MODEL_FAMILIES),
                    default=None, help="restrict search to one model family")
     p.add_argument("--base-channels", dest="base_channels", type=int,
                    choices=[16, 32, 64], default=None,

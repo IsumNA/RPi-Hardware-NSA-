@@ -20,7 +20,7 @@ HARDWARE = {
     "hailo8": "Raspberry Pi 5 + Hailo-8",
     "deepx": "DeepX DX-M1",
 }
-MODEL_FAMILIES = ("cnn", "unet", "nafnet")
+MODEL_FAMILIES = ("cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet")
 BASE_CHANNELS = (16, 32, 64)
 BLOCK_DEPTHS = (2, 4, 8)
 CONV_TYPES = ("standard", "depthwise")

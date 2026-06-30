@@ -42,6 +42,10 @@ CAPS = {
 }
 
 
+# Families whose graph contains ConvTranspose (needs resize+conv on NPUs).
+_CONVT_FAMILIES = {"unet", "rednet"}
+
+
 @dataclass
 class CompileResult:
     precision: str = "fp16"
@@ -125,11 +129,11 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
     else:
         log("Standard convs scheduled on MAC array", "info")
         res.passes.append("schedule:conv->mac")
-    if fam == "unet":
+    if fam in _CONVT_FAMILIES:
         if cfg.hardware in ("hailo8", "deepx"):
-            log("ConvTranspose (U-Net upsample) rewritten as resize+conv "
+            log(f"ConvTranspose ({fam.upper()} upsample) rewritten as resize+conv "
                 "for NPU compatibility", "warn")
-            res.warnings.append("U-Net ConvTranspose rewritten to resize+conv.")
+            res.warnings.append(f"{fam.upper()} ConvTranspose rewritten to resize+conv.")
             res.passes.append("rewrite:convT->resize+conv")
         else:
             res.passes.append("keep:convT")
@@ -247,8 +251,9 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
         if accel and not quantize_enabled:
             notes.append("INT8-only NPU but quantization is disabled")
 
-        if cfg.model.model_family == "unet" and accel:
-            notes.append("U-Net ConvTranspose rewritten to resize+conv")
+        if cfg.model.model_family in _CONVT_FAMILIES and accel:
+            notes.append(f"{cfg.model.model_family.upper()} ConvTranspose "
+                         "rewritten to resize+conv")
 
         latency = estimate_device_latency_ms(model, patch, key, quantized)
         fps = 1000.0 / max(latency, 1e-6)
@@ -257,7 +262,7 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
         verdict = "SUITABLE"
         if not fits or (accel and not quantize_enabled):
             verdict = "UNSUITABLE"
-        elif tiled or not act_native or (cfg.model.model_family == "unet" and accel):
+        elif tiled or not act_native or (cfg.model.model_family in _CONVT_FAMILIES and accel):
             verdict = "CAVEATS"
         if fps < 5.0:
             notes.append(f"~{fps:.0f} FPS — well below real-time")

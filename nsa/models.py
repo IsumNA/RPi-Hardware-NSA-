@@ -161,6 +161,117 @@ class NAFNetUNetDenoiser(nn.Module):
         return torch.clamp(out, 0.0, 1.0)
 
 
+class DnCNNDenoiser(nn.Module):
+    """Classic DnCNN — a BatchNorm-free residual conv stack.
+
+    Distinct from ``CNNDenoiser`` (which uses BatchNorm): dropping BN makes the
+    graph friendlier to INT8 post-training quantization (no scale/shift folding),
+    so it tends to keep more PSNR after the INT8 step. Predicts the noise residual.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        layers = [_conv(3, c, cfg.conv_type), _act(cfg.activation)]
+        for _ in range(cfg.block_depth):
+            layers += [_conv(c, c, cfg.conv_type), _act(cfg.activation)]
+        self.body = nn.Sequential(*layers)
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        noise = self.tail(self.body(x))
+        return torch.clamp(x - noise, 0.0, 1.0)
+
+
+class REDNetDenoiser(nn.Module):
+    """RED-Net — residual encoder-decoder with symmetric skip connections.
+
+    A stack of convolutions (encoder) mirrored by transpose-convolutions
+    (decoder) at the *same* spatial resolution, with skip connections linking
+    matching encoder/decoder layers every two steps. The skips carry image
+    detail across the network, which helps recover texture lost to heavy noise.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        n = max(2, cfg.block_depth)
+        self.head = nn.Sequential(_conv(3, c, cfg.conv_type), _act(cfg.activation))
+        self.encoders = nn.ModuleList(
+            [nn.Sequential(_conv(c, c, cfg.conv_type), _act(cfg.activation))
+             for _ in range(n)])
+        self.decoders = nn.ModuleList(
+            [nn.Sequential(nn.ConvTranspose2d(c, c, 3, padding=1), _act(cfg.activation))
+             for _ in range(n)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        feat = self.head(x)
+        skips = []
+        for i, enc in enumerate(self.encoders):
+            feat = enc(feat)
+            if i % 2 == 0:
+                skips.append(feat)
+        for i, dec in enumerate(self.decoders):
+            feat = dec(feat)
+            j = (len(self.decoders) - 1 - i)
+            if j % 2 == 0 and skips:
+                feat = feat + skips.pop()
+        return torch.clamp(x + self.tail(feat), 0.0, 1.0)
+
+
+class _ChannelAttention(nn.Module):
+    """Squeeze-and-excitation style feature attention (RIDNet's EAM gate)."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, max(4, c // 4), 1), nn.ReLU(inplace=True),
+            nn.Conv2d(max(4, c // 4), c, 1), nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return x * self.gate(x)
+
+
+class _EAM(nn.Module):
+    """Enhancement-attention module: residual conv pair + channel attention."""
+
+    def __init__(self, c: int, conv_type: str, act: str):
+        super().__init__()
+        self.conv1 = _conv(c, c, conv_type)
+        self.conv2 = _conv(c, c, conv_type)
+        self.act = _act(act)
+        self.ca = _ChannelAttention(c)
+
+    def forward(self, x):
+        y = self.act(self.conv2(self.act(self.conv1(x))))
+        return x + self.ca(y)
+
+
+class RIDNetDenoiser(nn.Module):
+    """RIDNet-style residual-in-residual denoiser with feature attention.
+
+    A head projection feeds a stack of enhancement-attention modules (each a
+    residual conv pair gated by channel attention), then a tail projection with
+    a global residual connection. The attention lets the network suppress noisy
+    channels and emphasise structure — strong quality per parameter.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.body = nn.Sequential(
+            *[_EAM(c, cfg.conv_type, cfg.activation) for _ in range(cfg.block_depth)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        feat = self.body(self.head(x))
+        return torch.clamp(x + self.tail(feat), 0.0, 1.0)
+
+
 class UNetDenoiser(nn.Module):
     """Compact 2-scale U-Net encoder/decoder."""
 
@@ -187,7 +298,14 @@ class UNetDenoiser(nn.Module):
 def build_model(cfg: ModelConfig) -> nn.Module:
     if cfg.model_family == "nafnet" and list(getattr(cfg, "nafnet_enc_blocks", []) or []):
         return NAFNetUNetDenoiser(cfg)
-    families = {"cnn": CNNDenoiser, "unet": UNetDenoiser, "nafnet": NAFNetDenoiser}
+    families = {
+        "cnn": CNNDenoiser,
+        "dncnn": DnCNNDenoiser,
+        "unet": UNetDenoiser,
+        "rednet": REDNetDenoiser,
+        "ridnet": RIDNetDenoiser,
+        "nafnet": NAFNetDenoiser,
+    }
     return families[cfg.model_family](cfg)
 
 

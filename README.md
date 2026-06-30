@@ -19,7 +19,7 @@ ONNX export, real per-channel INT8 quantization, and real PSNR measurements.
 |------:|-------|--------------|
 | **1** | **Sensor / Input** | Pick a sensor from the **sensor library** (legacy IMX219, current IMX662, or an unreleased next-gen low-light part); ingest a real Bayer RAW or synthesise a physically-plausible one from that sensor's noise profile at extreme analog gain (256× / 512×); demosaic to linear RGB. |
 | **2** | **Data / Ground Truth** | Build a clean reference by temporally averaging many sensor reads. |
-| **3** | **Architecture** | Instantiate the denoiser (`cnn` / `unet` / `nafnet`) with the chosen channels, depth, conv type and activation. |
+| **3** | **Architecture** | Instantiate the denoiser (`cnn` / `dncnn` / `unet` / `rednet` / `ridnet` / `nafnet`) with the chosen channels, depth, conv type and activation. |
 | **4** | **Compiler** | Legalize operators for the target NPU, budget on-chip SRAM (tiling if needed), and select the quantization scheme (PTQ vs forced QAT). |
 | **5** | **Calibration / Quantization** | Live-calibrate the model on the test frame and quantize FP32 → INT8, measuring the accuracy drop. |
 | **6** | **Export** | Emit the export profile: `exported_model.onnx` plus a hardware-ready `.hef` / `.bin` / `.ort`. |
@@ -96,7 +96,7 @@ Edit `config.yaml`, or override any value on the command line.
 |------|---------|---------|
 | `--sensor` | `imx219` \| `imx662` \| `imxng` | Image sensor noise profile (Level 1) |
 | `--hardware` | `rpi5_cpu` \| `hailo8` \| `deepx` | Target export profile (Level 6) |
-| `--model-family` | `cnn` \| `unet` \| `nafnet` | Architecture (Level 3) |
+| `--model-family` | `cnn` \| `dncnn` \| `unet` \| `rednet` \| `ridnet` \| `nafnet` | Architecture (Level 3) |
 | `--base-channels` | `16` \| `32` \| `64` | Width |
 | `--block-depth` | `2` \| `4` \| `8` | Depth |
 | `--conv-type` | `standard` \| `depthwise` | Convolution style |
@@ -129,10 +129,11 @@ Edit `config.yaml`, or override any value on the command line.
 
 All of the above are also available as controls in the desktop GUI (mode radios,
 the QAT checkbox, the custom-NAFNet fields, the Pareto-sweep radio, and the
-*Build Cache* / *Build Package* buttons). The **Compile & export** checkbox makes
-the main run end-to-end — it compiles the model and writes the transferable
-hardware package in one click, with *Open Package* / *Export Package* buttons on
-the results screen.
+*Build Cache* / *Build Package* buttons). The sweep produces a **ranked,
+clickable leaderboard** — click any model row to review its config and run that
+exact model (or *Load into form*); *Use winner* loads the top result. Package
+export is an on-demand action on the results screen (*Export Package*), so a
+normal compile doesn't write a package every time.
 
 ---
 

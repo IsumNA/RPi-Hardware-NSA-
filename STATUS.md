@@ -34,7 +34,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 |------:|-------|:------:|------------------------------|
 | 1 | Sensor / Input | ✅ | Selects a sensor from a **sensor library** (IMX219 / IMX662 / unreleased IMX-NG), then **loads real captures** (paired `noisy`/`gt` folders, single files, uploads, or whole folders; `.npy`/image/`.dng` via rawpy; keyword-filtered; detail-scored crop) **or** synthesises a frame from that sensor's physical noise profile (QE, read-noise floor, full-well, PRNU, chroma; Poisson shot + Gaussian read, gain-scaled). Real frames can optionally have the sensor's noise simulated on top. |
 | 2 | Data / Ground Truth | ✅ | Uses **real paired `gt`** when present (denoise-hw convention), else temporally averages N simulated reads, else derives an NL-means reference for a lone real frame. |
-| 3 | Architecture | ✅ | Builds a real PyTorch denoiser — CNN (DnCNN-style), U-Net (2-scale), or NAFNet (simplified NAF blocks) — honouring channels / depth / conv-type / activation. |
+| 3 | Architecture | ✅ | Builds a real PyTorch denoiser from a 6-family zoo — CNN (BN), DnCNN (BN-free), U-Net (2-scale), RED-Net (residual enc-dec + skips), RIDNet (feature attention), NAFNet (NAF blocks) — honouring channels / depth / conv-type / activation. |
 | 4 | Compiler | ◐ | Runs hardware-aware passes: operator legalization, GELU→QAT / PWL handling, depthwise→grouped mapping, U-Net ConvTranspose rewrite, SRAM budgeting + tiling decision, PTQ-vs-QAT selection, export-format lock. Emits a live log. (Logic is real; it models the constraints rather than calling a vendor compiler.) |
 | 5 | Calibration / Quantization | ✅ | **Real** on-frame training (random-crop, MSE, Adam, cosine LR) and **real** per-channel INT8 weight quant + per-tensor activation fake-quant with a measured FP32→INT8 PSNR drop. **True QAT** (fake-quant-in-the-loop with straight-through gradients) is available via `--qat` and is auto-enabled for non-native activations (e.g. gelu→DeepX). |
 | 6 | Export | ✅/◐ | Writes a **real, validated** `exported_model.onnx` and a **real, self-describing** INT8 binary (`.hef`/`.bin`/`.ort`: magic header + JSON manifest + packed int8 weights + per-channel scales). The binary is a stand-in container, not a vendor-runtime-loadable file. |
@@ -54,7 +54,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Sensor library (Level 1) | ✅ | `imx219` (legacy), `imx662` (Starvis 2), `imxng` (unreleased low-light); add more in `nsa/sensors.py` |
 | Optimise for an *unreleased* sensor | ✅ | Physics-based noise injection from datasheet params — no hardware needed |
 | Target hardware selection | ✅ | `rpi5_cpu` (FP16/.ort), `hailo8` (INT8/.hef), `deepx` (INT8/.bin) |
-| Model family | ✅ | `cnn`, `unet`, `nafnet` |
+| Model family | ✅ | `cnn`, `dncnn`, `unet`, `rednet`, `ridnet`, `nafnet` |
 | Width / depth | ✅ | `base_channels` 16/32/64, `block_depth` 2/4/8 |
 | Convolution type | ✅ | `standard`, `depthwise`-separable |
 | Activation | ✅ | `relu`, `gelu`, `silu` (gelu drives the DeepX QAT path) |
@@ -73,7 +73,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Temporal video denoise | ✅ | `--temporal --burst N`: recursive IIR burst denoise, writes a denoised frame sequence to `outputs/video/` |
 | True QAT | ✅ | `--qat`: fake-quant-in-the-loop training (per-channel weights + per-tensor acts, STE gradients) |
 | Custom multi-scale NAFNet | ✅ | `--nafnet-enc 1 2 2 --nafnet-middle 4 --nafnet-dec 2 2 1`: U-shaped NAFNet with PixelShuffle up/down + skips |
-| Automated Pareto sweep | ✅ | `search.py`: grid (or `--optuna N` TPE) search; writes a Pareto front + winner to `outputs/pareto.json` |
+| Automated Pareto sweep | ✅ | `search.py`: grid (or `--optuna N` TPE) search; writes a Pareto front + winner to `outputs/pareto.json`. GUI shows a ranked, clickable leaderboard — click a row to run that exact model |
 | Patch-cache training-set builder | ✅ | `cache.py`: detail-scored crops → `outputs/patch_cache/` (denoise-hw `dataset.py` idea) |
 | Deployment package builder | ✅ | `deploy.py`: bundles artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into a `.zip` (flashing still needs the vendor SDK + device) |
 | One-click compile & export | ✅ | `run_demo.py --export` (and the GUI *Compile & export* checkbox) builds the transferable hardware package automatically at the end of a compile |
@@ -123,7 +123,7 @@ nsa/
   config.py          # dataclasses, YAML load, CLI flags, validation
   sensors.py         # sensor library (per-sensor physical noise profiles)
   raw_io.py          # sensor sim, noise model, mosaic/demosaic, RAW loader
-  models.py          # CNN / U-Net / NAFNet (configurable)
+  models.py          # CNN / DnCNN / U-Net / RED-Net / RIDNet / NAFNet (configurable)
   compiler.py        # per-target capability table + legalization passes
   inference.py       # calibration, INT8 quant, latency model, PSNR
   export.py          # ONNX export + packed INT8 device binary

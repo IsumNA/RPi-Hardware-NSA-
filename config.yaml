@@ -16,7 +16,7 @@ hardware: hailo8
 
 # ---- LEVEL 3 : Model Architecture --------------------------------------------
 model:
-  model_family: nafnet      # cnn | unet | nafnet
+  model_family: nafnet      # cnn | dncnn | unet | rednet | ridnet | nafnet
   base_channels: 32         # 16 | 32 | 64
   block_depth: 4            # 2  | 4  | 8
   conv_type: depthwise      # standard | depthwise
