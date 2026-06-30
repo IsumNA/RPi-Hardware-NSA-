@@ -124,6 +124,7 @@ Edit `config.yaml`, or override any value on the command line.
 | Tool | What it does |
 |------|--------------|
 | `python search.py --hardware hailo8` | Automated **Pareto sweep** over the design space (grid, or `--optuna N` for a TPE search). Add `--all-sensors` to also sweep every sensor profile (IMX219 · IMX662 · IMX-NG). Prints a Pareto front + winner and writes `outputs/pareto.json`. |
+| `python live.py` | **Live testing** — runs the last-compiled model (`outputs/model.pt`) on a live camera feed and shows the **raw sensor frame next to the denoised output** in real time, with live latency / FPS and a noise-reduction readout. Auto-detects the Raspberry Pi CSI camera (picamera2, e.g. the IMX662 low-light module) → a USB webcam (`--source opencv`) → a simulated low-light stream (`--source sim`) so it works even with no camera. |
 | `python hf_search.py --query qwen --size small` | **Hugging Face model sourcing** — searches the Hub filtered strictly to Apache-2.0 / MIT, tiered by size (small 1-8B → mid 8-20B → large 20-80B). `--freeze MODEL` locks the exact commit SHA into `outputs/hf_lock.json` (add `--download` to pull a pinned snapshot into `models/frozen/`); `--list-locked` shows what's frozen. |
 | `python cache.py --dataset DIR --per-image 6` | **Patch-cache builder** — detail-scored crops → `outputs/patch_cache/` for full training runs (denoise-hw `dataset.py` idea). |
 | `python deploy.py` | **Deployment package** — bundles the compiled artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into `outputs/deployment/…zip` (flashing still needs the vendor SDK + device). Run automatically when you pass `--export` (or tick *Compile & export* in the GUI). |
@@ -169,6 +170,28 @@ Search, license-vetting and freezing the commit hash use only the Python
 standard library (the public Hub API); downloading a pinned snapshot uses the
 optional `huggingface_hub` package. This is a discovery + vetting + freeze
 front-end — the on-device 6-level compile still targets the built-in denoisers.
+
+### Live testing on the Pi camera
+
+After a compile, the results screen has a **LIVE TESTING** button (or run
+`python live.py`). It loads the exact model just compiled (`outputs/model.pt`)
+and runs it on a live camera stream, showing the **raw sensor feed beside the
+denoised output** in real time — the on-device proof that the optimization
+actually cleans up the low-light camera. The overlay reports per-frame latency,
+FPS, and a live noise-reduction percentage (high-frequency noise of the raw vs
+denoised frame).
+
+Camera backends are auto-detected (override with `--source`):
+
+1. **picamera2** — the Raspberry Pi CSI camera (e.g. the **IMX662 low-light**
+   module); `--cam-gain` / `--exposure` push it into the noisy low-light regime.
+2. **OpenCV** — any USB / V4L2 webcam (`--source opencv --camera-index N`).
+3. **simulated** — a synthetic low-light stream from the sensor noise model
+   (`--source sim --sensor imx662`), so the feature is demonstrable on a dev
+   machine with no camera attached.
+
+Press `q` or `ESC` in the window to stop. On a headless box it saves a
+side-by-side sample to `outputs/live_preview.png` instead of opening a window.
 
 The Level-3 options are also **contextual**: pick a model family first and only
 the parameters that apply appear (e.g. NAFNet and Restormer hide the activation

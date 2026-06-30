@@ -1619,6 +1619,33 @@ class App(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Lock file", str(exc))
 
+    def _live_test(self):
+        """Launch live camera testing (raw vs denoised) in its own window."""
+        if not (ROOT / "outputs" / "model.pt").exists():
+            if not messagebox.askyesno(
+                "Live testing",
+                "No compiled model checkpoint (outputs/model.pt) was found yet.\n\n"
+                "Live testing will rebuild and quick-calibrate a model first "
+                "(a few seconds). Continue?"):
+                return
+        cmd = [sys.executable, str(ROOT / "live.py"), "--source", "auto"]
+        try:
+            kwargs = {"cwd": str(ROOT)}
+            if sys.platform.startswith("win"):
+                kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+            subprocess.Popen(cmd, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Live testing", str(exc))
+            return
+        messagebox.showinfo(
+            "Live testing",
+            "Opening the live camera view in a new window.\n\n"
+            "It connects to the Raspberry Pi camera (or a USB webcam) and shows "
+            "the raw sensor feed beside the denoised output in real time, with "
+            "live latency / FPS and a noise-reduction readout. With no camera it "
+            "falls back to a simulated low-light stream.\n\n"
+            "Press 'q' or ESC in that window to stop.")
+
     def _build_deploy(self):
         if not (ROOT / "outputs" / "summary.json").exists():
             messagebox.showinfo(
@@ -1837,11 +1864,13 @@ class App(tk.Tk):
         footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
         tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
         RoundButton(footer, "RUN AGAIN", self._back, kind="secondary",
-                    width=150, height=44).pack(side="left")
-        RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
+                    width=140, height=44).pack(side="left")
+        RoundButton(footer, "LIVE TESTING", self._live_test, kind="primary",
                     width=170, height=44).pack(side="left", padx=(S(8), 0))
+        RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
+                    width=160, height=44).pack(side="left", padx=(S(8), 0))
         RoundButton(footer, "FULL LOG", self._show_log, kind="primary",
-                    width=140, height=44).pack(side="right")
+                    width=130, height=44).pack(side="right")
         if s and s.get("package_zip"):
             RoundButton(footer, "OPEN PACKAGE",
                         lambda: self._reveal(s.get("package_zip")), kind="primary",

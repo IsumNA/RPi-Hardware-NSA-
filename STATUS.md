@@ -74,6 +74,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | True QAT | ✅ | `--qat`: fake-quant-in-the-loop training (per-channel weights + per-tensor acts, STE gradients) |
 | Custom multi-scale NAFNet | ✅ | `--nafnet-enc 1 2 2 --nafnet-middle 4 --nafnet-dec 2 2 1`: U-shaped NAFNet with PixelShuffle up/down + skips |
 | Automated Pareto sweep | ✅ | `search.py`: grid (or `--optuna N` TPE) search over all 9 families; `--all-sensors` also sweeps every sensor profile (IMX219 / IMX662 / IMX-NG). Writes a Pareto front + winner + per-chip suitability + sensor to `outputs/pareto.json`. GUI shows a ranked, clickable leaderboard with a "Best for" chip filter (Pi 5 CPU / Hailo-8 / DeepX) that floats suitable models to the top, standout tags (top pick / sharpest / fastest / leanest), and a SENSOR column for all-sensors sweeps — click a row to run that exact model |
+| Live camera testing | ✅ | `live.py` (and GUI *LIVE TESTING* button): loads the last-compiled model (`outputs/model.pt`) and runs it on a live feed, showing raw vs denoised side-by-side with latency / FPS / noise-reduction. Auto-detects picamera2 (Pi CSI, e.g. IMX662 low-light) → USB/V4L2 (OpenCV) → simulated low-light stream |
 | Hugging Face model sourcing | ✅ | `hf_search.py` + `nsa/hub.py` (and GUI *Browse Hugging Face*): license-filtered (Apache-2.0 / MIT only) Hub search, size tiers (small 1-8B → mid 8-20B → large 20-80B), and **freeze** of the exact commit SHA into `outputs/hf_lock.json` (optional pinned snapshot to `models/frozen/` via `huggingface_hub`). Search + freeze use stdlib HTTP only |
 | Patch-cache training-set builder | ✅ | `cache.py`: detail-scored crops → `outputs/patch_cache/` (denoise-hw `dataset.py` idea) |
 | Deployment package builder | ✅ | `deploy.py`: bundles artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into a `.zip` (flashing still needs the vendor SDK + device) |
@@ -117,6 +118,7 @@ config.yaml          # single source of truth for inputs
 run_demo.py          # CLI entry; orchestrates all 6 levels (single/batch/temporal)
 search.py            # automated Pareto sweep (grid or Optuna TPE) over the design space
 hf_search.py         # Hugging Face model sourcing CLI (license filter, size tiers, freeze)
+live.py              # live camera testing (raw vs denoised, picamera2/OpenCV/sim)
 cache.py             # patch-cache training-set builder (detail-scored crops)
 deploy.py            # deployment package builder (artifacts + flash instructions + zip)
 nsa_gui.py           # Raspberry Pi Imager-styled desktop UI (DPI-aware)
@@ -212,6 +214,10 @@ python search.py --hardware hailo8 --all-sensors --search-steps 40 --no-final-ru
 
 # one-click: compile AND export the transferable hardware package
 python run_demo.py --hardware hailo8 --export --no-window
+
+# live camera test the compiled model (raw vs denoised, real-time)
+python live.py                                        # auto camera; sim if none
+python live.py --source sim --sensor imx662 --seconds 10   # demo with no camera
 
 # source a Hugging Face model the safe way (license-filtered, size-tiered)…
 python hf_search.py --query qwen --size small        # step 1-2: benchmark small

@@ -26,3 +26,8 @@ onnx>=1.15
 # model (hf_search.py --download / the GUI FREEZE button). Searching, license
 # filtering and freezing the commit hash work without it (stdlib HTTP only).
 # huggingface_hub>=0.23
+
+# Optional: live testing against the Raspberry Pi CSI camera (live.py / the GUI
+# LIVE TESTING button). Install ON THE PI (it ships with Raspberry Pi OS). On a
+# dev machine live.py falls back to a USB webcam (OpenCV) or a simulated stream.
+# picamera2>=0.3   # Raspberry Pi only

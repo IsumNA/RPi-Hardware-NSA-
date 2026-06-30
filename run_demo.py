@@ -299,6 +299,32 @@ def main() -> int:
     log(f"Wrote {artifact_path}  ({info['total_bytes']/1024:.1f} KB)  "
         f"[{result.export_format}, {info['layers']} layers]", "ok")
 
+    # Save the trained FP32 weights so `live.py` can run THIS exact model on a
+    # live camera stream without re-training (Level-7 live testing).
+    try:
+        ckpt_path = out_dir / "model.pt"
+        torch.save({
+            "state_dict": model.state_dict(),
+            "model": {
+                "family": cfg.model.model_family,
+                "base_channels": cfg.model.base_channels,
+                "block_depth": cfg.model.block_depth,
+                "conv_type": cfg.model.conv_type,
+                "activation": cfg.model.activation,
+                "nafnet_enc": list(cfg.model.nafnet_enc_blocks),
+                "nafnet_middle": cfg.model.nafnet_middle_blocks,
+                "nafnet_dec": list(cfg.model.nafnet_dec_blocks),
+            },
+            "sensor": cfg.sensor.sensor,
+            "gain": cfg.sensor.gain,
+            "hardware": cfg.hardware,
+            "params": n_params,
+            "psnr_out": final_psnr,
+        }, ckpt_path)
+        log(f"Wrote {ckpt_path}  (FP32 weights for live testing)", "ok")
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not save live-testing checkpoint: {exc}", "warn")
+
     # ===========================================================================
     # OUTPUT 3 - VISUAL VALIDATION MATRIX
     # ===========================================================================
