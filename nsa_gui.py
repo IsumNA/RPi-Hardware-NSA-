@@ -27,25 +27,59 @@ except Exception:  # pragma: no cover
     Image = ImageTk = None
 
 
-# -- High-DPI awareness (crisp text on scaled Windows displays) ----------------
+# -- Display scaling (readable text on Windows, Linux and macOS) ---------------
+# Windows: derive from the real DPI. Linux/macOS: ctypes.windll doesn't exist, so
+# we use a comfortable default (text was tiny before because it fell back to 1.0
+# AND "Segoe UI" is absent on Linux). Override anytime with NSA_UI_SCALE=1.5.
+USE_TK_SCALING = False  # set True only on the Windows DPI path
+
+
 def _detect_scale() -> float:
-    """Make the process DPI-aware and return the display scale factor."""
-    try:
-        import ctypes
+    global USE_TK_SCALING
+    env = os.environ.get("NSA_UI_SCALE")
+    if env:
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor v2
-        except Exception:
-            ctypes.windll.user32.SetProcessDPIAware()
+            return max(0.8, min(3.0, float(env)))
+        except ValueError:
+            pass
+    if sys.platform.startswith("win"):
         try:
-            dpi = ctypes.windll.user32.GetDpiForSystem()
+            import ctypes
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor v2
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()
+            try:
+                dpi = ctypes.windll.user32.GetDpiForSystem()
+            except Exception:
+                dpi = 96
+            USE_TK_SCALING = True
+            return max(1.0, dpi / 96.0)
         except Exception:
-            dpi = 96
-        return max(1.0, dpi / 96.0)
-    except Exception:
-        return 1.0
+            return 1.0
+    # Linux / macOS: enlarge by default so the UI is readable out of the box.
+    return 1.35 if sys.platform.startswith("linux") else 1.2
 
 
 SCALE = _detect_scale()
+
+# Resolved at runtime (after a Tk root exists) to an installed family.
+FONT_FAMILY = "Segoe UI"
+_FONT_PREFS = ["Segoe UI", "Nunito", "Cantarell", "Ubuntu", "Noto Sans",
+               "DejaVu Sans", "Helvetica", "Arial", "TkDefaultFont"]
+
+
+def _resolve_font_family():
+    """Pick the first installed preferred family (needs a Tk root to exist)."""
+    global FONT_FAMILY
+    try:
+        available = set(tkfont.families())
+        for fam in _FONT_PREFS:
+            if fam in available:
+                FONT_FAMILY = fam
+                return
+    except Exception:
+        pass
 
 
 def S(x: float) -> int:
@@ -58,7 +92,8 @@ def FT(size: float) -> int:
     return int(round(size * SCALE))
 
 
-def font(size: float, weight: str = "normal", family: str = "Segoe UI"):
+def font(size: float, weight: str = "normal", family: str | None = None):
+    family = family or FONT_FAMILY
     if weight == "normal":
         return (family, FT(size))
     return (family, FT(size), weight)
@@ -237,12 +272,15 @@ class ConfigRow(tk.Frame):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        _resolve_font_family()
         self.title("NSA — Neural Sensor Architecture")
         self.configure(bg=WHITE)
-        self.geometry(f"{S(960)}x{S(660)}")
+        self.geometry(f"{S(980)}x{S(680)}")
         self.minsize(S(900), S(620))
+        # On Windows we already scale fonts via FT(); applying Tk's own scaling on
+        # top double-counts on Linux, so only enable it on the Windows DPI path.
         try:
-            self.tk.call("tk", "scaling", SCALE * 1.0)
+            self.tk.call("tk", "scaling", SCALE if USE_TK_SCALING else 1.0)
         except Exception:
             pass
         try:
@@ -258,6 +296,12 @@ class App(tk.Tk):
         self.dataset_path = None
         self.upload_files = []
 
+        self._build_chrome()
+
+    def _build_chrome(self):
+        """(Re)build the sidebar + main area — used on launch and on rescale."""
+        for w in self.winfo_children():
+            w.destroy()
         self.sidebar = Sidebar(self)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.reset()
@@ -564,7 +608,7 @@ class App(tk.Tk):
         footer = tk.Frame(self.main, bg=WHITE)
         footer.pack(side="bottom", fill="x", padx=pad, pady=S(16))
         tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
-        RoundButton(footer, "APP OPTIONS", self._noop, kind="secondary",
+        RoundButton(footer, "APP OPTIONS", self._app_options, kind="secondary",
                     width=150, height=44).pack(side="left")
         self.run_btn = RoundButton(footer, "RUN COMPILE", self._run, kind="primary",
                                    width=180, height=44)
@@ -633,6 +677,64 @@ class App(tk.Tk):
 
     def _noop(self):
         pass
+
+    def _set_ui_scale(self, value, win=None):
+        """Live-apply a new text/UI scale and rebuild the whole window."""
+        global SCALE
+        SCALE = max(0.8, min(3.0, float(value)))
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        try:
+            self.tk.call("tk", "scaling", SCALE if USE_TK_SCALING else 1.0)
+        except Exception:
+            pass
+        self.geometry(f"{S(980)}x{S(680)}")
+        self._build_chrome()
+
+    def _app_options(self):
+        win = tk.Toplevel(self)
+        win.title("App Options")
+        win.configure(bg=WHITE)
+        win.transient(self)
+        win.resizable(False, False)
+        pad = S(24)
+        wrap = tk.Frame(win, bg=WHITE)
+        wrap.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        tk.Label(wrap, text="App Options", bg=WHITE, fg=INK,
+                 font=font(16, "bold")).pack(anchor="w")
+        tk.Label(wrap, text="Adjust how the interface looks.", bg=WHITE,
+                 fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), S(14)))
+
+        tk.Label(wrap, text="TEXT SIZE", bg=WHITE, fg=RASPBERRY,
+                 font=font(9, "bold")).pack(anchor="w")
+        tk.Label(wrap, text=f"Current scale: {SCALE:.2f}×  "
+                 f"(or set NSA_UI_SCALE before launch)", bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w", pady=(S(2), S(8)))
+        sizes = tk.Frame(wrap, bg=WHITE)
+        sizes.pack(fill="x", pady=(0, S(16)))
+        for label, val in [("Small", 1.0), ("Medium", 1.3),
+                           ("Large", 1.6), ("Extra Large", 1.9)]:
+            RoundButton(sizes, label, lambda v=val: self._set_ui_scale(v, win),
+                        kind="secondary", width=128, height=40).pack(
+                            side="left", padx=(0, S(8)))
+
+        tk.Frame(wrap, bg=LINE, height=1).pack(fill="x", pady=(0, S(14)))
+        actions = tk.Frame(wrap, bg=WHITE)
+        actions.pack(fill="x")
+        RoundButton(actions, "OPEN OUTPUTS", self._open_outputs,
+                    kind="secondary", width=170, height=42).pack(side="left")
+        RoundButton(actions, "CLOSE", win.destroy,
+                    kind="primary", width=130, height=42).pack(side="right")
+
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.grab_set()
 
     # -- Run view -------------------------------------------------------------
     def _run(self):
