@@ -448,6 +448,15 @@ def main() -> int:
         except Exception as exc:
             log(f"Deployment export failed: {exc}", "warn")
 
+    # -- Save this run into the persistent history (so it can be browsed/reused) -
+    try:
+        from nsa.history import record_run
+        rec = record_run(summary, out_dir)
+        log(f"Saved to run history -> {Path(rec['dir']).name}  "
+            f"(browse past runs in the GUI · HISTORY)", "ok")
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not write run history: {exc}", "warn")
+
     if result.warnings:
         console.print()
         log(f"{len(result.warnings)} compiler note(s) issued during this build:", "warn")

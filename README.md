@@ -153,14 +153,20 @@ write a package every time.
 ### Sourcing external models from Hugging Face
 
 The model step also has a **Browse Hugging Face** button (and the standalone
-`hf_search.py` CLI) that brings the methodology in-house:
+`hf_search.py` CLI) that brings the methodology in-house. The GUI browser
+**auto-loads a relevant model list as soon as it opens** — no need to invent a
+search query. A **Category** dropdown (Low-light enhancement, Image denoising,
+Image restoration, Super-resolution, …) re-loads the relevant models instantly;
+an optional *Refine* keyword and *Size* filter narrow it further.
 
 1. **Filter by License** — only **Apache-2.0 / MIT** models are ever returned, so
    legal risk is eliminated up front.
-2. **Benchmark Small** — searches default to the **small** tier (1-8B params) to
-   establish a speed/hardware-cost baseline.
-3. **Test the Gap** — bump the *Size* selector to **mid** (8-20B) or **large**
-   (20-80B) to see whether the accuracy jump justifies the extra compute.
+2. **Pick a relevant category** — the list is pre-filtered to image-to-image
+   denoising / restoration models that fit this project (most are *tiny*, so the
+   *Size* filter defaults to **any**). For LLM-style sourcing, the CLI still
+   supports the small (1-8B) → mid (8-20B) → large (20-80B) tiers.
+3. **Test the Gap** — switch Category or bump the *Size* selector to see whether
+   a bigger model's accuracy jump justifies the extra compute.
 4. **Freeze the Weights** — **FREEZE** locks that model's exact commit SHA into
    `outputs/hf_lock.json` (your secure manifest); `--download` additionally pulls
    a pinned snapshot into `models/frozen/`, so an upstream update can never
@@ -207,6 +213,23 @@ The Level-3 options are also **contextual**: pick a model family first and only
 the parameters that apply appear (e.g. NAFNet and Restormer hide the activation
 and conv-type rows because they use a built-in SimpleGate / transposed-attention
 graph instead).
+
+### Run history (don't re-run tests you've already done)
+
+Every compile and sweep is **automatically archived** to `outputs/history/` — a
+timestamped snapshot folder (the trained `model.pt`, `summary.json`, the
+validation panel, ONNX / device artifact and any package `.zip`) plus a one-line
+record in `outputs/history/index.jsonl`. Nothing is overwritten, so past results
+*and* models stay around.
+
+Open it from the **HISTORY** button (on the first wizard step and on the results
+screen). Each past run shows its profile, target chip, sensor and key metrics
+(PSNR in→out, FPS, latency, fitness/grade), with actions to:
+
+- **Open folder** / **View panel** — inspect the saved artifacts and before/after image.
+- **Use for live** — load that exact model as `outputs/model.pt` and jump straight
+  into live camera testing — no recompile.
+- **Load config** — reload that run's configuration into the wizard.
 
 ---
 

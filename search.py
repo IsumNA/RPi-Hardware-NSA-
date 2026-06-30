@@ -601,6 +601,15 @@ def main() -> int:
             show_sensor=args.all_sensors))
     pareto_path = _save_pareto(results, front, winner, caps, args)
     console.print(f"\n  [{_MUTED}]Saved sweep results -> {pareto_path}[/]")
+    try:
+        import json as _json
+        from nsa.history import record_sweep
+        _rec = record_sweep(_json.loads(pareto_path.read_text(encoding="utf-8")),
+                            Path("outputs"))
+        console.print(f"  [{_MUTED}]Saved to run history -> "
+                      f"{Path(_rec['dir']).name}[/]")
+    except Exception as _exc:  # noqa: BLE001
+        console.print(f"  [{_AMBER}]Could not write run history: {_exc}[/]")
 
     if skipped:
         console.print(f"\n  [{_MUTED}]{len(skipped)} combinations skipped (infeasible SRAM):[/]")

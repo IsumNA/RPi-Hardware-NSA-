@@ -146,6 +146,19 @@ SENSOR_CARDS = [
     },
 ]
 
+# Curated, project-relevant Hugging Face categories so the browser can show a
+# ready-made list of denoising / low-light / restoration models without the user
+# having to think up a search query. (label -> search query, pipeline tag).
+HF_CATEGORIES = [
+    ("Low-light enhancement", "low-light", "image-to-image"),
+    ("Image denoising", "denoise", "image-to-image"),
+    ("Image restoration", "restoration", "image-to-image"),
+    ("Super-resolution", "super-resolution", "image-to-image"),
+    ("Image-to-image (all)", "", "image-to-image"),
+    ("Denoisers (any task)", "denoise", ""),
+]
+HF_CATEGORY_MAP = {label: (q, t) for label, q, t in HF_CATEGORIES}
+
 # -- Raspberry Pi Imager palette ----------------------------------------------
 WHITE = "#FFFFFF"
 INK = "#2B2B2B"
@@ -1222,6 +1235,9 @@ class App(tk.Tk):
             w.destroy()
         RoundButton(self._nav, "APP OPTIONS", self._app_options, kind="secondary",
                     width=140, height=44).pack(side="left")
+        if self._step == 0:
+            RoundButton(self._nav, "HISTORY", self._show_history, kind="secondary",
+                        width=120, height=44).pack(side="left", padx=(S(8), 0))
         if self._step > 0:
             RoundButton(self._nav, "◀ BACK", lambda: self._goto_step(self._step - 1),
                         kind="secondary", width=120,
@@ -1752,41 +1768,56 @@ class App(tk.Tk):
             tk.Radiobutton(lf, text=label, variable=self._hf_license, value=val,
                            bg=WHITE, fg=INK, selectcolor=WHITE,
                            activebackground=WHITE, font=font(10),
-                           highlightthickness=0, bd=0).pack(side="left", padx=(0, S(8)))
+                           highlightthickness=0, bd=0,
+                           command=self._hf_run_search).pack(side="left",
+                                                             padx=(0, S(8)))
 
-        self._hf_size = tk.StringVar(value="small")
-        self._hf_task = tk.StringVar(value="text-generation")
+        self._hf_size = tk.StringVar(value="any")
+        self._hf_category = tk.StringVar(value=HF_CATEGORIES[0][0])
         self._hf_query = tk.StringVar(value="")
 
-        def field(label, var, values=None, width=26):
-            fr = tk.Frame(ctl, bg=WHITE); fr.pack(fill="x", pady=S(2))
-            tk.Label(fr, text=label, bg=WHITE, fg=INK, font=font(10, "bold"),
-                     width=9, anchor="w").pack(side="left")
-            if values:
-                ttk.Combobox(fr, textvariable=var, values=values, state="readonly",
-                             width=width, style="Rpi.TCombobox").pack(side="left")
-            else:
-                ent = ttk.Entry(fr, textvariable=var, width=width + 3, font=font(10))
-                ent.pack(side="left")
-                ent.bind("<Return>", lambda _e: self._hf_run_search())
+        # Category picker — pre-loads a relevant model list, no query needed.
+        crow = tk.Frame(ctl, bg=WHITE); crow.pack(fill="x", pady=S(2))
+        tk.Label(crow, text="Category", bg=WHITE, fg=INK, font=font(10, "bold"),
+                 width=9, anchor="w").pack(side="left")
+        cat_cb = ttk.Combobox(crow, textvariable=self._hf_category,
+                              values=[c[0] for c in HF_CATEGORIES],
+                              state="readonly", width=28, style="Rpi.TCombobox")
+        cat_cb.pack(side="left")
+        cat_cb.bind("<<ComboboxSelected>>", lambda _e: self._hf_run_search())
 
-        field("Size", self._hf_size, values=["small", "mid", "large", "any"], width=24)
-        tk.Label(ctl, text="          small = 1-8B  ·  mid = 8-20B  ·  large = 20-80B",
-                 bg=WHITE, fg=SUBTLE, font=font(8)).pack(anchor="w")
-        field("Task", self._hf_task)
-        field("Query", self._hf_query)
+        srow2 = tk.Frame(ctl, bg=WHITE); srow2.pack(fill="x", pady=S(2))
+        tk.Label(srow2, text="Size", bg=WHITE, fg=INK, font=font(10, "bold"),
+                 width=9, anchor="w").pack(side="left")
+        size_cb = ttk.Combobox(srow2, textvariable=self._hf_size,
+                               values=["any", "tiny", "small", "mid", "large"],
+                               state="readonly", width=12, style="Rpi.TCombobox")
+        size_cb.pack(side="left")
+        size_cb.bind("<<ComboboxSelected>>", lambda _e: self._hf_run_search())
+        tk.Label(srow2, text="  tiny <1B · small 1-8B  (denoisers are usually tiny)",
+                 bg=WHITE, fg=SUBTLE, font=font(8)).pack(side="left")
+
+        # Optional free-text refinement (not required — list loads automatically).
+        qrow = tk.Frame(ctl, bg=WHITE); qrow.pack(fill="x", pady=S(2))
+        tk.Label(qrow, text="Refine", bg=WHITE, fg=INK, font=font(10, "bold"),
+                 width=9, anchor="w").pack(side="left")
+        ent = ttk.Entry(qrow, textvariable=self._hf_query, width=28, font=font(10))
+        ent.pack(side="left")
+        ent.bind("<Return>", lambda _e: self._hf_run_search())
+        tk.Label(qrow, text="  optional keyword", bg=WHITE, fg=SUBTLE,
+                 font=font(8)).pack(side="left")
 
         srow = tk.Frame(ctl, bg=WHITE); srow.pack(fill="x", pady=(S(6), 0))
-        self._hf_search_btn = RoundButton(srow, "SEARCH", self._hf_run_search,
-                                          kind="primary", width=140, height=38)
+        self._hf_search_btn = RoundButton(srow, "REFRESH LIST", self._hf_run_search,
+                                          kind="primary", width=160, height=38)
         self._hf_search_btn.pack(side="left")
         self._hf_status = tk.Label(srow, text="", bg=WHITE, fg=SUBTLE, font=font(9),
-                                   wraplength=S(440), justify="left")
+                                   wraplength=S(420), justify="left")
         self._hf_status.pack(side="left", padx=(S(10), 0))
 
         tk.Frame(pad, bg=LINE, height=1).pack(fill="x", pady=(S(10), S(4)))
         hdr = tk.Frame(pad, bg=WHITE); hdr.pack(fill="x")
-        for label, w in [("MODEL", 34), ("PARAMS", 8), ("TIER", 6), ("LICENSE", 11)]:
+        for label, w in [("MODEL", 42), ("PARAMS", 8), ("TIER", 6), ("LICENSE", 11)]:
             tk.Label(hdr, text=label, bg=WHITE, fg=SUBTLE, font=font(8, "bold"),
                      width=w, anchor="w").pack(side="left")
         self._hf_results = tk.Frame(pad, bg=WHITE)
@@ -1801,9 +1832,10 @@ class App(tk.Tk):
         tk.Label(ftr, text="frozen → outputs/hf_lock.json", bg=WHITE, fg=SUBTLE,
                  font=font(8)).pack(side="right")
 
-        self._hf_set_status("Pick a license + size, then SEARCH. Start small; "
-                            "step up only if accuracy demands it.")
+        self._hf_set_status("Loading relevant models…", RASPBERRY)
         self.after(150, lambda: self._hf_poll(dlg))
+        # Auto-load a relevant list immediately — no manual search needed.
+        self.after(250, self._hf_run_search)
 
     def _hf_set_status(self, text, color=None):
         if hasattr(self, "_hf_status") and self._hf_status.winfo_exists():
@@ -1816,11 +1848,14 @@ class App(tk.Tk):
         licenses = (["apache-2.0", "mit"] if self._hf_license.get() == "both"
                     else [self._hf_license.get()])
         size = self._hf_size.get()
-        task = self._hf_task.get().strip()
-        query = self._hf_query.get().strip()
+        cat_q, task = HF_CATEGORY_MAP.get(self._hf_category.get(),
+                                          ("", "image-to-image"))
+        refine = self._hf_query.get().strip()
+        query = refine or cat_q
         self._hf_busy = True
         self._hf_search_btn.set_enabled(False)
-        self._hf_set_status("Searching the Hugging Face Hub…", RASPBERRY)
+        self._hf_set_status(f"Loading {self._hf_category.get().lower()} models…",
+                            RASPBERRY)
 
         def work():
             try:
@@ -1847,7 +1882,8 @@ class App(tk.Tk):
             self._hf_set_status(
                 f"{len(payload)} license-safe model(s). Click FREEZE to lock one's "
                 f"exact commit." if payload else
-                "No models matched — try Size = any or a different query.",
+                "No models in this category for that license/size — try another "
+                "Category, Size = any, or License = Both.",
                 GREEN if payload else AMBER)
         elif kind == "search_err":
             self._hf_busy = False
@@ -1871,8 +1907,8 @@ class App(tk.Tk):
         for w in holder.winfo_children():
             w.destroy()
         if not self._hf_rows:
-            tk.Label(holder, text="No models to show. Search with Size = any or a "
-                     "broader query.", bg=WHITE, fg=SUBTLE,
+            tk.Label(holder, text="No models to show — pick another Category, set "
+                     "Size = any, or License = Both.", bg=WHITE, fg=SUBTLE,
                      font=font(9)).pack(anchor="w", pady=S(8))
             return
         locked = {e.get("id") for e in hub.load_lock(self._hf_lock)}
@@ -1881,7 +1917,7 @@ class App(tk.Tk):
         for r in self._hf_rows:
             row = tk.Frame(holder, bg=WHITE); row.pack(fill="x", pady=1)
             tk.Label(row, text=r.get("id", ""), bg=WHITE, fg=INK, font=font(9),
-                     width=34, anchor="w").pack(side="left")
+                     width=42, anchor="w").pack(side="left")
             tk.Label(row, text=hub.human_params(r.get("params")), bg=WHITE, fg=INK,
                      font=font(9, "bold"), width=8, anchor="w").pack(side="left")
             t = r.get("tier") or "—"
@@ -2163,6 +2199,8 @@ class App(tk.Tk):
                     width=140, height=44).pack(side="left")
         RoundButton(footer, "LIVE TESTING", self._live_test, kind="primary",
                     width=170, height=44).pack(side="left", padx=(S(8), 0))
+        RoundButton(footer, "HISTORY", self._show_history, kind="secondary",
+                    width=120, height=44).pack(side="left", padx=(S(8), 0))
         RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
                     width=160, height=44).pack(side="left", padx=(S(8), 0))
         RoundButton(footer, "FULL LOG", self._show_log, kind="primary",
@@ -2708,6 +2746,177 @@ class App(tk.Tk):
             messagebox.showinfo("Outputs folder", f"Results are saved in:\n{path}")
         except Exception:
             pass
+
+    def _open_path(self, target):
+        """Open a file or folder directly in the OS."""
+        p = Path(target)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showinfo("Open", f"{target}\n\n({exc})")
+
+    # -- Run history ---------------------------------------------------------
+    def _show_history(self):
+        """Browse past compiles + sweeps saved under outputs/history/."""
+        try:
+            from nsa.history import load_history
+            rows = load_history(ROOT / "outputs" / "history")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("History", f"Could not load history:\n{exc}")
+            return
+
+        pad = S(34)
+        try:
+            self.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+        for w in self.main.winfo_children():
+            w.destroy()
+        try:
+            self.sidebar.all_done()
+        except Exception:
+            pass
+
+        header = tk.Frame(self.main, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(22), S(2)))
+        tk.Label(header, text="Run history", bg=WHITE, fg=INK,
+                 font=font(19, "bold")).pack(anchor="w")
+        tk.Label(header, text=f"{len(rows)} saved run(s) · refer back to past results "
+                 "and models without re-running anything", bg=WHITE, fg=SUBTLE,
+                 font=font(10)).pack(anchor="w", pady=(S(2), 0))
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
+
+        footer = tk.Frame(self.main, bg=WHITE)
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
+        tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
+        RoundButton(footer, "◀ BACK", self._back, kind="secondary",
+                    width=130, height=44).pack(side="left")
+        RoundButton(footer, "OPEN HISTORY FOLDER",
+                    lambda: self._open_path(ROOT / "outputs" / "history"),
+                    kind="secondary", width=210, height=44).pack(side="left",
+                                                                 padx=(S(8), 0))
+
+        outer = tk.Frame(self.main, bg=WHITE)
+        outer.pack(fill="both", expand=True, padx=pad, pady=(S(8), 0))
+        body = self._make_scrollable(outer)
+
+        if not rows:
+            tk.Label(body, text="No runs saved yet. Run a compile or sweep and it will "
+                     "be archived here automatically (model + report + artifacts).",
+                     bg=WHITE, fg=SUBTLE, font=font(11), wraplength=S(560),
+                     justify="left").pack(anchor="w", pady=S(20))
+            return
+        for rec in rows:
+            self._history_card(body, rec)
+
+    def _history_card(self, parent, rec):
+        is_sweep = rec.get("kind") == "sweep"
+        card = tk.Frame(parent, bg=FIELD)
+        card.pack(fill="x", pady=S(5))
+        inner = tk.Frame(card, bg=FIELD)
+        inner.pack(fill="x", padx=S(14), pady=S(10))
+
+        top = tk.Frame(inner, bg=FIELD); top.pack(fill="x")
+        tk.Label(top, text=rec.get("time", ""), bg=FIELD, fg=INK,
+                 font=font(11, "bold")).pack(side="left")
+        kind_txt = "SWEEP" if is_sweep else "COMPILE"
+        kind_col = AMBER if is_sweep else RASPBERRY
+        tk.Label(top, text=f"  {kind_txt} ", bg=FIELD, fg=kind_col,
+                 font=font(8, "bold")).pack(side="left", padx=(S(6), 0))
+        g = rec.get("grade")
+        if g:
+            tk.Label(top, text=f" {g} ", bg=FIELD, fg=GRADE_COLORS.get(g, INK),
+                     font=font(8, "bold")).pack(side="right")
+
+        prof = rec.get("profile", "")
+        sub = f"{prof}   ·   {rec.get('hardware_name', rec.get('hardware',''))}"
+        sensor = rec.get("sensor")
+        if sensor:
+            sub += f"   ·   {sensor}"
+        if rec.get("gain"):
+            sub += f" @{rec.get('gain')}x"
+        tk.Label(inner, text=sub, bg=FIELD, fg=RASPBERRY, font=font(10, "bold"),
+                 wraplength=S(620), justify="left").pack(anchor="w", pady=(S(3), 0))
+
+        # Metrics line
+        bits = []
+        if rec.get("psnr_out") is not None:
+            if rec.get("psnr_in") is not None:
+                bits.append(f"PSNR {rec['psnr_in']:.1f} -> {rec['psnr_out']:.1f} dB")
+            else:
+                bits.append(f"PSNR {rec['psnr_out']:.1f} dB")
+        if rec.get("fps"):
+            bits.append(f"{rec['fps']:.0f} FPS")
+        if rec.get("latency_ms"):
+            bits.append(f"{rec['latency_ms']:.1f} ms")
+        if rec.get("fitness") is not None:
+            bits.append(f"fit {rec['fitness']}")
+        if rec.get("params"):
+            bits.append(f"{rec['params']/1000:.1f}K params")
+        if is_sweep and rec.get("n_evaluated"):
+            bits.append(f"{rec['n_evaluated']} models tried")
+        if bits:
+            tk.Label(inner, text="   ·   ".join(bits), bg=FIELD, fg=INK,
+                     font=font(9)).pack(anchor="w", pady=(S(3), 0))
+
+        # Action buttons
+        btns = tk.Frame(inner, bg=FIELD); btns.pack(anchor="w", pady=(S(8), 0))
+        RoundButton(btns, "OPEN FOLDER", lambda r=rec: self._open_path(r.get("dir")),
+                    kind="secondary", width=140, height=34).pack(side="left")
+        if rec.get("panel"):
+            RoundButton(btns, "VIEW PANEL",
+                        lambda r=rec: self._open_path(r.get("panel")),
+                        kind="secondary", width=130,
+                        height=34).pack(side="left", padx=(S(6), 0))
+        if not is_sweep and rec.get("model_pt"):
+            RoundButton(btns, "USE FOR LIVE",
+                        lambda r=rec: self._history_use_model(r),
+                        kind="primary", width=140,
+                        height=34).pack(side="left", padx=(S(6), 0))
+        RoundButton(btns, "LOAD CONFIG",
+                    lambda r=rec: self._history_load_config(r),
+                    kind="secondary", width=140,
+                    height=34).pack(side="left", padx=(S(6), 0))
+
+    def _history_use_model(self, rec):
+        """Copy a past model back to outputs/model.pt so live testing uses it."""
+        import shutil
+        src = rec.get("model_pt")
+        if not src or not Path(src).exists():
+            messagebox.showinfo("Use model", "This run has no saved model checkpoint.")
+            return
+        try:
+            dest = ROOT / "outputs" / "model.pt"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Use model", str(exc))
+            return
+        if messagebox.askyesno(
+                "Model ready for live testing",
+                f"Loaded the {rec.get('family','').upper()} model from "
+                f"{rec.get('time','')} as the active model.\n\n"
+                "Open live camera testing now?"):
+            self._live_test()
+
+    def _history_load_config(self, rec):
+        """Reload a past run's configuration into the wizard (no re-run needed)."""
+        m = rec.get("model", {}) or {}
+        win = rec.get("winner", {}) or {}
+        cfg = {
+            "family": m.get("family") or win.get("family"),
+            "base_channels": m.get("base_channels") or win.get("base_channels"),
+            "block_depth": m.get("block_depth") or win.get("block_depth"),
+            "conv_type": m.get("conv_type") or win.get("conv_type"),
+            "activation": m.get("activation") or win.get("activation"),
+            "sensor": rec.get("sensor_key") or rec.get("sensor"),
+        }
+        self._use_config(cfg)
 
 
 def _has_display() -> bool:
