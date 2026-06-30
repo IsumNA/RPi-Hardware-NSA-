@@ -625,8 +625,6 @@ class App(tk.Tk):
         self.quantize_var = tk.BooleanVar(value=True)
         self.qat_var = tk.BooleanVar(value=False)
         self.eval_var = tk.StringVar(value="single")   # single | sweep
-        self.export_var = tk.BooleanVar(value=True)    # build transferable package
-
         def add_rows(specs):
             for key, title, desc, values, default in specs:
                 row = ConfigRow(body, title, desc, values, default)
@@ -769,11 +767,11 @@ class App(tk.Tk):
                  font=font(9)).pack(anchor="w")
         RoundButton(dep_row, "BUILD PACKAGE", self._build_deploy, kind="secondary",
                     width=170, height=36).grid(row=0, column=1, sticky="e")
+        tk.Label(body, text="     Optional — you can also export the transferable "
+                 ".zip from the results screen after a compile.", bg=WHITE,
+                 fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(S(4), 0))
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
-        self._check(body, "Compile & export transferable package (.zip)",
-                    "End-to-end: after compiling, bundle the device binary + ONNX "
-                    "+ manifest + flash steps into a transferable .zip for the target.",
-                    self.export_var, command=self._on_eval_change)
 
         # -- LEVEL 5: CALIBRATION / QUANTIZATION -----------------------------
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
@@ -866,8 +864,6 @@ class App(tk.Tk):
             return
         if self.eval_var.get() == "sweep":
             self.run_btn.set_text("RUN SWEEP")
-        elif self.export_var.get():
-            self.run_btn.set_text("COMPILE & EXPORT")
         else:
             self.run_btn.set_text("RUN COMPILE")
 
@@ -1052,9 +1048,6 @@ class App(tk.Tk):
             cmd += ["--no-quantize"]
         if self.qat_var.get():
             cmd += ["--qat"]
-        if self.export_var.get():
-            cmd += ["--export"]
-
         mode = self.mode_var.get()
         if mode == "batch":
             bs = (self.batch_var.get() or "6").strip()
