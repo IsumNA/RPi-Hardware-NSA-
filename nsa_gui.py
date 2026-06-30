@@ -289,7 +289,7 @@ class Sidebar(tk.Canvas):
 class ConfigRow(tk.Frame):
     """One Imager-style list row: bold title + grey description + a control."""
 
-    def __init__(self, parent, title, desc, values, default):
+    def __init__(self, parent, title, desc, values, default, command=None):
         super().__init__(parent, bg=WHITE)
         self.columnconfigure(0, weight=1)
         left = tk.Frame(self, bg=WHITE)
@@ -303,6 +303,8 @@ class ConfigRow(tk.Frame):
                                   state="readonly", width=14, font=font(10),
                                   style="Rpi.TCombobox")
         self.combo.grid(row=0, column=1, sticky="e", padx=(S(8), 0))
+        if command is not None:
+            self.combo.bind("<<ComboboxSelected>>", lambda _e: command())
         tk.Frame(self, bg=LINE, height=1).grid(row=1, column=0, columnspan=2,
                                                sticky="ew", pady=(S(12), 0))
 
@@ -723,33 +725,22 @@ class App(tk.Tk):
 
         # -- LEVEL 3: MODEL --------------------------------------------------
         self._section(body, "LEVEL 3 · MODEL ARCHITECTURE")
-        tk.Label(body, text="     These are the STARTING parameters for a single "
-                 "compile. Turn on the Pareto sweep (below) to train many "
-                 "variations and rank them.", bg=WHITE, fg=RASPBERRY,
-                 font=font(9, "bold"), wraplength=S(560), justify="left").pack(
-                     anchor="w", pady=(0, S(4)))
-        add_rows([
-            ("model_family", "Model Family",
-             "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet",
-             ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet"], "nafnet"),
-            ("base_channels", "Base Channels", "Network width", [16, 32, 64], 32),
-            ("block_depth", "Block Depth", "Network depth", [2, 4, 8], 4),
-            ("conv_type", "Convolution", "Standard or depthwise-separable",
-             ["standard", "depthwise"], "depthwise"),
-            ("activation", "Activation", "gelu on DeepX forces QAT injection",
-             ["relu", "gelu", "silu"], "relu"),
-        ])
-        tk.Label(body, text="     Custom NAFNet topology (NAFNet family only) — "
-                 "leave blank for a flat NAFNet.", bg=WHITE, fg=SUBTLE,
-                 font=font(9)).pack(anchor="w", pady=(S(6), 0))
-        self.naf_enc_var = self._entry_row(
-            body, "naf_enc", "NAFNet Encoders",
-            "Per-level encoder block counts, e.g. 1 2 2", "")
-        self.naf_mid_var = self._entry_row(
-            body, "naf_mid", "NAFNet Middle", "Bottleneck block count, e.g. 4", "")
-        self.naf_dec_var = self._entry_row(
-            body, "naf_dec", "NAFNet Decoders",
-            "Per-level decoder block counts, e.g. 2 2 1", "")
+        tk.Label(body, text="     Pick a model family first — the options below "
+                 "adapt to it (e.g. NAFNet has no separate activation, it uses a "
+                 "built-in SimpleGate). These are the STARTING parameters for a "
+                 "single compile; use the Pareto sweep to rank many.", bg=WHITE,
+                 fg=RASPBERRY, font=font(9, "bold"), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(4)))
+        fam_row = ConfigRow(body, "Model Family",
+                            "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet",
+                            ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet"],
+                            "nafnet", command=self._on_family_change)
+        fam_row.pack(fill="x", pady=S(6))
+        self.rows["model_family"] = fam_row
+        # Container whose contents change with the selected family.
+        self.model_box = tk.Frame(body, bg=WHITE)
+        self.model_box.pack(fill="x")
+        self._render_model_options()
 
         # -- LEVELS 4 & 6: HARDWARE ------------------------------------------
         self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
@@ -860,6 +851,83 @@ class App(tk.Tk):
             self.sensor_echo.config(
                 text=f"     Optimising for {card['name']} ({card['family']}) — "
                      f"{card['specs']}.")
+
+    def _row_get(self, key, default):
+        r = self.rows.get(key)
+        return r.get() if r is not None else default
+
+    def _grab_when_ready(self, win):
+        """Make a Toplevel modal once it is actually viewable.
+
+        Calling grab_set() before the window is mapped raises
+        'grab failed: window not viewable', so we poll until it's ready.
+        """
+        try:
+            if not win.winfo_exists():
+                return
+            if win.winfo_viewable():
+                win.grab_set()
+            else:
+                win.after(40, lambda: self._grab_when_ready(win))
+        except tk.TclError:
+            win.after(40, lambda: self._grab_when_ready(win))
+
+    def _on_family_change(self):
+        self._render_model_options()
+
+    def _render_model_options(self):
+        """Render only the Level-3 options that apply to the chosen model family.
+
+        e.g. NAFNet has no separate activation (it uses SimpleGate) and uses
+        built-in depthwise convs, so those rows are hidden and the multi-scale
+        topology fields appear instead.
+        """
+        prev = {k: self.rows[k].get()
+                for k in ("base_channels", "block_depth", "conv_type", "activation")
+                if k in self.rows}
+        for w in self.model_box.winfo_children():
+            w.destroy()
+        for k in ("base_channels", "block_depth", "conv_type", "activation"):
+            self.rows.pop(k, None)
+        for attr in ("naf_enc_var", "naf_mid_var", "naf_dec_var"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        fam = self.rows["model_family"].get()
+
+        def cfgrow(key, title, desc, values, default):
+            r = ConfigRow(self.model_box, title, desc, values, default)
+            r.pack(fill="x", pady=S(6))
+            self.rows[key] = r
+
+        cfgrow("base_channels", "Base Channels", "Network width",
+               [16, 32, 64], prev.get("base_channels", 32))
+        cfgrow("block_depth", "Block Depth", "Network depth",
+               [2, 4, 8], prev.get("block_depth", 4))
+
+        if fam == "nafnet":
+            tk.Label(self.model_box,
+                     text="     NAFNet uses a built-in SimpleGate and depthwise "
+                          "convs — no separate activation or conv-type to pick. "
+                          "Optionally define a multi-scale topology (leave blank "
+                          "for a flat NAFNet).",
+                     bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                     justify="left").pack(anchor="w", pady=(S(2), 0))
+            self.naf_enc_var = self._entry_row(
+                self.model_box, "naf_enc", "NAFNet Encoders",
+                "Per-level encoder block counts, e.g. 1 2 2", "")
+            self.naf_mid_var = self._entry_row(
+                self.model_box, "naf_mid", "NAFNet Middle",
+                "Bottleneck block count, e.g. 4", "")
+            self.naf_dec_var = self._entry_row(
+                self.model_box, "naf_dec", "NAFNet Decoders",
+                "Per-level decoder block counts, e.g. 2 2 1", "")
+        else:
+            cfgrow("conv_type", "Convolution", "Standard or depthwise-separable",
+                   ["standard", "depthwise"], prev.get("conv_type", "depthwise"))
+            cfgrow("activation", "Activation",
+                   "gelu on DeepX forces QAT injection",
+                   ["relu", "gelu", "silu"], prev.get("activation", "relu"))
 
     def _on_eval_change(self):
         if not hasattr(self, "run_btn"):
@@ -977,7 +1045,7 @@ class App(tk.Tk):
         x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
         y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
         win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        win.grab_set()
+        self._grab_when_ready(win)
 
     # -- Run view -------------------------------------------------------------
     def _run(self):
@@ -1043,8 +1111,12 @@ class App(tk.Tk):
         for key in ("sensor", "hardware", "model_family", "base_channels",
                     "block_depth", "conv_type", "activation", "gain", "steps",
                     "frames"):
+            # conv_type / activation are hidden (and irrelevant) for NAFNet.
+            row = self.rows.get(key)
+            if row is None:
+                continue
             flag = "--" + key.replace("_", "-")
-            cmd += [flag, self.rows[key].get()]
+            cmd += [flag, row.get()]
 
         if not self.quantize_var.get():
             cmd += ["--no-quantize"]
@@ -1096,9 +1168,9 @@ class App(tk.Tk):
                "--hardware", self.rows["hardware"].get(),
                "--sensor", self.rows["sensor"].get(),
                "--gain", self.rows["gain"].get(),
-               "--base-channels", self.rows["base_channels"].get(),
-               "--conv-type", self.rows["conv_type"].get(),
-               "--activation", self.rows["activation"].get(),
+               "--base-channels", self._row_get("base_channels", "32"),
+               "--conv-type", self._row_get("conv_type", "depthwise"),
+               "--activation", self._row_get("activation", "relu"),
                "--search-steps", "45",
                "--patch-size", "128",
                "--top", "10",
@@ -1615,10 +1687,14 @@ class App(tk.Tk):
         self._build_form()                     # rebuilds self.rows with defaults
         self.eval_var.set("single")
         self._on_eval_change()
-        for key in ("model_family", "base_channels", "block_depth",
-                    "conv_type", "activation"):
-            jkey = "family" if key == "model_family" else key
-            val = r.get(jkey)
+        fam = r.get("family")
+        if fam and "model_family" in self.rows:
+            self.rows["model_family"].set(fam)
+        # .set() doesn't fire the combobox callback, so rebuild the detail rows
+        # for this family before applying its specific parameters.
+        self._render_model_options()
+        for key in ("base_channels", "block_depth", "conv_type", "activation"):
+            val = r.get(key)
             if val is not None and key in self.rows:
                 self.rows[key].set(val)
 
@@ -1628,12 +1704,12 @@ class App(tk.Tk):
         dlg.title("Run this model")
         dlg.configure(bg=WHITE)
         dlg.transient(self)
-        dlg.grab_set()
         try:
             dlg.geometry(f"{S(470)}x{S(380)}+{self.winfo_rootx()+S(120)}"
                          f"+{self.winfo_rooty()+S(120)}")
         except Exception:
             pass
+        self._grab_when_ready(dlg)
 
         pad = tk.Frame(dlg, bg=WHITE)
         pad.pack(fill="both", expand=True, padx=S(22), pady=S(18))
