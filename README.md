@@ -68,46 +68,60 @@ Edit `config.yaml`, or override any value on the command line.
 
 ---
 
-## Running it in the terminal — step by step
+## Running it in the terminal — Linux (primary)
+
+This is the main, intended way to run NSA (Raspberry Pi OS / Ubuntu / Debian).
 
 ### 1. Open a terminal in the project folder
 
-```powershell
-cd "C:\Users\isump\Downloads\RPi-Hardware-NSA-"
+```bash
+cd ~/RPi-Hardware-NSA-
 ```
 
-### 2. (First time only) install the dependencies
+### 2. Create and activate a virtual environment
 
-```powershell
+Keeping the dependencies in a project-local `.venv` avoids polluting your system
+Python.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Your prompt should now start with `(.venv)`. To leave it later, run `deactivate`.
+
+> **`python3-venv` missing?** On Debian/Ubuntu/Raspberry Pi OS install it once:
+> ```bash
+> sudo apt update && sudo apt install -y python3-venv python3-tk
+> ```
+> `python3-tk` is the Tk toolkit the desktop UI needs (it is not bundled with
+> the headless Python on some distros).
+
+### 3. (First time only) install the dependencies
+
+With the environment active:
+
+```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
-
-### 3. (Windows only) enable UTF-8 for the current session
-
-The live log uses Raspberry Pi glyphs (✓, ▲, ·, box characters). Run this once
-per terminal session so they render instead of erroring on the legacy console:
-
-```powershell
-$env:PYTHONUTF8 = "1"
-```
-
-> On macOS / Linux you can skip this step.
 
 ### 4. Launch it
 
 **Option A — Desktop UI (recommended for the demo):**
 
-```powershell
-python nsa_gui.py
+```bash
+python run_demo.py            # CLI, or:
+python nsa_gui.py             # desktop window
 ```
 
-Pick your options in the window, then press **RUN COMPILE**. The sidebar lights
-up level-by-level and the validation matrix opens at the end.
+In the UI, pick your options and press **RUN COMPILE**. The sidebar lights up
+level-by-level and the validation matrix opens at the end.
 
 **Option B — Command line:** run the full pipeline with the defaults in
 `config.yaml`:
 
-```powershell
+```bash
 python run_demo.py
 ```
 
@@ -115,11 +129,14 @@ You'll see Levels 1–6 stream live, a calibration progress bar, the saved
 artifacts, and finally the Pareto scorecard. A 3-panel window opens at the end
 (close it to let the script finish).
 
+> **Headless box (no display)?** Skip the pop-up window with `--no-window`; the
+> panel is still saved to `outputs/validation_panel.png`.
+
 ### 5. Drive it with flags
 
 Override any option from `config.yaml` on the command line:
 
-```powershell
+```bash
 # The DeepX + GELU -> forced QAT compiler path (great talking point)
 python run_demo.py --hardware deepx --activation gelu --model-family nafnet
 
@@ -133,7 +150,7 @@ python run_demo.py --hardware deepx --base-channels 64 --block-depth 8
 python run_demo.py --steps 70 --no-window
 
 # Feed a real IMX662 Bayer RAW frame instead of the synthetic one
-python run_demo.py --input-raw "path\to\frame.npy"
+python run_demo.py --input-raw path/to/frame.npy
 
 # See every available flag
 python run_demo.py --help
@@ -149,10 +166,44 @@ Everything is written to the `outputs/` folder:
 | `hardware_ready.hef` / `.bin` / `.ort` | hardware-ready INT8 artifact for the chosen target |
 | `validation_panel.png` | the 3-panel before / ground-truth / after image |
 
+```bash
+xdg-open outputs            # or: ls -lh outputs
+```
+
+---
+
+## Running it in the terminal — Windows (spare)
+
+Same steps in PowerShell, with two Windows-only extras.
+
 ```powershell
-# Open the outputs folder
+# 1. Go to the project folder
+cd "C:\Users\isump\Downloads\RPi-Hardware-NSA-"
+
+# 2. Create + activate a virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 3. Install dependencies (first time only)
+pip install -r requirements.txt
+
+# 4. Enable UTF-8 for this session so the Pi glyphs render
+$env:PYTHONUTF8 = "1"
+
+# 5. Launch (UI or CLI)
+python nsa_gui.py
+python run_demo.py --hardware deepx --activation gelu
+
+# 6. Open the results
 explorer outputs
 ```
+
+> **PowerShell blocks the activate script?** If you see *"running scripts is
+> disabled on this system"*, allow local scripts for your user once:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+> ```
+> Or use the classic prompt: `.\.venv\Scripts\activate.bat` (cmd).
 
 ---
 
