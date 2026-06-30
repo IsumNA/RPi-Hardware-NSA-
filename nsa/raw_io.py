@@ -201,17 +201,223 @@ def _classical_reference(noisy: np.ndarray) -> np.ndarray:
     return den.astype(np.float32) / 255.0
 
 
+# ---------------------------------------------------------------------------
+# Real-dataset ingestion  (logic adapted from davidplowman/denoise-hw)
+#   * paired noisy/gt folders        (his folders.find_folders convention)
+#   * detail-scored patch selection  (his dataset._patch_detail)
+#   * keyword filtering              (his --filter tokens)
+# ---------------------------------------------------------------------------
+
+_LAP = np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=np.float32)
+
+
+def _detail_score(gray: np.ndarray) -> float:
+    """Laplacian-variance / mean^2 detail score (after denoise-hw)."""
+    lap = cv2.filter2D(gray.astype(np.float32), -1, _LAP)
+    mean_sq = float(gray.mean()) ** 2 + 1e-6
+    return 20.0 * float(lap.var() / mean_sq)
+
+
+def _detail_crop(img: np.ndarray, size: int) -> np.ndarray:
+    """Pick the most detailed square crop of `img` (sharp, interesting region)."""
+    img = _fit_min_side(img, size)
+    h, w = img.shape[:2]
+    if h == size and w == size:
+        return img
+    gray = cv2.cvtColor((np.clip(img, 0, 1) * 255).astype(np.uint8),
+                        cv2.COLOR_RGB2GRAY).astype(np.float32)
+    step = max(1, size // 2)
+    best, best_xy = -1.0, (0, 0)
+    for y0 in range(0, h - size + 1, step):
+        for x0 in range(0, w - size + 1, step):
+            s = _detail_score(gray[y0:y0 + size, x0:x0 + size])
+            if s > best:
+                best, best_xy = s, (y0, x0)
+    y0, x0 = best_xy
+    return img[y0:y0 + size, x0:x0 + size]
+
+
+def _fit_min_side(img: np.ndarray, size: int) -> np.ndarray:
+    """Scale so the short side is >= size (never upscale beyond ~1.6x crop budget)."""
+    h, w = img.shape[:2]
+    s = size / float(min(h, w))
+    if s < 1.0:
+        interp = cv2.INTER_AREA
+        img = cv2.resize(img, (max(size, int(round(w * s))),
+                               max(size, int(round(h * s)))), interpolation=interp)
+    elif min(h, w) < size:
+        img = cv2.resize(img, (max(size, w), max(size, h)), interpolation=cv2.INTER_LINEAR)
+    return img
+
+
+def _pair_in_folder(folder: Path) -> tuple[Path, Path] | None:
+    """Return (noisy, gt) paths if `folder` holds a paired capture, else None.
+
+    Mirrors denoise-hw's noisy.dng / gt.dng convention but accepts any supported
+    extension so it also works without rawpy (e.g. noisy.png + gt.png).
+    """
+    noisy = gt = None
+    for f in folder.iterdir():
+        if not f.is_file():
+            continue
+        stem, ext = f.stem.lower(), f.suffix.lower()
+        if ext not in SUPPORTED_EXTS:
+            continue
+        if stem == "noisy":
+            noisy = f
+        elif stem in ("gt", "clean", "reference"):
+            gt = f
+    if noisy is not None and gt is not None:
+        return noisy, gt
+    return None
+
+
+def find_paired_folders(root: str, filter_tokens: list[str] | None = None) -> list[Path]:
+    """Recursively find folders containing a paired noisy/gt capture.
+
+    Adapted from denoise-hw's ``folders.find_folders``: a folder qualifies when
+    it holds both a noisy and a gt frame and its path contains every filter token.
+    """
+    root_p = Path(root).expanduser()
+    if not root_p.exists():
+        return []
+    out: list[Path] = []
+    for folder in [root_p, *(p for p in root_p.rglob("*") if p.is_dir())]:
+        if _pair_in_folder(folder) is None:
+            continue
+        s = str(folder)
+        if filter_tokens and not all(t in s for t in filter_tokens):
+            continue
+        out.append(folder)
+    return sorted(set(out))
+
+
+def list_frames(path: str | None, filter_tokens: list[str] | None = None,
+                limit: int = 0) -> list[dict]:
+    """Enumerate usable real frames under `path`.
+
+    Returns a list of frame-source dicts:
+      {"noisy": Path, "gt": Path|None, "name": str}
+    Paired folders (noisy/gt) are preferred; otherwise every supported loose file
+    is returned with no ground-truth pair. Keyword filtering follows denoise-hw.
+    """
+    if not path:
+        return []
+    p = Path(path).expanduser()
+    frames: list[dict] = []
+
+    if p.is_file():
+        frames.append({"noisy": p, "gt": None, "name": p.name})
+    elif p.is_dir():
+        pairs = find_paired_folders(str(p), filter_tokens)
+        if pairs:
+            for folder in pairs:
+                pr = _pair_in_folder(folder)
+                if pr:
+                    frames.append({"noisy": pr[0], "gt": pr[1], "name": folder.name})
+        else:
+            files = sorted(f for f in p.rglob("*")
+                           if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
+                           and f.stem.lower() not in ("gt", "clean", "reference"))
+            for f in files:
+                s = str(f)
+                if filter_tokens and not all(t in s for t in filter_tokens):
+                    continue
+                frames.append({"noisy": f, "gt": None, "name": f.name})
+
+    if limit and limit > 0:
+        frames = frames[:limit]
+    return frames
+
+
 class Frame:
     """Bundle of the tensors the rest of the stack needs."""
 
-    def __init__(self, noisy_rgb, clean_rgb, bayer, gain, source, sensor):
+    def __init__(self, noisy_rgb, clean_rgb, bayer, gain, source, sensor,
+                 gt_kind="temporal"):
         self.noisy_rgb = noisy_rgb          # HxWx3 float32 [0,1]  (Panel A)
         self.clean_rgb = clean_rgb          # HxWx3 float32 [0,1]  (Panel B / GT)
         self.bayer = bayer                  # HxW   float32 [0,1]  (the RAW plane)
         self.gain = gain
-        self.source = source                # "synthetic" | path
+        self.source = source                # "synthetic" | path | folder name
         self.sensor = sensor                # SensorProfile
+        self.gt_kind = gt_kind              # temporal | paired | reference
         self.height, self.width = noisy_rgb.shape[:2]
+
+
+def _synth_noisy_gt(clean, gain, sensor, temporal_frames, seed):
+    """Inject sensor noise on a clean scene; build temporal-average ground truth."""
+    rng = np.random.default_rng(seed)
+    prnu = (1.0 + np.random.default_rng(seed + 777).normal(
+        0.0, sensor.prnu, size=clean.shape)).astype(np.float32)
+    noisy = _capture(clean, gain, sensor, rng, prnu)
+    acc = np.zeros_like(clean)
+    for _ in range(max(1, temporal_frames)):
+        acc += _capture(clean, gain, sensor, rng, prnu)
+    return noisy, acc / max(1, temporal_frames)
+
+
+def _load_pair(noisy_path: Path, gt_path: Path, patch: int):
+    """Load a paired noisy/gt capture and crop both at the same detailed window."""
+    noisy = _fit_min_side(_load_any(noisy_path), patch)
+    gt = _fit_min_side(_load_any(gt_path), patch)
+    h = min(noisy.shape[0], gt.shape[0])
+    w = min(noisy.shape[1], gt.shape[1])
+    noisy, gt = noisy[:h, :w], gt[:h, :w]
+    if (h, w) == (patch, patch):
+        return noisy, gt
+    gray = cv2.cvtColor((np.clip(noisy, 0, 1) * 255).astype(np.uint8),
+                        cv2.COLOR_RGB2GRAY).astype(np.float32)
+    step = max(1, patch // 2)
+    best, bxy = -1.0, (0, 0)
+    for y0 in range(0, h - patch + 1, step):
+        for x0 in range(0, w - patch + 1, step):
+            s = _detail_score(gray[y0:y0 + patch, x0:x0 + patch])
+            if s > best:
+                best, bxy = s, (y0, x0)
+    y0, x0 = bxy
+    return noisy[y0:y0 + patch, x0:x0 + patch], gt[y0:y0 + patch, x0:x0 + patch]
+
+
+def build_frame_from_source(
+    source: dict,
+    gain: int,
+    temporal_frames: int,
+    patch: int,
+    sensor: SensorProfile | str,
+    seed: int,
+    simulate_noise: bool = False,
+) -> Frame:
+    """Build a Frame from a real frame-source dict (see ``list_frames``).
+
+    * paired noisy/gt           -> real ground truth (denoise-hw convention)
+    * paired + simulate_noise   -> use gt as clean, inject sensor noise on top
+    * loose file                -> frame is the noisy input; NL-means reference
+    * loose file + simulate_noise-> treat file as clean, inject sensor noise
+    """
+    if isinstance(sensor, str):
+        sensor = get_sensor(sensor)
+    name = source.get("name", str(source["noisy"]))
+    gt_path = source.get("gt")
+
+    if gt_path is not None:
+        noisy, gt = _load_pair(Path(source["noisy"]), Path(gt_path), patch)
+        if simulate_noise:                       # clean gt -> simulate target sensor
+            noisy, gt = _synth_noisy_gt(gt, gain, sensor, temporal_frames, seed)
+            kind = "paired+sim"
+        else:
+            kind = "paired"
+    else:
+        img = _detail_crop(_load_any(Path(source["noisy"])), patch)
+        if simulate_noise:                       # treat file as clean source
+            noisy, gt = _synth_noisy_gt(img, gain, sensor, temporal_frames, seed)
+            kind = "clean+sim"
+        else:                                    # file IS the noisy capture
+            noisy, gt = img, _classical_reference(img)
+            kind = "reference"
+
+    bayer = _to_bayer(noisy, sensor.bayer)
+    return Frame(noisy, gt, bayer, gain, name, sensor, gt_kind=kind)
 
 
 def build_frame(
@@ -222,35 +428,31 @@ def build_frame(
     sensor: SensorProfile | str,
     seed: int,
     real_capture: bool = False,
+    simulate_noise: bool = False,
+    filter_tokens: list[str] | None = None,
 ) -> Frame:
     """Produce the (noisy, reference, bayer) frame bundle for the chosen sensor.
 
     Modes:
-      * real_capture=True  -> load a real frame (from a file or dataset folder)
-        and use it directly as the noisy input; a clean reference is synthesised
-        for it (single real frame has no temporal ground truth).
+      * real_capture=True  -> load a real frame/dataset (paired noisy/gt preferred)
+        and use it as the noisy input; optionally simulate sensor noise instead.
       * input_raw set      -> treat the loaded image as a clean source and inject
         the sensor's physical noise on top of it.
       * neither            -> synthesise a clean scene and inject sensor noise.
     """
     if isinstance(sensor, str):
         sensor = get_sensor(sensor)
-    rng = np.random.default_rng(seed)
 
     if real_capture:
-        path = resolve_dataset(input_raw, seed)
-        if path is not None:
+        frames = list_frames(input_raw, filter_tokens)
+        if frames:
+            idx = int(np.random.default_rng(seed).integers(0, len(frames)))
             try:
-                noisy = load_real_raw(str(path), patch)
-                gt = _classical_reference(noisy)
-                bayer = _to_bayer(noisy, sensor.bayer)
-                return Frame(noisy, gt, bayer, gain, str(path), sensor)
+                return build_frame_from_source(
+                    frames[idx], gain, temporal_frames, patch, sensor, seed,
+                    simulate_noise=simulate_noise)
             except Exception:
-                real_capture = False  # fall back to synthetic below
-                input_raw = None
-        else:
-            real_capture = False
-            input_raw = None
+                pass  # fall back to synthetic below
 
     if input_raw and not real_capture:
         clean = load_real_raw(input_raw, patch)
@@ -259,18 +461,6 @@ def build_frame(
         clean = _center_crop(_synthetic_scene(patch, patch, seed), patch)
         source = "synthetic"
 
-    # Fixed-pattern PRNU gain map: same for every exposure of this sensor, so it
-    # does NOT average out in the temporal ground truth (as on real silicon).
-    prnu = (1.0 + np.random.default_rng(seed + 777).normal(
-        0.0, sensor.prnu, size=clean.shape)).astype(np.float32)
-
-    noisy = _capture(clean, gain, sensor, rng, prnu)
-
-    # Ground truth = temporal average of many independent reads (denoised ref).
-    acc = np.zeros_like(clean)
-    for _ in range(max(1, temporal_frames)):
-        acc += _capture(clean, gain, sensor, rng, prnu)
-    gt = acc / max(1, temporal_frames)
-
+    noisy, gt = _synth_noisy_gt(clean, gain, sensor, temporal_frames, seed)
     bayer = _to_bayer(noisy, sensor.bayer)
-    return Frame(noisy, gt, bayer, gain, source, sensor)
+    return Frame(noisy, gt, bayer, gain, source, sensor, gt_kind="temporal")

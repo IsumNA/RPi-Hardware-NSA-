@@ -60,8 +60,31 @@ Two ways to feed Level 1:
   images (`.png/.tif/.jpg/...`), and `.dng` (needs `rawpy`). Point `dataset_path`
   at a cloned repo of IMX219 frames and they flow straight into the stack.
 
-In the GUI this is the **Capture Source** toggle at Level 1: *Real IMX219*,
-*Simulated IMX662*, or *Simulated IMX-NG*.
+In the GUI this is the **Capture Source** toggle at Level 1 (*Simulated capture*
+vs *Real captures*) plus the **Sensor Profile** dropdown.
+
+### Real datasets, paired ground truth, and batches
+
+The real-dataset ingestion reuses the conventions of
+[`davidplowman/denoise-hw`](https://github.com/davidplowman/denoise-hw):
+
+* **Paired folders** — a folder containing a `noisy.*` and a `gt.*` frame is
+  treated as a paired capture, and the `gt` frame is used as **real ground
+  truth** (better than a derived reference). Point `--dataset` at a tree of such
+  folders (e.g. `PI_RAW/<scene>/imx219_ag12/{noisy,gt}.dng`).
+* **Keyword filter** — `--filter imx219 ag12` keeps only folders whose path
+  contains *all* tokens (same semantics as denoise-hw's `--filter`).
+* **Detail-scored crops** — the working patch is chosen by a Laplacian-variance
+  detail score, so the demo lands on a sharp, interesting region.
+* **Batch mode** — `--batch N` loads up to N frames and calibrates across random
+  crops drawn from all of them (denoise-hw's "patches across many images"), then
+  reports averaged PSNR.
+* **DNG** — `.dng` decoding uses `rawpy` if installed; `.npy`/`.png`/`.tif`/...
+  always work.
+
+> Credit: the real-dataset structure, keyword filtering, paired noisy/gt
+> convention, and detail-scored patch selection are adapted from
+> [denoise-hw](https://github.com/davidplowman/denoise-hw).
 
 ---
 
@@ -81,6 +104,10 @@ Edit `config.yaml`, or override any value on the command line.
 | `--input-raw` | *path* | A real Bayer RAW (`.npy` / image). Omitted ⇒ synthetic frame |
 | `--dataset` | *path* | Folder (or file) of real captures for real-capture mode |
 | `--real` | — | Use real captures from `--dataset` / `dataset_path` as the noisy input |
+| `--simulate-noise` | — | Inject the selected sensor's noise on top of loaded frames |
+| `--filter` | *words* | Keyword filter for dataset folders (denoise-hw style, e.g. `imx219 ag12`) |
+| `--batch` | *int* | Batch mode: process up to N frames and average the metrics |
+| `--frames` | *int* | Temporal frames averaged for the synthetic ground truth |
 | `--gain` | `256` \| `512` | Analog gain of the challenge frame |
 | `--steps` | *int* | Calibration steps (lower = faster demo) |
 | `--no-window` | — | Skip the pop-up validation window |

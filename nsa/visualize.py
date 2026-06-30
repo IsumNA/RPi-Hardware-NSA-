@@ -93,10 +93,15 @@ def render_panel(
     gs = fig.add_gridspec(1, 3, left=0.018, right=0.982, top=0.78, bottom=0.06,
                           wspace=0.05)
     real = meta.get("real_capture", False)
+    kind = meta.get("gt_kind", "temporal")
     raw_sub = (f"{meta.get('sensor', 'sensor')}  ·  real capture" if real
                else f"{meta.get('sensor', 'sensor')}  ·  {meta['gain']}× gain")
-    gt_title = "REFERENCE" if real else "GROUND TRUTH"
-    gt_sub = "NL-means reference" if real else f"temporal avg  ·  {meta['frames']} frames"
+    if kind in ("paired", "paired+sim"):
+        gt_title, gt_sub = "GROUND TRUTH", "paired gt frame"
+    elif kind == "reference":
+        gt_title, gt_sub = "REFERENCE", "NL-means reference"
+    else:
+        gt_title, gt_sub = "GROUND TRUTH", f"temporal avg  ·  {meta['frames']} frames"
     panels = [
         ("RAW INPUT", noisy, raw_sub,
          RASPBERRY, f"PSNR {meta['psnr_in']:.1f} dB", RASPBERRY),

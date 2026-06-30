@@ -29,10 +29,10 @@ from nsa import __version__
 from nsa.compiler import compile_stack
 from nsa.config import apply_overrides, build_parser, load_config, ConfigError
 from nsa.export import export_onnx, write_device_artifact
-from nsa.inference import (calibrate, estimate_device_latency_ms,
+from nsa.inference import (calibrate, calibrate_multi, estimate_device_latency_ms,
                            fake_quantize_int8, psnr, run)
 from nsa.models import build_model, count_params
-from nsa.raw_io import build_frame
+from nsa.raw_io import build_frame, build_frame_from_source, list_frames
 from nsa.sensors import get_sensor
 from nsa.report import compute_fitness, print_report
 from nsa.theme import (RPI_GREEN, banner, console, kv_table, level_rule, log,
@@ -84,8 +84,12 @@ def main() -> int:
             ("input", (cfg.sensor.dataset_path or cfg.sensor.input_raw or
                        "synthetic (auto-generated)") if cfg.sensor.real_capture
                       else (cfg.sensor.input_raw or "synthetic (auto-generated)")),
-            ("capture_mode", "REAL (repo frames)" if cfg.sensor.real_capture
-                             else "simulated physics"),
+            ("capture_mode", ("REAL captures" if cfg.sensor.real_capture
+                              else "simulated physics")
+                             + (" + simulated noise" if cfg.sensor.simulate_noise else "")),
+            ("dataset_filter", " ".join(cfg.sensor.filter) if cfg.sensor.filter else "—"),
+            ("run_mode", f"batch ×{cfg.run.batch_size}" if cfg.run.mode == "batch"
+                         else "single frame"),
             ("quantize", "INT8" if cfg.optimization.quantize else "off"),
         ],
         title="COMPILATION PROFILE  ·  selected inputs",
@@ -103,47 +107,67 @@ def main() -> int:
         f"well {sensor.full_well:,.0f}e-", "step")
     real_capture = bool(cfg.sensor.real_capture)
     real_source = cfg.sensor.dataset_path or cfg.sensor.input_raw
+    simulate_noise = bool(cfg.sensor.simulate_noise)
+    filter_tokens = list(cfg.sensor.filter or [])
+    batch = cfg.run.mode == "batch"
+    n_want = cfg.run.batch_size if batch else 1
+    patch = cfg.optimization.patch_size
+    tframes = cfg.data.temporal_frames
+
+    # -- Assemble the working frame set (1 frame for single, N for batch) -----
+    frames = []
     if real_capture:
-        log(f"Real-capture mode: loading actual {sensor.label} frame from "
-            f"{real_source or '(unset)'}", "step")
+        sources = list_frames(real_source, filter_tokens, limit=n_want)
+        if filter_tokens:
+            log(f"Dataset filter: {' '.join(filter_tokens)}  "
+                f"({len(sources)} matching frame(s))", "step")
+        for i, s in enumerate(sources):
+            try:
+                frames.append(build_frame_from_source(
+                    s, cfg.sensor.gain, tframes, patch, sensor,
+                    cfg.output.seed + i, simulate_noise=simulate_noise))
+            except Exception as exc:
+                log(f"Skipped {s.get('name', '?')}: {exc}", "warn")
+        if not frames:
+            log(f"No usable real frames at {real_source!r} — falling back to "
+                f"synthetic {sensor.label}", "warn")
+    if not frames:                                  # synthetic (or fallback)
+        for i in range(n_want):
+            frames.append(build_frame(
+                input_raw=(None if real_capture else cfg.sensor.input_raw),
+                gain=cfg.sensor.gain, temporal_frames=tframes, patch=patch,
+                sensor=sensor, seed=cfg.output.seed + i))
+
+    frame = frames[0]                               # representative for the panel
+    gt_kind = frame.gt_kind
+    real_loaded = real_capture and frame.source != "synthetic"
+
+    if batch:
+        log(f"Batch mode: {len(frames)} frame(s) loaded for calibration", "step")
+    if real_loaded:
+        log(f"Real-capture mode: {frame.source}", "step")
     else:
         log(f"Reading {sensor.label} RAW @ {cfg.sensor.gain}× analog gain "
             f"({sensor.bayer}, {sensor.bit_depth}-bit)", "step")
-    frame = build_frame(
-        input_raw=(real_source if real_capture else cfg.sensor.input_raw),
-        gain=cfg.sensor.gain,
-        temporal_frames=cfg.data.temporal_frames,
-        patch=cfg.optimization.patch_size,
-        sensor=sensor,
-        seed=cfg.output.seed,
-        real_capture=real_capture,
-    )
-    real_loaded = real_capture and frame.source != "synthetic"
-    if real_capture and not real_loaded:
-        log(f"No usable frames found at {real_source!r} — falling back to "
-            f"synthetic {sensor.label} capture", "warn")
-    src = f"synthetic {sensor.label} capture" if frame.source == "synthetic" else frame.source
-    log(f"Frame source: {src}", "info")
-    if real_loaded:
-        log("Reference for real frame: NL-means + edge-preserving denoise "
-            "(single capture has no temporal GT)", "info")
-    else:
-        log(f"Noise model: {sensor.note}", "info")
+    log(f"Frame source: {frame.source if frame.source != 'synthetic' else f'synthetic {sensor.label} capture'}", "info")
     log(f"Working resolution: {frame.width}×{frame.height}  ·  demosaiced linear RGB", "ok")
 
     # ===========================================================================
     # LEVEL 2 - GROUND TRUTH / DATA
     # ===========================================================================
-    level_rule(2, "DATA  ·  temporal ground-truth synthesis")
-    if real_loaded:
-        log("Real capture: deriving clean reference from the single frame "
-            "(no temporal stack available)", "step")
-    else:
-        log(f"Averaging {cfg.data.temporal_frames} independent reads to build "
-            "clean reference", "step")
+    level_rule(2, "DATA  ·  ground-truth reference")
+    _GT_MSG = {
+        "paired": "Paired real ground truth (noisy/gt folder, denoise-hw convention)",
+        "paired+sim": "Paired gt frame used as clean source; sensor noise simulated",
+        "clean+sim": "Loaded frame used as clean source; sensor noise simulated",
+        "reference": "NL-means + edge-preserving reference (single real capture)",
+        "temporal": f"Temporal average of {tframes} independent reads",
+    }
+    log(_GT_MSG.get(gt_kind, "ground truth"), "step")
     pause(0.2)
-    psnr_in = psnr(frame.noisy_rgb, frame.clean_rgb)
-    log(f"Input frame PSNR vs reference: {psnr_in:.2f} dB  "
+    psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
+    label = "Avg input PSNR" if batch else "Input frame PSNR"
+    log(f"{label} vs reference: {psnr_in:.2f} dB  "
         f"(heavily corrupted, as expected at {cfg.sensor.gain}×)", "warn")
 
     # ===========================================================================
@@ -181,22 +205,26 @@ def main() -> int:
         def on_step(i, total, loss):
             progress.update(task, completed=i, loss=loss)
 
-        calibrate(model, frame.noisy_rgb, frame.clean_rgb,
-                  cfg.optimization.calibration_steps, cfg.output.seed, on_step)
+        pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
+        calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
+                        cfg.output.seed, on_step)
 
     fp32_out, fwd_ms = run(model, frame.noisy_rgb)
-    psnr_fp32 = psnr(fp32_out, frame.clean_rgb)
+    psnr_fp32 = float(np.mean([psnr(run(model, f.noisy_rgb)[0], f.clean_rgb)
+                               for f in frames]))
+    lbl = "avg PSNR" if batch else "PSNR"
     log(f"FP32 inference complete  ·  forward pass {fwd_ms:.1f} ms (host) "
-        f"·  PSNR {psnr_fp32:.2f} dB", "ok")
+        f"·  {lbl} {psnr_fp32:.2f} dB", "ok")
 
     quantized = bool(cfg.uses_accelerator and cfg.optimization.quantize)
     if quantized:
         qmodel = fake_quantize_int8(model)
         int8_out, _ = run(qmodel, frame.noisy_rgb)
-        psnr_int8 = psnr(int8_out, frame.clean_rgb)
+        psnr_int8 = float(np.mean([psnr(run(qmodel, f.noisy_rgb)[0], f.clean_rgb)
+                                   for f in frames]))
         quant_drop = psnr_int8 - psnr_fp32
         log(f"INT8 quantization applied ({result.quant_scheme})  ·  "
-            f"PSNR {psnr_int8:.2f} dB  ·  drop {quant_drop:+.2f} dB", "info")
+            f"{lbl} {psnr_int8:.2f} dB  ·  drop {quant_drop:+.2f} dB", "info")
         final_out, final_psnr, export_model = int8_out, psnr_int8, qmodel
     else:
         quant_drop = 0.0
@@ -234,6 +262,8 @@ def main() -> int:
         "gain": cfg.sensor.gain,
         "frames": cfg.data.temporal_frames,
         "real_capture": real_loaded,
+        "gt_kind": gt_kind,
+        "batch": len(frames) if batch else 0,
         "family": cfg.model.model_family,
         "precision": "INT8" if quantized else result.precision.upper(),
         "hardware_name": cfg.hardware_name,

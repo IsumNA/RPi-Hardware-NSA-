@@ -13,3 +13,7 @@ onnx>=1.15
 # Optional: enables running inference directly from the exported .onnx graph.
 # The demo falls back to the live torch runtime if this is not installed.
 # onnxruntime>=1.17
+
+# Optional: enables loading real .dng captures (e.g. denoise-hw PI_RAW datasets).
+# .npy / .png / .tif inputs work without it.
+# rawpy>=0.19

@@ -256,6 +256,7 @@ class App(tk.Tk):
         self.q: queue.Queue[str] = queue.Queue()
         self.input_raw = None
         self.dataset_path = None
+        self.upload_files = []
 
         self.sidebar = Sidebar(self)
         self.sidebar.pack(side="left", fill="y")
@@ -359,6 +360,34 @@ class App(tk.Tk):
         tk.Label(fr, text="     " + desc, bg=WHITE, fg="#C4C4C4",
                  font=font(9)).pack(anchor="w")
 
+    def _check(self, parent, text, desc, variable, command=None):
+        fr = tk.Frame(parent, bg=WHITE)
+        fr.pack(fill="x", pady=S(6))
+        cb = tk.Checkbutton(
+            fr, text="  " + text, variable=variable, onvalue=True, offvalue=False,
+            bg=WHITE, fg=INK, selectcolor=WHITE, activebackground=WHITE,
+            activeforeground=INK, font=font(11, "bold"), anchor="w",
+            highlightthickness=0, bd=0, command=command)
+        cb.pack(anchor="w")
+        if desc:
+            tk.Label(fr, text="     " + desc, bg=WHITE, fg=SUBTLE,
+                     font=font(9)).pack(anchor="w")
+        return cb
+
+    def _entry_row(self, parent, key, title, desc, default=""):
+        row = tk.Frame(parent, bg=WHITE)
+        row.pack(fill="x", pady=S(6))
+        row.columnconfigure(0, weight=1)
+        left = tk.Frame(row, bg=WHITE); left.grid(row=0, column=0, sticky="w")
+        tk.Label(left, text=title, bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
+        tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+        var = tk.StringVar(value=str(default))
+        ent = ttk.Entry(row, textvariable=var, width=18, font=font(10))
+        ent.grid(row=0, column=1, sticky="e", padx=(S(8), 0))
+        tk.Frame(parent, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
+        self.entries[key] = var
+        return var
+
     # -- Form view ------------------------------------------------------------
     def _build_form(self):
         try:
@@ -386,7 +415,11 @@ class App(tk.Tk):
         body = self._make_scrollable(outer)
 
         self.rows = {}
+        self.entries = {}
         self.mode_var = tk.StringVar(value="single")
+        self.source_var = tk.StringVar(value="sim")
+        self.sim_noise_var = tk.BooleanVar(value=False)
+        self.quantize_var = tk.BooleanVar(value=True)
 
         def add_rows(specs):
             for key, title, desc, values, default in specs:
@@ -396,52 +429,77 @@ class App(tk.Tk):
 
         # -- MODE -------------------------------------------------------------
         self._section(body, "MODE")
-        self._radio(body, "Single Frame Calibration", "single", enabled=True)
+        self._radio(body, "Single Frame Calibration", "single", enabled=True,
+                    desc="Calibrate + evaluate on one frame.",
+                    command=self._on_mode_change)
+        self._radio(body, "Batch Folder Calibration", "batch", enabled=True,
+                    badge="MULTI-IMAGE",
+                    desc="Train across many frames in a folder; metrics are averaged.",
+                    command=self._on_mode_change)
         self._radio(body, "Temporal Video Denoise", "temporal", enabled=False,
-                    badge="PHASE 2")
+                    badge="COMING SOON",
+                    desc="Multi-frame temporal denoising of video sequences.")
+        self.batch_var = self._entry_row(
+            body, "batch", "Batch Size", "Frames to load in batch mode", "6")
 
-        # -- LEVEL 1: SENSOR / CAPTURE SOURCE --------------------------------
-        self._section(body, "LEVEL 1 · IMAGE SENSOR  ·  CAPTURE SOURCE")
-        self.source_var = tk.StringVar(value="sim_imx662")
-        self._radio(body, "Real IMX219", "real_imx219", enabled=True,
-                    variable=self.source_var, badge="REAL DATA",
-                    desc="Loads real captures from the repo dataset folder.",
-                    command=self._on_source_change)
-        self._radio(body, "Simulated IMX662", "sim_imx662", enabled=True,
+        # -- LEVEL 1: CAPTURE SOURCE -----------------------------------------
+        self._section(body, "LEVEL 1 · CAPTURE SOURCE")
+        self._radio(body, "Simulated capture", "sim", enabled=True,
                     variable=self.source_var,
-                    desc="Synthesised Starvis 2 low-light physics (shot-noise limited).",
+                    desc="Synthesise a noisy frame from the sensor's noise physics.",
                     command=self._on_source_change)
-        self._radio(body, "Simulated IMX-NG", "sim_imxng", enabled=True,
-                    variable=self.source_var, badge="UNRELEASED",
-                    desc="Physics model of an unreleased next-gen low-light sensor.",
+        self._radio(body, "Real captures", "real", enabled=True,
+                    variable=self.source_var, badge="REAL DATA",
+                    desc="Load real frames; paired noisy/gt folders are auto-detected.",
                     command=self._on_source_change)
 
-        # Repo dataset chooser (only meaningful for Real IMX219).
+        # Dataset / upload controls (real mode).
         ds_row = tk.Frame(body, bg=WHITE)
         ds_row.pack(fill="x", pady=(S(8), S(2)))
         ds_row.columnconfigure(0, weight=1)
         ds_left = tk.Frame(ds_row, bg=WHITE); ds_left.grid(row=0, column=0, sticky="w")
-        tk.Label(ds_left, text="Repo Dataset", bg=WHITE, fg=INK,
+        tk.Label(ds_left, text="Image Source", bg=WHITE, fg=INK,
                  font=font(11, "bold")).pack(anchor="w")
         self.dataset_label = tk.Label(
             ds_left, text="using config.yaml dataset_path", bg=WHITE,
             fg=SUBTLE, font=font(9))
         self.dataset_label.pack(anchor="w")
-        self.dataset_btn = RoundButton(ds_row, "CHOOSE FOLDER", self._choose_dataset,
-                                       kind="secondary", width=170, height=36)
-        self.dataset_btn.grid(row=0, column=1, sticky="e")
+        btns = tk.Frame(ds_row, bg=WHITE); btns.grid(row=0, column=1, sticky="e")
+        self.dataset_btn = RoundButton(btns, "CHOOSE FOLDER", self._choose_dataset,
+                                       kind="secondary", width=160, height=36)
+        self.dataset_btn.pack(side="left", padx=(0, S(8)))
+        self.upload_btn = RoundButton(btns, "UPLOAD IMAGES", self._upload_images,
+                                      kind="secondary", width=160, height=36)
+        self.upload_btn.pack(side="left")
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
 
-        gain_only = tk.Frame(body, bg=WHITE)
-        gain_only.pack(fill="x")
-        add_rows_into = gain_only
-        row = ConfigRow(add_rows_into, "Sensor Gain",
-                        "Challenge-frame analog gain (simulated modes)", [256, 512], 512)
-        row.pack(fill="x", pady=S(6))
-        self.rows["gain"] = row
-        self._on_source_change()
+        self.filter_var = self._entry_row(
+            body, "filter", "Dataset Filter",
+            "Keyword filter for folders (e.g. imx219 ag12)", "")
+        self._check(body, "Simulate sensor noise on loaded frames",
+                    "Inject the selected sensor's physics on top of the real frames.",
+                    self.sim_noise_var)
 
-        # -- LEVELS 2 & 3: MODEL ---------------------------------------------
-        self._section(body, "LEVELS 2 & 3 · MODEL ARCHITECTURE")
+        self._section(body, "LEVEL 1 · IMAGE SENSOR PROFILE")
+        add_rows([
+            ("sensor", "Sensor Profile",
+             "imx219 legacy · imx662 Starvis 2 · imxng unreleased",
+             ["imx219", "imx662", "imxng"], "imx662"),
+            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
+        ])
+
+        # -- LEVEL 2: GROUND TRUTH -------------------------------------------
+        self._section(body, "LEVEL 2 · GROUND TRUTH / DATA")
+        add_rows([
+            ("frames", "Temporal Frames",
+             "Reads averaged for synthetic ground truth", [64, 128, 256], 256),
+        ])
+        tk.Label(body, text="     Paired noisy/gt folders auto-detected · "
+                 "detail-scored patch selection (denoise-hw logic).",
+                 bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(0, S(4)))
+
+        # -- LEVEL 3: MODEL --------------------------------------------------
+        self._section(body, "LEVEL 3 · MODEL ARCHITECTURE")
         add_rows([
             ("model_family", "Model Family", "CNN · U-Net · NAFNet",
              ["cnn", "unet", "nafnet"], "nafnet"),
@@ -452,6 +510,9 @@ class App(tk.Tk):
             ("activation", "Activation", "gelu on DeepX forces QAT injection",
              ["relu", "gelu", "silu"], "relu"),
         ])
+        self._coming_soon(body, "Custom NAFNet topology (scaling / encoders)",
+                          "Per-level downscale + NAFBlock counts, e.g. scaling "
+                          "2 2 1 · encoders 1 2 2 (denoise-hw style).")
 
         # -- LEVELS 4 & 6: HARDWARE ------------------------------------------
         self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
@@ -463,28 +524,40 @@ class App(tk.Tk):
                           "Flash the compiled .hef/.bin to real hardware "
                           "(requires Hailo / DeepX vendor SDK).")
 
-        # -- CALIBRATION / INPUT ---------------------------------------------
-        self._section(body, "LEVEL 5 · CALIBRATION & INPUT")
+        # -- LEVEL 5: CALIBRATION / QUANTIZATION -----------------------------
+        self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
         add_rows([
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
              [70, 160, 220], 160),
         ])
+        self._check(body, "INT8 quantization (PTQ)",
+                    "Quantize weights + activations for the accelerator target.",
+                    self.quantize_var)
         raw_row = tk.Frame(body, bg=WHITE)
         raw_row.pack(fill="x", pady=S(6))
         raw_row.columnconfigure(0, weight=1)
         left = tk.Frame(raw_row, bg=WHITE); left.grid(row=0, column=0, sticky="w")
-        tk.Label(left, text="Input RAW", bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
-        self.raw_label = tk.Label(left, text="synthetic (auto-generated)", bg=WHITE,
+        tk.Label(left, text="Single RAW (optional)", bg=WHITE, fg=INK,
+                 font=font(11, "bold")).pack(anchor="w")
+        self.raw_label = tk.Label(left, text="none — using source above", bg=WHITE,
                                   fg=SUBTLE, font=font(9))
         self.raw_label.pack(anchor="w")
         RoundButton(raw_row, "CHOOSE RAW", self._choose_raw, kind="secondary",
                     width=140, height=36).grid(row=0, column=1, sticky="e")
+        self._coming_soon(body, "Quantization-Aware Training (QAT)",
+                          "Fine-tune with simulated INT8 to recover quantization loss.")
 
         # -- EVALUATION (roadmap) --------------------------------------------
         self._section(body, "EVALUATION")
         self._coming_soon(body, "Automated Pareto Space Sweep / Optuna Loop",
                           "Auto-search the 6-level design space for the optimal "
                           "accuracy / latency trade-off.")
+        self._coming_soon(body, "Patch-cache training set builder",
+                          "Pre-scan a dataset into detail-scored patches for full "
+                          "training runs (denoise-hw dataset.py).")
+
+        self._on_mode_change()
+        self._on_source_change()
 
     def _build_footer(self):
         pad = S(34)
@@ -498,19 +571,40 @@ class App(tk.Tk):
         self.run_btn.pack(side="right")
 
     def _on_source_change(self):
-        real = self.source_var.get() == "real_imx219"
-        if hasattr(self, "dataset_btn"):
-            self.dataset_btn.set_enabled(real)
+        real = self.source_var.get() == "real"
+        for attr in ("dataset_btn", "upload_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).set_enabled(real)
         if hasattr(self, "dataset_label"):
             self.dataset_label.config(fg=(SUBTLE if real else "#C4C4C4"))
 
+    def _on_mode_change(self):
+        # Batch size only matters in batch mode (kept editable, just a hint).
+        pass
+
     def _choose_dataset(self):
-        if self.source_var.get() != "real_imx219":
+        if self.source_var.get() != "real":
             return
-        path = filedialog.askdirectory(title="Select the repo dataset folder (real RAW captures)")
+        path = filedialog.askdirectory(title="Select a dataset folder (real captures / paired noisy-gt)")
         if path:
             self.dataset_path = path
+            self.upload_files = []
             self.dataset_label.config(text=Path(path).name)
+
+    def _upload_images(self):
+        if self.source_var.get() != "real":
+            return
+        files = filedialog.askopenfilenames(
+            title="Upload one or more RAW / image frames",
+            filetypes=[("RAW / image", "*.npy *.png *.tif *.tiff *.dng *.raw *.jpg *.jpeg *.bmp"),
+                       ("All files", "*.*")])
+        if files:
+            self.upload_files = list(files)
+            self.dataset_path = None
+            n = len(self.upload_files)
+            self.dataset_label.config(
+                text=(Path(self.upload_files[0]).name if n == 1
+                      else f"{n} images uploaded"))
 
     def _choose_raw(self):
         path = filedialog.askopenfilename(
@@ -520,6 +614,22 @@ class App(tk.Tk):
         if path:
             self.input_raw = path
             self.raw_label.config(text=Path(path).name)
+
+    def _materialise_uploads(self):
+        """Copy uploaded files into a temp folder so they pass as one --dataset."""
+        if not self.upload_files:
+            return None
+        import shutil
+        dest = ROOT / "outputs" / "_uploads"
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in self.upload_files:
+            try:
+                shutil.copy(f, dest / Path(f).name)
+            except Exception:
+                pass
+        return str(dest)
 
     def _noop(self):
         pass
@@ -576,21 +686,30 @@ class App(tk.Tk):
 
     def _build_command(self):
         cmd = [sys.executable, str(ROOT / "run_demo.py"), "--no-window"]
-        source_map = {
-            "real_imx219": ("imx219", True),
-            "sim_imx662": ("imx662", False),
-            "sim_imxng": ("imxng", False),
-        }
-        sensor, real = source_map[self.source_var.get()]
-        cmd += ["--sensor", sensor]
-        for key in ("hardware", "model_family", "base_channels",
-                    "block_depth", "conv_type", "activation", "gain", "steps"):
+        for key in ("sensor", "hardware", "model_family", "base_channels",
+                    "block_depth", "conv_type", "activation", "gain", "steps",
+                    "frames"):
             flag = "--" + key.replace("_", "-")
             cmd += [flag, self.rows[key].get()]
-        if real:
+
+        if not self.quantize_var.get():
+            cmd += ["--no-quantize"]
+
+        if self.mode_var.get() == "batch":
+            bs = (self.batch_var.get() or "6").strip()
+            cmd += ["--batch", bs if bs.isdigit() else "6"]
+
+        if self.source_var.get() == "real":
             cmd += ["--real"]
-            if self.dataset_path:
-                cmd += ["--dataset", self.dataset_path]
+            dataset = self.dataset_path or self._materialise_uploads()
+            if dataset:
+                cmd += ["--dataset", dataset]
+            if self.sim_noise_var.get():
+                cmd += ["--simulate-noise"]
+            tokens = (self.filter_var.get() or "").split()
+            if tokens:
+                cmd += ["--filter", *tokens]
+
         if self.input_raw:
             cmd += ["--input-raw", self.input_raw]
         return cmd

@@ -40,6 +40,11 @@ sensor:
   #                          per-seed so re-runs can show different captures.
   real_capture: false
   dataset_path: null        # e.g. ./datasets/imx219_raws  (folder or file)
+  # Paired folders (a noisy.* + gt.* per folder, the denoise-hw convention) are
+  # auto-detected and used as real ground truth. simulate_noise injects the
+  # selected sensor's physics on top of loaded frames (clean -> noisy).
+  simulate_noise: false
+  filter: []                # keyword filter for dataset folders, e.g. [imx219, ag12]
   gain: 512                 # analog gain multiplier (challenge frame): 256 | 512
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
@@ -51,6 +56,11 @@ optimization:
   quantize: true            # enable INT8 post-training / QAT path
   calibration_steps: 220    # live calibration iterations on the test frame
   patch_size: 192           # working resolution for the live demo (square crop)
+
+# ---- Run mode ----------------------------------------------------------------
+run:
+  mode: single              # single | batch
+  batch_size: 6             # frames processed + averaged in batch mode
 
 # ---- Output ------------------------------------------------------------------
 output:

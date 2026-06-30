@@ -47,6 +47,8 @@ class SensorConfig:
     input_raw: str | None = None
     real_capture: bool = False      # load real frames instead of synthesising
     dataset_path: str | None = None # folder/file of real captures (e.g. IMX219 repo)
+    simulate_noise: bool = False    # inject sensor noise on top of loaded frames
+    filter: list = field(default_factory=list)  # keyword filter (denoise-hw style)
     gain: int = 512
 
 
@@ -70,6 +72,12 @@ class OutputConfig:
 
 
 @dataclass
+class RunConfig:
+    mode: str = "single"            # single | batch
+    batch_size: int = 6             # frames processed in batch mode
+
+
+@dataclass
 class Config:
     hardware: str = "hailo8"
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -77,6 +85,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    run: RunConfig = field(default_factory=RunConfig)
 
     # -- convenience --------------------------------------------------------
     @property
@@ -130,6 +139,7 @@ def load_config(path: str | Path) -> Config:
     _merge(cfg.data, raw.get("data", {}))
     _merge(cfg.optimization, raw.get("optimization", {}))
     _merge(cfg.output, raw.get("output", {}))
+    _merge(cfg.run, raw.get("run", {}))
     return cfg
 
 
@@ -152,9 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="folder/file of real captures (real-capture mode)")
     p.add_argument("--real", dest="real_capture", action="store_true",
                    help="use real captures from --dataset/dataset_path as the noisy input")
+    p.add_argument("--simulate-noise", dest="simulate_noise", action="store_true",
+                   help="inject the selected sensor's noise on top of loaded frames")
+    p.add_argument("--filter", dest="filter", nargs="*",
+                   help="keyword filter for dataset folders (denoise-hw style, e.g. imx219 ag12)")
+    p.add_argument("--batch", dest="batch", type=int,
+                   help="batch mode: process up to N frames and average the metrics")
     p.add_argument("--gain", type=int, choices=GAINS, help="analog gain of the test frame")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
+    p.add_argument("--frames", dest="frames", type=int,
+                   help="temporal frames averaged for the synthetic ground truth")
     p.add_argument("--no-quantize", action="store_true", help="disable the INT8 path")
     p.add_argument("--no-window", action="store_true", help="do not open the validation window")
     p.add_argument("--seed", type=int)
@@ -182,10 +200,19 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.sensor.dataset_path = args.dataset_path
     if getattr(args, "real_capture", False):
         cfg.sensor.real_capture = True
+    if getattr(args, "simulate_noise", False):
+        cfg.sensor.simulate_noise = True
+    if getattr(args, "filter", None):
+        cfg.sensor.filter = list(args.filter)
+    if getattr(args, "batch", None):
+        cfg.run.mode = "batch"
+        cfg.run.batch_size = max(1, int(args.batch))
     if args.gain:
         cfg.sensor.gain = args.gain
     if args.steps:
         cfg.optimization.calibration_steps = args.steps
+    if getattr(args, "frames", None):
+        cfg.data.temporal_frames = args.frames
     if args.no_quantize:
         cfg.optimization.quantize = False
     if args.no_window:

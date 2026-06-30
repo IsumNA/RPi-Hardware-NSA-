@@ -81,6 +81,45 @@ def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
     return model
 
 
+def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
+                    progress=None, crop: int = 128) -> nn.Module:
+    """Calibrate across a set of (noisy, clean) frames (batch / multi-image fit).
+
+    Each step samples a random frame and a random crop from it - the same
+    "patches drawn across many images" strategy used by denoise-hw's training.
+    """
+    if not pairs:
+        raise ValueError("calibrate_multi needs at least one (noisy, clean) pair")
+    if len(pairs) == 1:
+        return calibrate(model, pairs[0][0], pairs[0][1], steps, seed, progress, crop)
+
+    torch.manual_seed(seed)
+    g = torch.Generator().manual_seed(seed)
+    tensors = [(to_tensor(n), to_tensor(c)) for n, c in pairs]
+
+    opt = torch.optim.Adam(model.parameters(), lr=4e-3)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps), eta_min=2e-4)
+    loss_fn = nn.MSELoss()
+    model.train()
+    for i in range(max(1, steps)):
+        xi, yi = tensors[int(torch.randint(0, len(tensors), (1,), generator=g))]
+        h, w = xi.shape[-2:]
+        c = min(crop, h, w)
+        iy = int(torch.randint(0, h - c + 1, (1,), generator=g))
+        ix = int(torch.randint(0, w - c + 1, (1,), generator=g))
+        x = xi[..., iy:iy + c, ix:ix + c]
+        y = yi[..., iy:iy + c, ix:ix + c]
+        opt.zero_grad()
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+        sched.step()
+        if progress is not None and (i % 4 == 0 or i == steps - 1):
+            progress(i + 1, steps, float(loss.item()))
+    model.eval()
+    return model
+
+
 def run(model: nn.Module, noisy: np.ndarray) -> tuple[np.ndarray, float]:
     """Run inference; return the denoised image and measured forward time (ms)."""
     x = to_tensor(noisy)
