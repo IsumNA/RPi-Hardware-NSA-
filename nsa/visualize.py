@@ -93,8 +93,8 @@ def render_panel(
     gs = fig.add_gridspec(1, 3, left=0.018, right=0.982, top=0.78, bottom=0.06,
                           wspace=0.05)
     panels = [
-        ("RAW INPUT", noisy, f"IMX662  ·  {meta['gain']}× gain", RASPBERRY,
-         f"PSNR {meta['psnr_in']:.1f} dB", RASPBERRY),
+        ("RAW INPUT", noisy, f"{meta.get('sensor', 'sensor')}  ·  {meta['gain']}× gain",
+         RASPBERRY, f"PSNR {meta['psnr_in']:.1f} dB", RASPBERRY),
         ("GROUND TRUTH", ground_truth, f"temporal avg  ·  {meta['frames']} frames",
          INK, None, None),
         ("MODEL OUTPUT", denoised, f"{meta['family'].upper()}  ·  {meta['precision']}",

@@ -17,12 +17,33 @@ ONNX export, real per-channel INT8 quantization, and real PSNR measurements.
 
 | Level | Stage | What happens |
 |------:|-------|--------------|
-| **1** | **Sensor / Input** | Ingest an IMX662 Bayer RAW frame (or synthesise a physically-plausible one) at extreme analog gain (256× / 512×); demosaic to linear RGB. |
+| **1** | **Sensor / Input** | Pick a sensor from the **sensor library** (legacy IMX219, current IMX662, or an unreleased next-gen low-light part); ingest a real Bayer RAW or synthesise a physically-plausible one from that sensor's noise profile at extreme analog gain (256× / 512×); demosaic to linear RGB. |
 | **2** | **Data / Ground Truth** | Build a clean reference by temporally averaging many sensor reads. |
 | **3** | **Architecture** | Instantiate the denoiser (`cnn` / `unet` / `nafnet`) with the chosen channels, depth, conv type and activation. |
 | **4** | **Compiler** | Legalize operators for the target NPU, budget on-chip SRAM (tiling if needed), and select the quantization scheme (PTQ vs forced QAT). |
 | **5** | **Calibration / Quantization** | Live-calibrate the model on the test frame and quantize FP32 → INT8, measuring the accuracy drop. |
 | **6** | **Export** | Emit the export profile: `exported_model.onnx` plus a hardware-ready `.hef` / `.bin` / `.ort`. |
+
+---
+
+## The sensor library (why this is a framework, not a one-off)
+
+Level 1 is driven by a **sensor profile** — a set of datasheet-style physical
+parameters (quantum efficiency, read-noise floor, full-well capacity, PRNU,
+chroma cross-talk). Because the noisy frame is generated from these numbers, NSA
+can build a faithful training/validation frame for **any** sensor, including one
+that has not shipped yet, straight from its specification.
+
+| Profile | Role | Character |
+|---------|------|-----------|
+| `imx219` | Legacy (Camera Module v2) | High read noise, messy chroma splotches — hard to clean |
+| `imx662` | Current (Starvis 2) | Low read noise, mostly photon-shot limited |
+| `imxng` | **Unreleased** next-gen low-light | Shot-noise dominated, very uniform — a small NAFNet cleans it almost perfectly |
+
+This means we can target the **unreleased** low-light sensor today: model its
+physical noise, auto-compile an ultra-light denoiser for it, and have a
+production-ready, hardware-accelerated pipeline the day the chip leaves the
+factory. (Add a new sensor by appending one entry to `nsa/sensors.py`.)
 
 ---
 
@@ -32,6 +53,7 @@ Edit `config.yaml`, or override any value on the command line.
 
 | Flag | Choices | Meaning |
 |------|---------|---------|
+| `--sensor` | `imx219` \| `imx662` \| `imxng` | Image sensor noise profile (Level 1) |
 | `--hardware` | `rpi5_cpu` \| `hailo8` \| `deepx` | Target export profile (Level 6) |
 | `--model-family` | `cnn` \| `unet` \| `nafnet` | Architecture (Level 3) |
 | `--base-channels` | `16` \| `32` \| `64` | Width |

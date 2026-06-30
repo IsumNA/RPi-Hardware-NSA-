@@ -301,6 +301,8 @@ class App(tk.Tk):
 
         self.rows = {}
         specs = [
+            ("sensor", "Image Sensor", "Level 1 — physical noise profile",
+             ["imx219", "imx662", "imxng"], "imx662"),
             ("hardware", "Target Hardware", "Level 6 export profile",
              ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
             ("model_family", "Model Family", "Denoiser architecture",
@@ -405,8 +407,8 @@ class App(tk.Tk):
 
     def _build_command(self):
         cmd = [sys.executable, str(ROOT / "run_demo.py"), "--no-window"]
-        for key in ("hardware", "model_family", "base_channels", "block_depth",
-                    "conv_type", "activation", "gain", "steps"):
+        for key in ("sensor", "hardware", "model_family", "base_channels",
+                    "block_depth", "conv_type", "activation", "gain", "steps"):
             flag = "--" + key.replace("_", "-")
             cmd += [flag, self.rows[key].get()]
         if self.input_raw:
@@ -507,5 +509,23 @@ class App(tk.Tk):
             pass
 
 
+def _has_display() -> bool:
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    if not _has_display():
+        print("No graphical display detected (headless session).\n"
+              "The desktop UI needs a display (X / Wayland). Options:\n"
+              "  • Run the CLI instead:   python run_demo.py --no-window\n"
+              "  • Or enable X over SSH:  ssh -X <host>  (and install python3-tk)\n")
+        sys.exit(1)
+    try:
+        App().mainloop()
+    except tk.TclError as exc:
+        print(f"Could not open the GUI: {exc}\n"
+              "Tk may be missing — install it with: sudo apt install python3-tk\n"
+              "Or run headless:  python run_demo.py --no-window")
+        sys.exit(1)

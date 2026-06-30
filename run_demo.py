@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -32,15 +33,28 @@ from nsa.inference import (calibrate, estimate_device_latency_ms,
                            fake_quantize_int8, psnr, run)
 from nsa.models import build_model, count_params
 from nsa.raw_io import build_frame
+from nsa.sensors import get_sensor
 from nsa.report import compute_fitness, print_report
 from nsa.theme import (RPI_GREEN, banner, console, kv_table, level_rule, log,
                        pause)
 from nsa.visualize import render_panel
 
 
+def _has_display() -> bool:
+    """True if a GUI display is available for the validation pop-up window."""
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def main() -> int:
     args = build_parser().parse_args()
     cfg = apply_overrides(load_config(args.config), args)
+
+    # Headless box (e.g. Pi over SSH with no X): never try to open a window.
+    headless = cfg.output.show_window and not _has_display()
+    if headless:
+        cfg.output.show_window = False
 
     banner(f"Neural Sensor Architecture  ·  v{__version__}")
 
@@ -53,6 +67,8 @@ def main() -> int:
     torch.manual_seed(cfg.output.seed)
     np.random.seed(cfg.output.seed)
 
+    sensor = get_sensor(cfg.sensor.sensor)
+
     # -- Configuration summary --------------------------------------------------
     console.print(kv_table(
         [
@@ -62,7 +78,8 @@ def main() -> int:
             ("block_depth", str(cfg.model.block_depth)),
             ("conv_type", cfg.model.conv_type),
             ("activation", cfg.model.activation),
-            ("sensor", f"{cfg.sensor.model}  {cfg.sensor.bayer_pattern}  {cfg.sensor.bit_depth}-bit"),
+            ("sensor", f"{sensor.label} — {sensor.family}  ·  "
+                       f"{sensor.bayer}  {sensor.bit_depth}-bit"),
             ("gain", f"{cfg.sensor.gain}×"),
             ("input_raw", cfg.sensor.input_raw or "synthetic (auto-generated)"),
             ("quantize", "INT8" if cfg.optimization.quantize else "off"),
@@ -76,19 +93,23 @@ def main() -> int:
     # ===========================================================================
     # LEVEL 1 - SENSOR / INPUT
     # ===========================================================================
-    level_rule(1, "SENSOR  ·  IMX662 Bayer RAW ingestion")
-    log(f"Reading {cfg.sensor.model} RAW @ {cfg.sensor.gain}× analog gain "
-        f"({cfg.sensor.bayer_pattern}, {cfg.sensor.bit_depth}-bit)", "step")
+    level_rule(1, f"SENSOR  ·  {sensor.label} Bayer RAW ingestion")
+    log(f"Sensor profile: {sensor.label} — {sensor.family}  ·  "
+        f"QE {sensor.qe:.0%}, read {sensor.read_noise:.1f}e-, "
+        f"well {sensor.full_well:,.0f}e-", "step")
+    log(f"Reading {sensor.label} RAW @ {cfg.sensor.gain}× analog gain "
+        f"({sensor.bayer}, {sensor.bit_depth}-bit)", "step")
     frame = build_frame(
         input_raw=cfg.sensor.input_raw,
         gain=cfg.sensor.gain,
         temporal_frames=cfg.data.temporal_frames,
         patch=cfg.optimization.patch_size,
-        bayer_pattern=cfg.sensor.bayer_pattern,
+        sensor=sensor,
         seed=cfg.output.seed,
     )
-    src = "synthetic IMX662 capture" if frame.source == "synthetic" else frame.source
+    src = f"synthetic {sensor.label} capture" if frame.source == "synthetic" else frame.source
     log(f"Frame source: {src}", "info")
+    log(f"Noise model: {sensor.note}", "info")
     log(f"Working resolution: {frame.width}×{frame.height}  ·  demosaiced linear RGB", "ok")
 
     # ===========================================================================
@@ -168,9 +189,12 @@ def main() -> int:
     # ===========================================================================
     level_rule(6, "EXPORT  ·  writing hardware-ready artifacts")
     onnx_path = out_dir / "exported_model.onnx"
-    export_onnx(model, cfg.optimization.patch_size, onnx_path)
-    log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
-        "[FP32 baseline graph]", "ok")
+    if export_onnx(model, cfg.optimization.patch_size, onnx_path) and onnx_path.exists():
+        log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
+            "[FP32 baseline graph]", "ok")
+    else:
+        log("ONNX export skipped ('onnx' package unavailable) — "
+            "install it with: pip install onnx", "warn")
 
     artifact_path = out_dir / f"hardware_ready{cfg.artifact_ext}"
     info = write_device_artifact(export_model, cfg, result, artifact_path)
@@ -183,6 +207,7 @@ def main() -> int:
     level_rule(0, "VALIDATION  ·  before / ground-truth / after")
     panel_path = out_dir / "validation_panel.png"
     meta = {
+        "sensor": sensor.label,
         "gain": cfg.sensor.gain,
         "frames": cfg.data.temporal_frames,
         "family": cfg.model.model_family,
@@ -196,6 +221,9 @@ def main() -> int:
     log(f"Saved validation matrix -> {panel_path}", "ok")
     if cfg.output.show_window:
         log("Opened 3-panel validation window", "info")
+    elif headless:
+        log("No display detected (headless) — window skipped; "
+            "open validation_panel.png to view the result", "info")
 
     # ===========================================================================
     # OUTPUT 4 - PARETO FITNESS REPORT
@@ -214,9 +242,10 @@ def main() -> int:
 
     console.print()
     log("Artifacts written to: " + str(out_dir.resolve()), "ok")
+    onnx_note = "exported_model.onnx   [muted]·[/muted] " if onnx_path.exists() else ""
     console.print(
-        f"   [muted]·[/muted] exported_model.onnx   "
-        f"[muted]·[/muted] hardware_ready{cfg.artifact_ext}   "
+        f"   [muted]·[/muted] {onnx_note}"
+        f"hardware_ready{cfg.artifact_ext}   "
         f"[muted]·[/muted] validation_panel.png"
     )
     console.print()

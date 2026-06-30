@@ -23,19 +23,33 @@ import torch.nn as nn
 MAGIC = b"NSA1"
 
 
-def export_onnx(model: nn.Module, patch: int, path: Path) -> Path:
+def export_onnx(model: nn.Module, patch: int, path: Path) -> Path | None:
+    """Export the FP32 graph to ONNX.
+
+    Returns the path on success, or ``None`` if export is unavailable (e.g. the
+    optional ``onnx`` package is not installed) so the pipeline can continue and
+    still write the device binary.
+    """
     model.eval()
     dummy = torch.randn(1, 3, patch, patch)
-    torch.onnx.export(
-        model,
-        dummy,
-        str(path),
-        input_names=["raw_rgb"],
-        output_names=["denoised_rgb"],
-        dynamic_axes={"raw_rgb": {2: "h", 3: "w"}, "denoised_rgb": {2: "h", 3: "w"}},
-        opset_version=17,
-    )
-    return path
+    try:
+        torch.onnx.export(
+            model,
+            dummy,
+            str(path),
+            input_names=["raw_rgb"],
+            output_names=["denoised_rgb"],
+            dynamic_axes={"raw_rgb": {2: "h", 3: "w"}, "denoised_rgb": {2: "h", 3: "w"}},
+            opset_version=17,
+        )
+        return path
+    except Exception:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        return None
 
 
 def _pack_int8_weights(model: nn.Module) -> tuple[bytes, list[dict]]:

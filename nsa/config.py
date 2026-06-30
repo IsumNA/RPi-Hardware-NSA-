@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 
+from .sensors import SENSOR_KEYS
+
 # -- Allowed choices (the "compiler" front-end vocabulary) --------------------
 HARDWARE = {
     "rpi5_cpu": "Raspberry Pi 5 (CPU)",
@@ -41,9 +43,7 @@ class ModelConfig:
 
 @dataclass
 class SensorConfig:
-    model: str = "IMX662"
-    bayer_pattern: str = "RGGB"
-    bit_depth: int = 12
+    sensor: str = "imx662"          # profile key from nsa.sensors
     input_raw: str | None = None
     gain: int = 512
 
@@ -99,6 +99,7 @@ class Config:
             (m.conv_type in CONV_TYPES, "conv_type", m.conv_type, CONV_TYPES),
             (m.activation in ACTIVATIONS, "activation", m.activation, ACTIVATIONS),
             (s.gain in GAINS, "gain", s.gain, GAINS),
+            (s.sensor in SENSOR_KEYS, "sensor", s.sensor, SENSOR_KEYS),
         ]
         for ok, name, got, allowed in checks:
             if not ok:
@@ -142,7 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--block-depth", dest="block_depth", type=int, choices=BLOCK_DEPTHS)
     p.add_argument("--conv-type", dest="conv_type", choices=CONV_TYPES)
     p.add_argument("--activation", choices=ACTIVATIONS)
-    p.add_argument("--input-raw", dest="input_raw", help="path to IMX662 Bayer RAW frame")
+    p.add_argument("--sensor", choices=list(SENSOR_KEYS),
+                   help="image sensor profile (Level 1)")
+    p.add_argument("--input-raw", dest="input_raw", help="path to a Bayer RAW frame")
     p.add_argument("--gain", type=int, choices=GAINS, help="analog gain of the test frame")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
@@ -165,6 +168,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.model.conv_type = args.conv_type
     if args.activation:
         cfg.model.activation = args.activation
+    if args.sensor:
+        cfg.sensor.sensor = args.sensor
     if args.input_raw:
         cfg.sensor.input_raw = args.input_raw
     if args.gain:

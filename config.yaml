@@ -24,12 +24,13 @@ model:
 
 # ---- LEVEL 1 : Sensor / Input ------------------------------------------------
 sensor:
-  model: IMX662             # Sony Starvis 2 mono/colour sensor
-  bayer_pattern: RGGB
-  bit_depth: 12
-  # Path to a real IMX662 Bayer RAW frame. If null or missing, the stack
-  # synthesises a physically-plausible RAW at the requested gain so the
-  # demo always runs out-of-the-box.
+  # Image sensor profile (drives the physics-based noise injection):
+  #   imx219  -> legacy Camera Module v2 (noisy, messy chroma)
+  #   imx662  -> current Starvis 2 (low read noise)
+  #   imxng   -> unreleased next-gen low-light Starvis 2 (shot-noise limited)
+  sensor: imx662
+  # Path to a real Bayer RAW frame. If null or missing, the stack synthesises a
+  # physically-plausible RAW for the chosen sensor so the demo runs out-of-the-box.
   input_raw: null
   gain: 512                 # analog gain multiplier (challenge frame): 256 | 512
 

@@ -18,8 +18,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-FULL_WELL = 9000.0   # electrons at unity gain for a small Starvis-2 pixel
-READ_NOISE_E = 2.4   # read noise in electrons (IMX662 is very low-read-noise)
+from .sensors import SensorProfile, get_sensor
+
 BLACK_LEVEL = 0.015  # normalised pedestal
 
 
@@ -68,12 +68,27 @@ def _synthetic_scene(h: int, w: int, seed: int) -> np.ndarray:
     return np.clip(img, 0.0, 1.0).astype(np.float32)
 
 
-def _capture(clean: np.ndarray, gain: int, rng: np.random.Generator) -> np.ndarray:
-    """Simulate one noisy sensor read of a clean linear-RGB scene at `gain`."""
-    photons = np.clip(clean, 0, 1) * (FULL_WELL / float(gain))
+def _capture(clean: np.ndarray, gain: int, sensor: SensorProfile,
+             rng: np.random.Generator, prnu: np.ndarray) -> np.ndarray:
+    """Simulate one noisy read of a clean linear-RGB scene for a given sensor.
+
+    Photon-transfer model: shot noise on the collected electrons (scaled by
+    quantum efficiency and full-well capacity) + read noise, with a fixed-pattern
+    PRNU gain map and low-frequency chroma cross-talk. Lower-grade sensors (low
+    QE / high read noise / high chroma) therefore produce visibly messier frames.
+    """
+    eff = sensor.full_well * sensor.qe / float(gain)
+    photons = np.clip(clean, 0, 1) * eff * prnu
     electrons = rng.poisson(np.maximum(photons, 0.0)).astype(np.float32)
-    electrons += rng.normal(0.0, READ_NOISE_E, size=clean.shape).astype(np.float32)
-    noisy = electrons / (FULL_WELL / float(gain))
+    electrons += rng.normal(0.0, sensor.read_noise, size=clean.shape).astype(np.float32)
+    noisy = electrons / eff
+
+    if sensor.chroma_noise > 0:
+        cn = rng.normal(0.0, sensor.chroma_noise, size=clean.shape).astype(np.float32)
+        cn = cv2.GaussianBlur(cn, (0, 0), 2.2)        # low-frequency splotches
+        cn -= cn.mean(axis=2, keepdims=True)          # opponent (chroma-only) noise
+        noisy += cn
+
     noisy += BLACK_LEVEL
     return np.clip(noisy, 0.0, 1.0).astype(np.float32)
 
@@ -129,12 +144,13 @@ def _center_crop(img: np.ndarray, size: int) -> np.ndarray:
 class Frame:
     """Bundle of the tensors the rest of the stack needs."""
 
-    def __init__(self, noisy_rgb, clean_rgb, bayer, gain, source):
+    def __init__(self, noisy_rgb, clean_rgb, bayer, gain, source, sensor):
         self.noisy_rgb = noisy_rgb          # HxWx3 float32 [0,1]  (Panel A)
         self.clean_rgb = clean_rgb          # HxWx3 float32 [0,1]  (Panel B / GT)
         self.bayer = bayer                  # HxW   float32 [0,1]  (the RAW plane)
         self.gain = gain
         self.source = source                # "synthetic" | path
+        self.sensor = sensor                # SensorProfile
         self.height, self.width = noisy_rgb.shape[:2]
 
 
@@ -143,26 +159,33 @@ def build_frame(
     gain: int,
     temporal_frames: int,
     patch: int,
-    bayer_pattern: str,
+    sensor: SensorProfile | str,
     seed: int,
 ) -> Frame:
-    """Produce the (noisy, clean, bayer) frame bundle for the demo."""
+    """Produce the (noisy, clean, bayer) frame bundle for the chosen sensor."""
+    if isinstance(sensor, str):
+        sensor = get_sensor(sensor)
     rng = np.random.default_rng(seed)
 
     if input_raw:
         clean = load_real_raw(input_raw, patch)
-        noisy = _capture(clean, gain, rng)
         source = input_raw
     else:
         clean = _center_crop(_synthetic_scene(patch, patch, seed), patch)
-        noisy = _capture(clean, gain, rng)
         source = "synthetic"
+
+    # Fixed-pattern PRNU gain map: same for every exposure of this sensor, so it
+    # does NOT average out in the temporal ground truth (as on real silicon).
+    prnu = (1.0 + np.random.default_rng(seed + 777).normal(
+        0.0, sensor.prnu, size=clean.shape)).astype(np.float32)
+
+    noisy = _capture(clean, gain, sensor, rng, prnu)
 
     # Ground truth = temporal average of many independent reads (denoised ref).
     acc = np.zeros_like(clean)
     for _ in range(max(1, temporal_frames)):
-        acc += _capture(clean, gain, rng)
+        acc += _capture(clean, gain, sensor, rng, prnu)
     gt = acc / max(1, temporal_frames)
 
-    bayer = _to_bayer(noisy, bayer_pattern)
-    return Frame(noisy, gt, bayer, gain, source)
+    bayer = _to_bayer(noisy, sensor.bayer)
+    return Frame(noisy, gt, bayer, gain, source, sensor)
