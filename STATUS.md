@@ -58,7 +58,9 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Real RAW input | ◐ | `.npy` and standard images supported; **no DNG/metadata parser** yet |
 | Config via YAML **or** CLI flags | ✅ | `config.yaml` + full `--flag` overrides |
 | Calibration step count | ✅ | `--steps` (speed/quality trade-off) |
-| Desktop GUI | ✅ | Imager-styled, DPI-aware, live per-level progress sidebar |
+| Desktop GUI | ✅ | Imager-styled, DPI-aware, live per-level progress sidebar; grouped 6-level matrix |
+| Mode: Single Frame Calibration | ✅ | The working mode today (radio, locked on) |
+| Roadmap items shown greyed in UI | ✅ | Temporal Video Denoise, Pareto/Optuna sweep, Live Silicon Deployment rendered as disabled "coming soon" controls |
 | CLI | ✅ | Branded rich terminal UI |
 | Per-config evaluation | ✅ | Computes one Pareto point per run |
 | Reproducibility | ✅ | Seeded RNG (`output.seed`) |

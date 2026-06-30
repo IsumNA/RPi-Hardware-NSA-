@@ -281,31 +281,128 @@ class App(tk.Tk):
                         background=RASPBERRY, bordercolor=FIELD, thickness=S(6))
         self.option_add("*TCombobox*Listbox.font", font(10))
 
+    # -- Form widgets ---------------------------------------------------------
+    def _make_scrollable(self, parent):
+        """Return an inner frame inside a vertically scrollable canvas."""
+        canvas = tk.Canvas(parent, bg=WHITE, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=WHITE)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+
+        def _wheel(e):
+            step = -1 if (getattr(e, "num", 0) == 5 or getattr(e, "delta", 0) < 0) else 1
+            canvas.yview_scroll(-step, "units")
+
+        def _bind(_e):
+            canvas.bind_all("<MouseWheel>", _wheel)
+            canvas.bind_all("<Button-4>", _wheel)
+            canvas.bind_all("<Button-5>", _wheel)
+
+        def _unbind(_e):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.unbind_all(seq)
+
+        canvas.bind("<Enter>", _bind)
+        canvas.bind("<Leave>", _unbind)
+        return inner
+
+    def _section(self, parent, text):
+        wrap = tk.Frame(parent, bg=WHITE)
+        wrap.pack(fill="x", pady=(S(14), S(2)))
+        tk.Label(wrap, text=text, bg=WHITE, fg=RASPBERRY,
+                 font=font(9, "bold")).pack(anchor="w")
+        tk.Frame(parent, bg=LINE, height=1).pack(fill="x", pady=(S(2), S(2)))
+
+    def _badge(self, parent, text, bg=FIELD, fg=SUBTLE):
+        tk.Label(parent, text=f" {text} ", bg=bg, fg=fg,
+                 font=font(8, "bold")).pack(side="left", padx=(S(10), 0))
+
+    def _radio(self, parent, text, value, enabled, badge=None):
+        fr = tk.Frame(parent, bg=WHITE)
+        fr.pack(fill="x", pady=S(4))
+        rb = tk.Radiobutton(
+            fr, text="  " + text, variable=self.mode_var, value=value,
+            bg=WHITE, fg=(INK if enabled else "#B6B6B6"), selectcolor=WHITE,
+            activebackground=WHITE, activeforeground=INK,
+            font=font(11, "bold" if enabled else "normal"),
+            state=("normal" if enabled else "disabled"),
+            anchor="w", highlightthickness=0, bd=0, takefocus=enabled)
+        rb.pack(side="left")
+        if badge:
+            self._badge(fr, badge)
+
+    def _coming_soon(self, parent, text, desc, badge="COMING SOON"):
+        fr = tk.Frame(parent, bg=WHITE)
+        fr.pack(fill="x", pady=S(6))
+        var = tk.BooleanVar(value=False)
+        top = tk.Frame(fr, bg=WHITE); top.pack(fill="x")
+        cb = tk.Checkbutton(
+            top, text="  " + text, variable=var, state="disabled",
+            bg=WHITE, fg="#B6B6B6", selectcolor=WHITE, activebackground=WHITE,
+            font=font(11), anchor="w", highlightthickness=0, bd=0)
+        cb.pack(side="left")
+        self._badge(top, badge)
+        tk.Label(fr, text="     " + desc, bg=WHITE, fg="#C4C4C4",
+                 font=font(9)).pack(anchor="w")
+
     # -- Form view ------------------------------------------------------------
     def _build_form(self):
+        try:
+            self.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
         for w in self.main.winfo_children():
             w.destroy()
 
         pad = S(34)
         header = tk.Frame(self.main, bg=WHITE)
-        header.pack(fill="x", padx=pad, pady=(S(28), S(4)))
+        header.pack(fill="x", padx=pad, pady=(S(24), S(4)))
         tk.Label(header, text="Compilation Profile", bg=WHITE, fg=INK,
                  font=font(19, "bold")).pack(anchor="w")
-        tk.Label(header, text="Select the target hardware and model architecture, "
-                 "then compile a hardware-ready denoiser.",
+        tk.Label(header, text="Configure the 6-level stack, then compile a "
+                 "hardware-ready denoiser.",
                  bg=WHITE, fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))
-        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(14), S(6)))
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(12), 0))
 
-        body = tk.Frame(self.main, bg=WHITE)
-        body.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
+        # footer first so it stays pinned; body fills the space above it.
+        self._build_footer()
+
+        outer = tk.Frame(self.main, bg=WHITE)
+        outer.pack(fill="both", expand=True, padx=pad, pady=(S(4), 0))
+        body = self._make_scrollable(outer)
 
         self.rows = {}
-        specs = [
-            ("sensor", "Image Sensor", "Level 1 — physical noise profile",
+        self.mode_var = tk.StringVar(value="single")
+
+        def add_rows(specs):
+            for key, title, desc, values, default in specs:
+                row = ConfigRow(body, title, desc, values, default)
+                row.pack(fill="x", pady=S(6))
+                self.rows[key] = row
+
+        # -- MODE -------------------------------------------------------------
+        self._section(body, "MODE")
+        self._radio(body, "Single Frame Calibration", "single", enabled=True)
+        self._radio(body, "Temporal Video Denoise", "temporal", enabled=False,
+                    badge="PHASE 2")
+
+        # -- LEVEL 1: SENSOR --------------------------------------------------
+        self._section(body, "LEVEL 1 · IMAGE SENSOR")
+        add_rows([
+            ("sensor", "Sensor Profile", "imx219 legacy · imx662 Starvis 2 · imxng unreleased",
              ["imx219", "imx662", "imxng"], "imx662"),
-            ("hardware", "Target Hardware", "Level 6 export profile",
-             ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
-            ("model_family", "Model Family", "Denoiser architecture",
+            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
+        ])
+
+        # -- LEVELS 2 & 3: MODEL ---------------------------------------------
+        self._section(body, "LEVELS 2 & 3 · MODEL ARCHITECTURE")
+        add_rows([
+            ("model_family", "Model Family", "CNN · U-Net · NAFNet",
              ["cnn", "unet", "nafnet"], "nafnet"),
             ("base_channels", "Base Channels", "Network width", [16, 32, 64], 32),
             ("block_depth", "Block Depth", "Network depth", [2, 4, 8], 4),
@@ -313,18 +410,26 @@ class App(tk.Tk):
              ["standard", "depthwise"], "depthwise"),
             ("activation", "Activation", "gelu on DeepX forces QAT injection",
              ["relu", "gelu", "silu"], "relu"),
-            ("gain", "Sensor Gain", "IMX662 challenge-frame analog gain",
-             [256, 512], 512),
+        ])
+
+        # -- LEVELS 4 & 6: HARDWARE ------------------------------------------
+        self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
+        add_rows([
+            ("hardware", "Target Hardware", "Pi 5 CPU · Hailo-8 (est.) · DeepX (est.)",
+             ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
+        ])
+        self._coming_soon(body, "Live Silicon Deployment",
+                          "Flash the compiled .hef/.bin to real hardware "
+                          "(requires Hailo / DeepX vendor SDK).")
+
+        # -- CALIBRATION / INPUT ---------------------------------------------
+        self._section(body, "LEVEL 5 · CALIBRATION & INPUT")
+        add_rows([
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
              [70, 160, 220], 160),
-        ]
-        for key, title, desc, values, default in specs:
-            row = ConfigRow(body, title, desc, values, default)
-            row.pack(fill="x", pady=S(7))
-            self.rows[key] = row
-
+        ])
         raw_row = tk.Frame(body, bg=WHITE)
-        raw_row.pack(fill="x", pady=S(7))
+        raw_row.pack(fill="x", pady=S(6))
         raw_row.columnconfigure(0, weight=1)
         left = tk.Frame(raw_row, bg=WHITE); left.grid(row=0, column=0, sticky="w")
         tk.Label(left, text="Input RAW", bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
@@ -334,13 +439,17 @@ class App(tk.Tk):
         RoundButton(raw_row, "CHOOSE RAW", self._choose_raw, kind="secondary",
                     width=140, height=36).grid(row=0, column=1, sticky="e")
 
-        self._build_footer()
+        # -- EVALUATION (roadmap) --------------------------------------------
+        self._section(body, "EVALUATION")
+        self._coming_soon(body, "Automated Pareto Space Sweep / Optuna Loop",
+                          "Auto-search the 6-level design space for the optimal "
+                          "accuracy / latency trade-off.")
 
     def _build_footer(self):
         pad = S(34)
-        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad)
         footer = tk.Frame(self.main, bg=WHITE)
-        footer.pack(fill="x", padx=pad, pady=S(18))
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(16))
+        tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
         RoundButton(footer, "APP OPTIONS", self._noop, kind="secondary",
                     width=150, height=44).pack(side="left")
         self.run_btn = RoundButton(footer, "RUN COMPILE", self._run, kind="primary",
@@ -362,6 +471,10 @@ class App(tk.Tk):
     # -- Run view -------------------------------------------------------------
     def _run(self):
         pad = S(34)
+        try:
+            self.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
         self.sidebar.reset()
         for w in self.main.winfo_children():
             w.destroy()
