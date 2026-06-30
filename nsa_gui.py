@@ -104,6 +104,42 @@ ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "rpi_logo.png"
 PANEL_PATH = ROOT / "outputs" / "validation_panel.png"
 
+# Image-sensor catalogue shown as the primary input. Each card carries a
+# transparent product picture so the operator can see exactly which module
+# they're targeting (keeps IMX219 / IMX662 / IMX-NG from getting mixed up).
+SENSOR_CARDS = [
+    {
+        "key": "imx219",
+        "name": "IMX219",
+        "family": "Legacy CMOS",
+        "tag": "LEGACY",
+        "image": ROOT / "assets" / "sensor_imx219.png",
+        "blurb": "Camera Module v2. High read noise, messy chroma splotches — "
+                 "needs a deeper denoiser.",
+        "specs": "QE 55%  ·  read 4.0e\u207b  ·  10-bit RGGB",
+    },
+    {
+        "key": "imx662",
+        "name": "IMX662",
+        "family": "Starvis 2",
+        "tag": "CURRENT",
+        "image": ROOT / "assets" / "sensor_imx662.png",
+        "blurb": "Current Starvis 2. Low read noise, mostly photon-shot limited "
+                 "— a lean network cleans it well.",
+        "specs": "QE 80%  ·  read 2.0e\u207b  ·  12-bit RGGB",
+    },
+    {
+        "key": "imxng",
+        "name": "IMX-NG",
+        "family": "Starvis 2 · unreleased",
+        "tag": "FUTURE",
+        "image": ROOT / "assets" / "sensor_imxng.png",
+        "blurb": "Unreleased next-gen low-light. Shot-noise dominated and very "
+                 "uniform — optimise before silicon ships.",
+        "specs": "QE 92%  ·  read 0.8e\u207b  ·  12-bit RGGB",
+    },
+]
+
 # -- Raspberry Pi Imager palette ----------------------------------------------
 WHITE = "#FFFFFF"
 INK = "#2B2B2B"
@@ -275,6 +311,121 @@ class ConfigRow(tk.Frame):
 
     def set(self, value):
         self.var.set(str(value))
+
+
+class SensorSelector(tk.Frame):
+    """Primary input: a row of clickable sensor cards, each with a transparent
+    product picture so the operator can see which module they're choosing.
+
+    Exposes the same ``.get()`` / ``.set()`` surface as ``ConfigRow`` so the rest
+    of the form treats it as ``self.rows['sensor']``.
+    """
+
+    THUMB = 116  # logical px; scaled with S()
+
+    def __init__(self, parent, cards, default, command=None):
+        super().__init__(parent, bg=WHITE)
+        self.cards = cards
+        self.var = tk.StringVar(value=default)
+        self.command = command
+        self._imgs = {}      # keep PhotoImage refs alive
+        self._frames = {}    # key -> card frame (for highlight)
+        self._inner = {}     # key -> dict of child widgets to re-tint
+
+        grid = tk.Frame(self, bg=WHITE)
+        grid.pack(fill="x")
+        for i in range(len(cards)):
+            grid.columnconfigure(i, weight=1, uniform="sensor")
+
+        for i, c in enumerate(cards):
+            self._build_card(grid, c, i)
+        self._refresh()
+
+    def _load_thumb(self, path):
+        if not (ImageTk and Path(path).exists()):
+            return None
+        try:
+            im = Image.open(path).convert("RGBA")
+            box = S(self.THUMB)
+            im.thumbnail((box, box), Image.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+
+    def _build_card(self, parent, c, col):
+        key = c["key"]
+        card = tk.Frame(parent, bg=WHITE, highlightthickness=2,
+                        highlightbackground=LINE, highlightcolor=LINE,
+                        cursor="hand2")
+        card.grid(row=0, column=col, sticky="nsew", padx=S(5))
+        pad = tk.Frame(card, bg=WHITE)
+        pad.pack(fill="both", expand=True, padx=S(10), pady=S(10))
+
+        img = self._load_thumb(c["image"])
+        self._imgs[key] = img
+        thumb_bg = tk.Frame(pad, bg=FIELD, height=S(self.THUMB + 14))
+        thumb_bg.pack(fill="x")
+        thumb_bg.pack_propagate(False)
+        if img is not None:
+            lbl = tk.Label(thumb_bg, image=img, bg=FIELD)
+        else:
+            lbl = tk.Label(thumb_bg, text="sensor", bg=FIELD, fg=SUBTLE,
+                           font=font(9))
+        lbl.pack(expand=True)
+
+        head = tk.Frame(pad, bg=WHITE); head.pack(fill="x", pady=(S(8), 0))
+        name = tk.Label(head, text=c["name"], bg=WHITE, fg=INK,
+                        font=font(13, "bold"))
+        name.pack(side="left")
+        tag = tk.Label(head, text=f" {c['tag']} ", bg=FIELD, fg=SUBTLE,
+                       font=font(7, "bold"))
+        tag.pack(side="right")
+        fam = tk.Label(pad, text=c["family"], bg=WHITE, fg=RASPBERRY,
+                       font=font(9, "bold"))
+        fam.pack(anchor="w")
+        specs = tk.Label(pad, text=c["specs"], bg=WHITE, fg=INK, font=font(8))
+        specs.pack(anchor="w", pady=(S(2), 0))
+        blurb = tk.Label(pad, text=c["blurb"], bg=WHITE, fg=SUBTLE,
+                         font=font(8), wraplength=S(150), justify="left")
+        blurb.pack(anchor="w", pady=(S(4), 0))
+
+        self._frames[key] = card
+        self._inner[key] = {"pad": pad, "thumb_bg": thumb_bg, "img": lbl,
+                            "head": head, "name": name, "fam": fam,
+                            "specs": specs, "blurb": blurb, "tag": tag}
+
+        for w in (card, pad, thumb_bg, lbl, head, name, fam, specs, blurb):
+            w.bind("<Button-1>", lambda _e, k=key: self._select(k))
+
+    def _select(self, key):
+        if self.var.get() != key:
+            self.var.set(key)
+            self._refresh()
+            if self.command:
+                self.command()
+
+    def _refresh(self):
+        sel = self.var.get()
+        for key, card in self._frames.items():
+            on = key == sel
+            border = RASPBERRY if on else LINE
+            bg = "#FCEEF2" if on else WHITE
+            card.configure(highlightbackground=border, highlightcolor=border,
+                           bg=bg)
+            parts = self._inner[key]
+            for name in ("pad", "head", "name", "fam", "specs", "blurb"):
+                try:
+                    parts[name].configure(bg=bg)
+                except Exception:
+                    pass
+
+    def get(self):
+        return self.var.get()
+
+    def set(self, value):
+        if value in self._frames:
+            self.var.set(value)
+            self._refresh()
 
 
 class App(tk.Tk):
@@ -482,6 +633,20 @@ class App(tk.Tk):
                 row.pack(fill="x", pady=S(6))
                 self.rows[key] = row
 
+        # -- PRIMARY INPUT: IMAGE SENSOR -------------------------------------
+        # The sensor is the root of the whole stack: it sets the noise physics,
+        # which image data is loaded, and how aggressive the denoiser must be.
+        self._section(body, "PRIMARY INPUT · IMAGE SENSOR")
+        tk.Label(body, text="     Pick the camera module you're optimising for. "
+                 "Everything below (noise model, data, network) adapts to it.",
+                 bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(8)))
+        sensor_sel = SensorSelector(body, SENSOR_CARDS, "imx662",
+                                    command=self._on_sensor_change)
+        sensor_sel.pack(fill="x", pady=(0, S(4)))
+        self.rows["sensor"] = sensor_sel
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(10), 0))
+
         # -- MODE -------------------------------------------------------------
         self._section(body, "MODE")
         self._radio(body, "Single Frame Calibration", "single", enabled=True,
@@ -538,13 +703,15 @@ class App(tk.Tk):
                     "Inject the selected sensor's physics on top of the real frames.",
                     self.sim_noise_var)
 
-        self._section(body, "LEVEL 1 · IMAGE SENSOR PROFILE")
+        self._section(body, "LEVEL 1 · SENSOR GAIN")
+        self.sensor_echo = tk.Label(
+            body, text="", bg=WHITE, fg=RASPBERRY, font=font(9, "bold"),
+            wraplength=S(560), justify="left")
+        self.sensor_echo.pack(anchor="w", pady=(0, S(4)))
         add_rows([
-            ("sensor", "Sensor Profile",
-             "imx219 legacy · imx662 Starvis 2 · imxng unreleased",
-             ["imx219", "imx662", "imxng"], "imx662"),
             ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
         ])
+        self._on_sensor_change()
 
         # -- LEVEL 2: GROUND TRUTH -------------------------------------------
         self._section(body, "LEVEL 2 · GROUND TRUTH / DATA")
@@ -683,6 +850,16 @@ class App(tk.Tk):
     def _on_mode_change(self):
         # Batch size only matters in batch mode (kept editable, just a hint).
         pass
+
+    def _on_sensor_change(self):
+        if not hasattr(self, "sensor_echo"):
+            return
+        key = self.rows["sensor"].get() if "sensor" in self.rows else "imx662"
+        card = next((c for c in SENSOR_CARDS if c["key"] == key), None)
+        if card:
+            self.sensor_echo.config(
+                text=f"     Optimising for {card['name']} ({card['family']}) — "
+                     f"{card['specs']}.")
 
     def _on_eval_change(self):
         if not hasattr(self, "run_btn"):
