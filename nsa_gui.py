@@ -11,6 +11,7 @@ the CLI does, streaming the live compilation log into the window.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import subprocess
@@ -19,7 +20,7 @@ import threading
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 try:
     from PIL import Image, ImageTk
@@ -875,24 +876,182 @@ class App(tk.Tk):
         self.pbar.pack_forget()
         self.sidebar.all_done()
         self.status.config(text="Compilation complete — artifacts written to outputs/")
-        self.open_btn.set_enabled(True)
+        # Stash the full streamed log before we rebuild the view.
+        try:
+            self._full_log = self.log.get("1.0", "end").strip()
+        except Exception:
+            self._full_log = ""
         self._show_result()
 
-    def _show_result(self):
-        if not (ImageTk and PANEL_PATH.exists()):
-            return
+    def _load_summary(self) -> dict:
         try:
-            im = Image.open(PANEL_PATH)
-            target_w = S(900)
-            ratio = target_w / im.width
-            im = im.resize((int(im.width * ratio), int(im.height * ratio)), Image.LANCZOS)
-            self._result_img = ImageTk.PhotoImage(im)
-            top = tk.Toplevel(self)
-            top.title("NSA — Validation Matrix")
-            top.configure(bg=WHITE)
-            tk.Label(top, image=self._result_img, bg=WHITE).pack(padx=S(10), pady=S(10))
+            return json.loads((ROOT / "outputs" / "summary.json").read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _metric_card(self, parent, label, value, accent=INK, sub=None):
+        card = tk.Frame(parent, bg=FIELD)
+        card.pack(side="left", fill="both", expand=True, padx=(0, S(10)))
+        inner = tk.Frame(card, bg=FIELD)
+        inner.pack(fill="both", expand=True, padx=S(14), pady=S(12))
+        tk.Label(inner, text=label.upper(), bg=FIELD, fg=SUBTLE,
+                 font=font(8, "bold")).pack(anchor="w")
+        tk.Label(inner, text=value, bg=FIELD, fg=accent,
+                 font=font(16, "bold")).pack(anchor="w", pady=(S(2), 0))
+        if sub:
+            tk.Label(inner, text=sub, bg=FIELD, fg=SUBTLE,
+                     font=font(8)).pack(anchor="w")
+
+    def _show_result(self):
+        s = self._load_summary()
+        pad = S(34)
+        try:
+            self.unbind_all("<MouseWheel>")
         except Exception:
             pass
+        for w in self.main.winfo_children():
+            w.destroy()
+
+        # -- Header ----------------------------------------------------------
+        header = tk.Frame(self.main, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(22), S(2)))
+        tk.Label(header, text="Compilation Complete", bg=WHITE, fg=INK,
+                 font=font(19, "bold")).pack(anchor="w")
+        if s:
+            m = s.get("model", {})
+            subtitle = (f"{s.get('hardware_name','')}   ·   "
+                        f"{m.get('family','').upper()} "
+                        f"{m.get('base_channels','')}ch × {m.get('block_depth','')} · "
+                        f"{m.get('conv_type','')} · {m.get('activation','')} · "
+                        f"{s.get('precision','')}")
+        else:
+            subtitle = "Results written to outputs/"
+        tk.Label(header, text=subtitle, bg=WHITE, fg=SUBTLE,
+                 font=font(10)).pack(anchor="w", pady=(S(2), 0))
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
+
+        # -- Footer (pinned) -------------------------------------------------
+        footer = tk.Frame(self.main, bg=WHITE)
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
+        tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
+        RoundButton(footer, "RUN AGAIN", self._back, kind="secondary",
+                    width=150, height=44).pack(side="left")
+        RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
+                    width=170, height=44).pack(side="left", padx=(S(8), 0))
+        RoundButton(footer, "FULL LOG", self._show_log, kind="primary",
+                    width=140, height=44).pack(side="right")
+
+        outer = tk.Frame(self.main, bg=WHITE)
+        outer.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
+        body = self._make_scrollable(outer)
+
+        if not s:
+            tk.Label(body, text="No summary found. See the full log for details.",
+                     bg=WHITE, fg=SUBTLE, font=font(11)).pack(anchor="w", pady=S(10))
+
+        # -- Fitness banner --------------------------------------------------
+        if s:
+            grade = s.get("grade", "")
+            gcol = {"OPTIMAL": GREEN, "BALANCED": "#C98A1B",
+                    "SUBOPTIMAL": "#C98A1B", "INFEASIBLE": RASPBERRY}.get(grade, INK)
+            fb = tk.Frame(body, bg=WHITE)
+            fb.pack(fill="x", pady=(S(8), S(10)))
+            tk.Label(fb, text=f"{s.get('fitness','—')}", bg=WHITE, fg=gcol,
+                     font=font(34, "bold")).pack(side="left")
+            tk.Label(fb, text="/ 100", bg=WHITE, fg=SUBTLE,
+                     font=font(14)).pack(side="left", padx=(S(6), S(12)), anchor="s",
+                                         pady=(0, S(8)))
+            tk.Label(fb, text=grade, bg=WHITE, fg=gcol,
+                     font=font(13, "bold")).pack(side="left", anchor="s",
+                                                 pady=(0, S(10)))
+            tk.Label(fb, text="  Pareto fitness score", bg=WHITE, fg=SUBTLE,
+                     font=font(10)).pack(side="left", anchor="s", pady=(0, S(11)))
+
+            # -- Metric cards -----------------------------------------------
+            row1 = tk.Frame(body, bg=WHITE); row1.pack(fill="x", pady=(0, S(10)))
+            self._metric_card(row1, "Image quality",
+                              f"{s.get('psnr_out','—')} dB",
+                              accent=GREEN,
+                              sub=f"+{s.get('psnr_gain','—')} dB vs input ({s.get('psnr_in','—')} dB)")
+            self._metric_card(row1, "Latency / speed",
+                              f"{s.get('latency_ms','—')} ms",
+                              sub=f"{s.get('fps','—')} FPS  ·  {s.get('hardware','')}")
+            self._metric_card(row1, "INT8 drop",
+                              f"{s.get('quant_drop_db','—'):+} dB"
+                              if isinstance(s.get('quant_drop_db'), (int, float))
+                              else "—",
+                              sub="FP32 → INT8")
+
+            row2 = tk.Frame(body, bg=WHITE); row2.pack(fill="x", pady=(0, S(14)))
+            self._metric_card(row2, "Weight memory",
+                              f"{s.get('weight_kb','—')} KB", sub="storage / flash")
+            budget = s.get("sram_budget_kb", 0)
+            act = s.get("act_kb", 0)
+            sub_sram = (f"{100*act/budget:.0f}% of {budget:,.0f} KB SRAM"
+                        if budget and budget < 500000 else "peak activation")
+            self._metric_card(row2, "Activation memory",
+                              f"{act:,.0f} KB", sub=sub_sram)
+            self._metric_card(row2, "Model size",
+                              f"{s.get('model',{}).get('params','—'):,}"
+                              if isinstance(s.get('model',{}).get('params'), int) else "—",
+                              sub="trainable params")
+
+            # -- Config / data details --------------------------------------
+            self._section(body, "CONFIGURATION")
+            details = [
+                ("Sensor", f"{s.get('sensor','')}  ({s.get('sensor_key','')})  ·  {s.get('gain','')}× gain"),
+                ("Capture", s.get("capture_mode", "")),
+                ("Ground truth", s.get("gt_kind", "")),
+                ("Run mode", f"{s.get('run_mode','')}"
+                             + (f"  ·  {s.get('frames','')} frame(s)" if s.get('run_mode')=='batch' else "")),
+                ("Target", f"{s.get('hardware_name','')}  [{s.get('precision','')}]"),
+            ]
+            for k, v in details:
+                r = tk.Frame(body, bg=WHITE); r.pack(fill="x", pady=S(2))
+                tk.Label(r, text=k, bg=WHITE, fg=SUBTLE, font=font(10),
+                         width=14, anchor="w").pack(side="left")
+                tk.Label(r, text=v, bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+
+            if s.get("warnings"):
+                self._section(body, "COMPILER NOTES")
+                for w in s["warnings"]:
+                    tk.Label(body, text="▲  " + w, bg=WHITE, fg="#C98A1B",
+                             font=font(9), wraplength=S(560), justify="left").pack(anchor="w")
+
+        # -- Validation panel image -----------------------------------------
+        self._section(body, "VALIDATION MATRIX")
+        if ImageTk and PANEL_PATH.exists():
+            try:
+                im = Image.open(PANEL_PATH)
+                target_w = S(640)
+                ratio = target_w / im.width
+                im = im.resize((target_w, int(im.height * ratio)), Image.LANCZOS)
+                self._result_img = ImageTk.PhotoImage(im)
+                tk.Label(body, image=self._result_img, bg=WHITE).pack(anchor="w", pady=(S(4), S(12)))
+            except Exception:
+                tk.Label(body, text="(could not render validation_panel.png)",
+                         bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+        else:
+            tk.Label(body, text="validation_panel.png not found in outputs/",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+
+    def _show_log(self):
+        win = tk.Toplevel(self)
+        win.title("NSA — Full compilation log")
+        win.configure(bg=WHITE)
+        win.geometry(f"{S(820)}x{S(560)}")
+        con = tk.Frame(win, bg=FIELD)
+        con.pack(fill="both", expand=True, padx=S(12), pady=S(12))
+        mono = "Cascadia Mono" if "Cascadia Mono" in tkfont.families() else \
+               ("DejaVu Sans Mono" if "DejaVu Sans Mono" in tkfont.families() else "Courier")
+        txt = tk.Text(con, bg=FIELD, fg=INK, bd=0, relief="flat",
+                      font=(mono, FT(9)), wrap="none", padx=S(12), pady=S(10))
+        sb = ttk.Scrollbar(con, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", getattr(self, "_full_log", "") or "(no log captured)")
+        txt.configure(state="disabled")
 
     def _back(self):
         if self.proc and self.proc.poll() is None:
@@ -904,8 +1063,24 @@ class App(tk.Tk):
         self._build_form()
 
     def _open_outputs(self):
+        path = ROOT / "outputs"
         try:
-            os.startfile(str(ROOT / "outputs"))  # type: ignore[attr-defined]
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            return
+        except Exception:
+            pass
+        # No file manager (e.g. headless / SSH): at least tell the user where it is.
+        try:
+            messagebox.showinfo("Outputs folder", f"Results are saved in:\n{path}")
         except Exception:
             pass
 

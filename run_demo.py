@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -290,6 +291,50 @@ def main() -> int:
                f"{cfg.model.block_depth} · {cfg.model.conv_type} · "
                f"{cfg.model.activation} · {meta['precision']}")
     print_report(fit, cfg.hardware_name, profile)
+
+    # Machine-readable summary so the GUI can render a rich results screen.
+    summary = {
+        "hardware": cfg.hardware,
+        "hardware_name": cfg.hardware_name,
+        "model": {
+            "family": cfg.model.model_family,
+            "base_channels": cfg.model.base_channels,
+            "block_depth": cfg.model.block_depth,
+            "conv_type": cfg.model.conv_type,
+            "activation": cfg.model.activation,
+            "params": n_params,
+        },
+        "sensor": sensor.label,
+        "sensor_key": cfg.sensor.sensor,
+        "gain": cfg.sensor.gain,
+        "capture_mode": ("real" if real_loaded else "simulated")
+                        + (" + simulated noise" if cfg.sensor.simulate_noise else ""),
+        "gt_kind": gt_kind,
+        "run_mode": cfg.run.mode,
+        "frames": len(frames),
+        "precision": meta["precision"],
+        "psnr_in": round(psnr_in, 2),
+        "psnr_out": round(final_psnr, 2),
+        "psnr_gain": round(final_psnr - psnr_in, 2),
+        "quant_drop_db": round(quant_drop, 3),
+        "latency_ms": round(latency_ms, 1),
+        "fps": round(1000.0 / latency_ms, 1),
+        "weight_kb": round(info["total_bytes"] / 1024.0, 1),
+        "act_kb": round(result.est_sram_kb, 0),
+        "sram_budget_kb": result.sram_budget_kb,
+        "fitness": fit.score,
+        "grade": fit.grade,
+        "warnings": result.warnings,
+        "panel": str((out_dir / "validation_panel.png").resolve()),
+        "artifacts": [str((out_dir / f).resolve()) for f in (
+            "exported_model.onnx", f"hardware_ready{cfg.artifact_ext}",
+            "validation_panel.png") if (out_dir / f).exists()],
+    }
+    try:
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2),
+                                              encoding="utf-8")
+    except Exception:
+        pass
 
     if result.warnings:
         console.print()
