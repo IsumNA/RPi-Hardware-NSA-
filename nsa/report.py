@@ -106,8 +106,8 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
 
     score = round(score, 1)
     grade = ("OPTIMAL" if score >= 85 else
-             "BALANCED" if score >= 70 else
-             "SUBOPTIMAL" if score >= 50 else "INFEASIBLE")
+             "STRONG" if score >= 70 else
+             "FAIR" if score >= 50 else "WEAK")
     return Fitness(psnr, latency_ms, fps, quant_drop_db, score,
                    grade, quality, latency_s, robust,
                    weight_kb=wk, act_kb=ak, total_kb=total, mem_score=mem,
@@ -157,9 +157,9 @@ def print_report(fit: Fitness, hardware_name: str, profile: str) -> None:
         table.add_row("Memory Efficiency", _bar(fit.mem_score))
 
     grade_colour = {
-        "OPTIMAL": RPI_GREEN, "BALANCED": "#E8A33D",
-        "SUBOPTIMAL": "#E8A33D", "INFEASIBLE": RPI_RASPBERRY,
-    }[fit.grade]
+        "OPTIMAL": RPI_GREEN, "STRONG": RPI_GREEN,
+        "FAIR": "#E8A33D", "WEAK": RPI_RASPBERRY,
+    }.get(fit.grade, "#E8A33D")
     score_line = Text()
     score_line.append("FINAL PARETO FITNESS SCORE   ", style="bold white")
     score_line.append(f"{fit.score:.1f} / 100", style=f"bold {grade_colour}")

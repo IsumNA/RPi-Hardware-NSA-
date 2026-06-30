@@ -43,7 +43,11 @@ CAPS = {
 
 
 # Families whose graph contains ConvTranspose (needs resize+conv on NPUs).
-_CONVT_FAMILIES = {"unet", "rednet"}
+_CONVT_FAMILIES = {"unet", "rednet", "drunet"}
+
+# Families with NPU-awkward ops (LayerNorm / softmax attention) that really want
+# floating-point execution — used to add caveats in the suitability matrix.
+_TRANSFORMER_FAMILIES = {"restormer"}
 
 
 @dataclass
@@ -255,6 +259,11 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
             notes.append(f"{cfg.model.model_family.upper()} ConvTranspose "
                          "rewritten to resize+conv")
 
+        transformer_on_npu = cfg.model.model_family in _TRANSFORMER_FAMILIES and accel
+        if transformer_on_npu:
+            notes.append(f"{cfg.model.model_family.upper()} LayerNorm/softmax "
+                         "attention runs in FP fallback (limited NPU offload)")
+
         latency = estimate_device_latency_ms(model, patch, key, quantized)
         fps = 1000.0 / max(latency, 1e-6)
 
@@ -262,7 +271,8 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
         verdict = "SUITABLE"
         if not fits or (accel and not quantize_enabled):
             verdict = "UNSUITABLE"
-        elif tiled or not act_native or (cfg.model.model_family in _CONVT_FAMILIES and accel):
+        elif (tiled or not act_native or transformer_on_npu
+              or (cfg.model.model_family in _CONVT_FAMILIES and accel)):
             verdict = "CAVEATS"
         if fps < 5.0:
             notes.append(f"~{fps:.0f} FPS — well below real-time")

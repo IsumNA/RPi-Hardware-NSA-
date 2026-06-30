@@ -11,6 +11,9 @@ outputs/
 # Real-capture datasets (cloned/local RAW frames, not part of the repo)
 datasets/
 
+# Frozen Hugging Face snapshots (pinned model weights, can be large)
+models/frozen/
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -96,7 +96,7 @@ Edit `config.yaml`, or override any value on the command line.
 |------|---------|---------|
 | `--sensor` | `imx219` \| `imx662` \| `imxng` | Image sensor noise profile (Level 1) |
 | `--hardware` | `rpi5_cpu` \| `hailo8` \| `deepx` | Target export profile (Level 6) |
-| `--model-family` | `cnn` \| `dncnn` \| `unet` \| `rednet` \| `ridnet` \| `nafnet` | Architecture (Level 3) |
+| `--model-family` | `cnn` \| `dncnn` \| `unet` \| `rednet` \| `ridnet` \| `nafnet` \| `ffdnet` \| `drunet` \| `restormer` | Architecture (Level 3) — 9 families |
 | `--base-channels` | `16` \| `32` \| `64` | Width |
 | `--block-depth` | `2` \| `4` \| `8` | Depth |
 | `--conv-type` | `standard` \| `depthwise` | Convolution style |
@@ -123,17 +123,57 @@ Edit `config.yaml`, or override any value on the command line.
 
 | Tool | What it does |
 |------|--------------|
-| `python search.py --hardware hailo8` | Automated **Pareto sweep** over the design space (grid, or `--optuna N` for a TPE search). Prints a Pareto front + winner and writes `outputs/pareto.json`. |
+| `python search.py --hardware hailo8` | Automated **Pareto sweep** over the design space (grid, or `--optuna N` for a TPE search). Add `--all-sensors` to also sweep every sensor profile (IMX219 · IMX662 · IMX-NG). Prints a Pareto front + winner and writes `outputs/pareto.json`. |
+| `python hf_search.py --query qwen --size small` | **Hugging Face model sourcing** — searches the Hub filtered strictly to Apache-2.0 / MIT, tiered by size (small 1-8B → mid 8-20B → large 20-80B). `--freeze MODEL` locks the exact commit SHA into `outputs/hf_lock.json` (add `--download` to pull a pinned snapshot into `models/frozen/`); `--list-locked` shows what's frozen. |
 | `python cache.py --dataset DIR --per-image 6` | **Patch-cache builder** — detail-scored crops → `outputs/patch_cache/` for full training runs (denoise-hw `dataset.py` idea). |
 | `python deploy.py` | **Deployment package** — bundles the compiled artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into `outputs/deployment/…zip` (flashing still needs the vendor SDK + device). Run automatically when you pass `--export` (or tick *Compile & export* in the GUI). |
 
-All of the above are also available as controls in the desktop GUI (mode radios,
-the QAT checkbox, the custom-NAFNet fields, the Pareto-sweep radio, and the
-*Build Cache* / *Build Package* buttons). The sweep produces a **ranked,
-clickable leaderboard** — click any model row to review its config and run that
-exact model (or *Load into form*); *Use winner* loads the top result. Package
-export is an on-demand action on the results screen (*Export Package*), so a
-normal compile doesn't write a package every time.
+All of the above are also available as controls in the desktop GUI. The GUI is a
+**step-by-step wizard**: it asks what you want to do first (*test one specific
+model* vs *sweep & rank many*), then walks you one page at a time through the
+image sensor, the capture source & data, the model architecture, and the
+hardware/calibration, finishing on a **Review & run** page that summarises every
+choice before you launch (*Back* / *Next* navigate; the run button reads *RUN
+COMPILE* or *RUN SWEEP* to match your choice). On the sensor page you can tick
+**Test ALL sensor profiles** (sweeps only) to vary IMX219 / IMX662 / IMX-NG as
+well, so the leaderboard shows which model suits which camera.
+
+The sweep trains **all 9 model families** and produces a **ranked, clickable
+leaderboard** — click any model row to review its config and run that exact model
+(or *Load into form*); *Use winner* loads the top result. A **"Best for" filter**
+(All chips / Pi 5 CPU / Hailo-8 / DeepX) re-ranks the board so the models that are
+actually suitable for the chip you care about float to the top, each row showing
+that chip's verdict (`RUNS WELL` / `WITH CAVEATS` / `NOT REC.`), its FPS, a
+*standout* tag (`top pick` / `sharpest` / `fastest` / `leanest`), and — when you
+ran an all-sensors sweep — a **SENSOR** column. Package export is an on-demand
+action on the results screen (*Export Package*), so a normal compile doesn't
+write a package every time.
+
+### Sourcing external models from Hugging Face
+
+The model step also has a **Browse Hugging Face** button (and the standalone
+`hf_search.py` CLI) that brings the methodology in-house:
+
+1. **Filter by License** — only **Apache-2.0 / MIT** models are ever returned, so
+   legal risk is eliminated up front.
+2. **Benchmark Small** — searches default to the **small** tier (1-8B params) to
+   establish a speed/hardware-cost baseline.
+3. **Test the Gap** — bump the *Size* selector to **mid** (8-20B) or **large**
+   (20-80B) to see whether the accuracy jump justifies the extra compute.
+4. **Freeze the Weights** — **FREEZE** locks that model's exact commit SHA into
+   `outputs/hf_lock.json` (your secure manifest); `--download` additionally pulls
+   a pinned snapshot into `models/frozen/`, so an upstream update can never
+   silently break your production pipeline.
+
+Search, license-vetting and freezing the commit hash use only the Python
+standard library (the public Hub API); downloading a pinned snapshot uses the
+optional `huggingface_hub` package. This is a discovery + vetting + freeze
+front-end — the on-device 6-level compile still targets the built-in denoisers.
+
+The Level-3 options are also **contextual**: pick a model family first and only
+the parameters that apply appear (e.g. NAFNet and Restormer hide the activation
+and conv-type rows because they use a built-in SimpleGate / transposed-attention
+graph instead).
 
 ---
 
@@ -237,7 +277,8 @@ Override any option from `config.yaml` on the command line:
 
 ```bash
 # The DeepX + GELU -> forced QAT compiler path (great talking point)
-python run_demo.py --hardware deepx --activation gelu --model-family nafnet
+# (use a family that has a pickable activation, e.g. dncnn/cnn/unet)
+python run_demo.py --hardware deepx --activation gelu --model-family dncnn
 
 # Lightweight CNN for the Pi 5 CPU at 256x gain
 python run_demo.py --hardware rpi5_cpu --model-family cnn --gain 256

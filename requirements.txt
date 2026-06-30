@@ -21,3 +21,8 @@ onnx>=1.15
 # Optional: enables the Optuna TPE search in search.py (--optuna N).
 # Without it the sweep falls back to an exhaustive grid search.
 # optuna>=3.6
+
+# Optional: enables downloading a pinned snapshot when freezing a Hugging Face
+# model (hf_search.py --download / the GUI FREEZE button). Searching, license
+# filtering and freezing the commit hash work without it (stdlib HTTP only).
+# huggingface_hub>=0.23

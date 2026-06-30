@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .config import ModelConfig
 
@@ -272,6 +273,184 @@ class RIDNetDenoiser(nn.Module):
         return torch.clamp(x + self.tail(feat), 0.0, 1.0)
 
 
+class FFDNetDenoiser(nn.Module):
+    """FFDNet-style denoiser — works at half resolution for speed.
+
+    Pixel-unshuffle folds the image into 12 channels at half resolution, a plain
+    conv body cleans it there (4× fewer spatial positions = fast), then
+    pixel-shuffle folds it back. Space-to-depth/depth-to-space map cleanly to
+    INT8 NPUs, so this is the lean, accelerator-friendly option in the zoo.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        self.down = nn.PixelUnshuffle(2)
+        self.head = nn.Sequential(_conv(12, c, cfg.conv_type), _act(cfg.activation))
+        self.body = nn.Sequential(
+            *[_ConvBlock(c, cfg.conv_type, cfg.activation) for _ in range(cfg.block_depth)])
+        self.tail = nn.Conv2d(c, 12, 3, padding=1)
+        self.up = nn.PixelShuffle(2)
+
+    def forward(self, x):
+        _, _, h, w = x.shape
+        ph, pw = h % 2, w % 2
+        xp = F.pad(x, (0, pw, 0, ph), mode="reflect")
+        d = self.down(xp)
+        feat = self.body(self.head(d))
+        out = xp + self.up(self.tail(feat))
+        out = out[..., :h, :w]
+        return torch.clamp(out, 0.0, 1.0)
+
+
+class _ResBlock(nn.Module):
+    def __init__(self, c: int, conv_type: str, act: str):
+        super().__init__()
+        self.c1 = _conv(c, c, conv_type)
+        self.act = _act(act)
+        self.c2 = _conv(c, c, conv_type)
+
+    def forward(self, x):
+        return x + self.c2(self.act(self.c1(x)))
+
+
+class DRUNetDenoiser(nn.Module):
+    """DRUNet — a deep, BatchNorm-free 3-scale residual U-Net.
+
+    Deeper and more capacity than the compact ``UNetDenoiser``: residual blocks
+    at three resolutions with strided-conv downsamples and transpose-conv
+    upsamples, no BatchNorm (quantization-friendly). The flagship quality option
+    — heavier on memory, so the suitability matrix flags tiling on small NPUs.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        d = max(1, cfg.block_depth // 2)
+        ct, ac = cfg.conv_type, cfg.activation
+        self.head = _conv(3, c, ct)
+        self.enc1 = nn.Sequential(*[_ResBlock(c, ct, ac) for _ in range(d)])
+        self.down1 = nn.Conv2d(c, c * 2, 2, stride=2)
+        self.enc2 = nn.Sequential(*[_ResBlock(c * 2, ct, ac) for _ in range(d)])
+        self.down2 = nn.Conv2d(c * 2, c * 4, 2, stride=2)
+        self.mid = nn.Sequential(*[_ResBlock(c * 4, ct, ac) for _ in range(d)])
+        self.up2 = nn.ConvTranspose2d(c * 4, c * 2, 2, stride=2)
+        self.dec2 = nn.Sequential(*[_ResBlock(c * 2, ct, ac) for _ in range(d)])
+        self.up1 = nn.ConvTranspose2d(c * 2, c, 2, stride=2)
+        self.dec1 = nn.Sequential(*[_ResBlock(c, ct, ac) for _ in range(d)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        _, _, h, w = x.shape
+        ph = (4 - h % 4) % 4
+        pw = (4 - w % 4) % 4
+        xp = F.pad(x, (0, pw, 0, ph), mode="reflect")
+        e1 = self.enc1(self.head(xp))
+        e2 = self.enc2(self.down1(e1))
+        m = self.mid(self.down2(e2))
+        d2 = self.dec2(self.up2(m) + e2)
+        d1 = self.dec1(self.up1(d2) + e1)
+        out = xp + self.tail(d1)
+        out = out[..., :h, :w]
+        return torch.clamp(out, 0.0, 1.0)
+
+
+class _LayerNorm2d(nn.Module):
+    """Channel-wise LayerNorm for NCHW tensors (Restormer/BCHW style)."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(c))
+        self.bias = nn.Parameter(torch.zeros(c))
+
+    def forward(self, x):
+        mu = x.mean(1, keepdim=True)
+        var = x.var(1, keepdim=True, unbiased=False)
+        x = (x - mu) / torch.sqrt(var + 1e-6)
+        return x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+
+class _MDTA(nn.Module):
+    """Multi-Dconv-head Transposed Attention (attention across channels)."""
+
+    def __init__(self, c: int, heads: int):
+        super().__init__()
+        self.heads = heads
+        self.temp = nn.Parameter(torch.ones(heads, 1, 1))
+        self.qkv = nn.Conv2d(c, c * 3, 1)
+        self.qkv_dw = nn.Conv2d(c * 3, c * 3, 3, padding=1, groups=c * 3)
+        self.proj = nn.Conv2d(c, c, 1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.qkv_dw(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
+        hd = c // self.heads
+        q = q.reshape(b, self.heads, hd, h * w)
+        k = k.reshape(b, self.heads, hd, h * w)
+        v = v.reshape(b, self.heads, hd, h * w)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        attn = (q @ k.transpose(-2, -1)) * self.temp     # (b, heads, hd, hd)
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).reshape(b, c, h, w)
+        return self.proj(out)
+
+
+class _GDFN(nn.Module):
+    """Gated-Dconv feed-forward network (Restormer FFN)."""
+
+    def __init__(self, c: int, expansion: float = 2.0):
+        super().__init__()
+        hidden = int(c * expansion)
+        self.project_in = nn.Conv2d(c, hidden * 2, 1)
+        self.dw = nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1, groups=hidden * 2)
+        self.project_out = nn.Conv2d(hidden, c, 1)
+
+    def forward(self, x):
+        x = self.dw(self.project_in(x))
+        a, b = x.chunk(2, dim=1)
+        return self.project_out(F.gelu(a) * b)
+
+
+class _RestormerBlock(nn.Module):
+    def __init__(self, c: int, heads: int):
+        super().__init__()
+        self.norm1 = _LayerNorm2d(c)
+        self.attn = _MDTA(c, heads)
+        self.norm2 = _LayerNorm2d(c)
+        self.ffn = _GDFN(c)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class RestormerDenoiser(nn.Module):
+    """Restormer-style transformer denoiser (efficient channel attention).
+
+    Uses transposed (channel) self-attention — cost scales with channels², not
+    pixels² — plus a gated Dconv FFN and LayerNorm. Highest-quality, but the
+    LayerNorm/softmax graph is awkward for INT8 NPUs, so it shines on the Pi 5
+    CPU and gets caveats on the accelerators (exactly what the matrix shows).
+    Architecture inspired by the published Restormer / HuggingFace variants.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        heads = max(1, c // 16)                  # 16->1, 32->2, 64->4 (divides c)
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.body = nn.Sequential(
+            *[_RestormerBlock(c, heads) for _ in range(cfg.block_depth)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        feat = self.body(self.head(x))
+        return torch.clamp(x + self.tail(feat), 0.0, 1.0)
+
+
 class UNetDenoiser(nn.Module):
     """Compact 2-scale U-Net encoder/decoder."""
 
@@ -305,6 +484,9 @@ def build_model(cfg: ModelConfig) -> nn.Module:
         "rednet": REDNetDenoiser,
         "ridnet": RIDNetDenoiser,
         "nafnet": NAFNetDenoiser,
+        "ffdnet": FFDNetDenoiser,
+        "drunet": DRUNetDenoiser,
+        "restormer": RestormerDenoiser,
     }
     return families[cfg.model_family](cfg)
 

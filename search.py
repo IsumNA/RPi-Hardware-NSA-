@@ -47,14 +47,14 @@ from nsa.config import (
     MODEL_FAMILIES, Config, DataConfig, ModelConfig, OptimizationConfig,
     OutputConfig, RunConfig, SensorConfig,
 )
-from nsa.compiler import CAPS, compile_stack
+from nsa.compiler import CAPS, assess_targets, compile_stack
 from nsa.inference import (
     calibrate_multi, estimate_device_latency_ms, fake_quantize_int8, psnr, run,
 )
 from nsa.models import build_model, count_params
 from nsa.raw_io import build_frame, build_frame_from_source, list_frames
 from nsa.report import compute_fitness, print_report
-from nsa.sensors import get_sensor
+from nsa.sensors import SENSOR_KEYS, get_sensor
 from nsa.theme import RPI_GREEN, RPI_RASPBERRY, banner, console as nsa_console
 from nsa.visualize import render_panel
 
@@ -77,6 +77,7 @@ _BRIGHT    = "#DDE3F0"
 @dataclass
 class SearchResult:
     model_family: str
+    sensor: str
     base_channels: int
     block_depth: int
     conv_type: str
@@ -89,6 +90,7 @@ class SearchResult:
     warnings: list[str]
     n_params: int
     duration_s: float
+    chips: dict = None      # per-chip suitability {key: {verdict, fps, ...}}
 
 
 def _build_search_cfg(
@@ -202,8 +204,25 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
                           weight_kb=weight_kb, act_kb=result.est_sram_kb,
                           sram_budget_kb=result.sram_budget_kb)
 
+    # Cross-chip suitability for this exact trained model (RPi5/Hailo-8/DeepX).
+    chips: dict = {}
+    try:
+        for a in assess_targets(cfg, export_model, cfg.optimization.quantize):
+            chips[a.key] = {
+                "verdict": a.verdict,
+                "fps": round(a.fps, 1),
+                "latency_ms": round(a.latency_ms, 1),
+                "fits": bool(a.fits),
+                "tiled": bool(a.tiled),
+                "native": bool(a.act_native),
+                "notes": list(a.notes),
+            }
+    except Exception:
+        chips = {}
+
     return SearchResult(
         model_family=cfg.model.model_family,
+        sensor=cfg.sensor.sensor,
         base_channels=cfg.model.base_channels,
         block_depth=cfg.model.block_depth,
         conv_type=cfg.model.conv_type,
@@ -216,6 +235,7 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         warnings=result.warnings,
         n_params=n_params,
         duration_s=time.perf_counter() - t0,
+        chips=chips,
     )
 
 
@@ -247,17 +267,20 @@ def _save_pareto(results: list[SearchResult], front: list[SearchResult],
 
     def _row(r: SearchResult) -> dict:
         return {
-            "family": r.model_family, "base_channels": r.base_channels,
+            "family": r.model_family, "sensor": r.sensor,
+            "base_channels": r.base_channels,
             "block_depth": r.block_depth, "conv_type": r.conv_type,
             "activation": r.activation, "params": r.n_params,
             "psnr": round(r.psnr_out, 2), "latency_ms": round(r.latency_ms, 1),
             "fitness": r.fitness, "grade": r.grade,
             "pareto": r in front,
+            "chips": r.chips or {},
         }
 
     payload = {
         "target": args.hardware, "target_label": caps["label"],
-        "sensor": args.sensor, "gain": args.gain,
+        "sensor": "all" if args.all_sensors else args.sensor,
+        "all_sensors": bool(args.all_sensors), "gain": args.gain,
         "data_source": "real" if args.real_capture else "simulated",
         "search_steps": args.search_steps,
         "n_evaluated": len(results),
@@ -272,18 +295,21 @@ def _save_pareto(results: list[SearchResult], front: list[SearchResult],
 
 def _grade_colour(grade: str) -> str:
     return {
-        "OPTIMAL": _GREEN, "BALANCED": _AMBER,
-        "SUBOPTIMAL": _AMBER, "INFEASIBLE": _RED,
+        "OPTIMAL": _GREEN, "STRONG": _GREEN,
+        "FAIR": _AMBER, "WEAK": _RED,
     }.get(grade, _MUTED)
 
 
-def _results_table(results: list[SearchResult], title: str = "Search Results") -> Table:
+def _results_table(results: list[SearchResult], title: str = "Search Results",
+                   show_sensor: bool = False) -> Table:
     tbl = Table(
         title=title, title_style=f"bold {_BRIGHT}",
         border_style=_MUTED, header_style=f"bold {_MUTED}",
         show_lines=False, pad_edge=True,
     )
     tbl.add_column("#",       style=_MUTED,   width=3,  justify="right")
+    if show_sensor:
+        tbl.add_column("Sensor", style=_MUTED, width=7)
     tbl.add_column("Family",  style=_BRIGHT,  width=8)
     tbl.add_column("Ch×Dep",  style=_MUTED,   width=7,  justify="right")
     tbl.add_column("Conv",    style=_MUTED,   width=10)
@@ -299,6 +325,7 @@ def _results_table(results: list[SearchResult], title: str = "Search Results") -
         warn_marker = " ▲" if r.warnings else ""
         tbl.add_row(
             str(i),
+            *(([r.sensor]) if show_sensor else []),
             r.model_family.upper(),
             f"{r.base_channels}×{r.block_depth}",
             r.conv_type,
@@ -335,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="use real captures from --dataset as the noisy input")
     p.add_argument("--dataset", dest="dataset_path", default=None,
                    help="folder or file of real captures (required with --real)")
+    p.add_argument("--all-sensors", dest="all_sensors", action="store_true",
+                   help="sweep across every sensor profile (imx219, imx662, imxng) too")
     p.add_argument("--simulate-noise", dest="simulate_noise", action="store_true",
                    help="inject sensor noise on top of loaded frames (real capture mode)")
     p.add_argument("--filter", nargs="*", default=[],
@@ -401,12 +430,15 @@ def main() -> int:
         else:
             skipped.append(((fam, ch, dep, ct, act), reason))
 
+    sensors = list(SENSOR_KEYS) if args.all_sensors else [args.sensor]
+
     caps = CAPS[args.hardware]
     console.print()
     console.print(f"  [bold {_BRIGHT}]Target chip   :[/] {caps['label']}")
-    console.print(f"  [bold {_BRIGHT}]Sensor        :[/] {args.sensor}  @{args.gain}×")
+    console.print(f"  [bold {_BRIGHT}]Sensor        :[/] "
+                  f"{'ALL profiles (' + ', '.join(sensors) + ')' if args.all_sensors else args.sensor}  @{args.gain}×")
     console.print(f"  [bold {_BRIGHT}]Data source   :[/] {'real captures' if args.real_capture else 'simulated physics'}")
-    console.print(f"  [bold {_BRIGHT}]Search space  :[/] {len(feasible)} candidates  ({len(skipped)} infeasible skipped)")
+    console.print(f"  [bold {_BRIGHT}]Search space  :[/] {len(feasible)} candidates × {len(sensors)} sensor(s) = {len(feasible) * len(sensors)} runs  ({len(skipped)} infeasible skipped)")
     console.print(f"  [bold {_BRIGHT}]Steps/candidate:[/] {args.search_steps}  (full run: {args.final_steps})")
     console.print()
 
@@ -414,45 +446,48 @@ def main() -> int:
         console.print(f"[bold {_RED}]No feasible configurations for this hardware. Try a smaller patch or fewer channels.[/]")
         return 1
 
-    # -- Build frames (once, shared across all candidates) -------------------
-    console.print(f"  [{_MUTED}]Loading frame(s)...[/]")
-    sensor = get_sensor(args.sensor)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # -- Frame loader (cached per sensor) -----------------------------------
+    _frames_cache: dict = {}
 
-    frames = []
-    if args.real_capture:
-        sources = list_frames(args.dataset_path, args.filter or [], limit=1)
-        for src in sources:
-            try:
-                frames.append(build_frame_from_source(
-                    src, args.gain, args.temporal_frames, args.patch_size,
-                    sensor, args.seed, simulate_noise=args.simulate_noise,
-                ))
-            except Exception as exc:
-                console.print(f"  [{_AMBER}]Skipped {src.get('name','?')}: {exc}[/]")
-
-    if not frames:
+    def load_frames(sensor_key: str):
+        if sensor_key in _frames_cache:
+            return _frames_cache[sensor_key]
+        sensor = get_sensor(sensor_key)
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        frames = []
         if args.real_capture:
-            console.print(f"  [{_AMBER}]No usable real frames — falling back to synthetic {args.sensor}[/]")
-        frames.append(build_frame(
-            input_raw=None, gain=args.gain,
-            temporal_frames=args.temporal_frames, patch=args.patch_size,
-            sensor=sensor, seed=args.seed,
-        ))
-
-    psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
-    console.print(f"  [{_MUTED}]Input PSNR: {psnr_in:.1f} dB  ·  {len(frames)} frame(s)  ·  "
-                  f"{frames[0].width}×{frames[0].height}px[/]")
-    console.print()
+            sources = list_frames(args.dataset_path, args.filter or [], limit=1)
+            for src in sources:
+                try:
+                    frames.append(build_frame_from_source(
+                        src, args.gain, args.temporal_frames, args.patch_size,
+                        sensor, args.seed, simulate_noise=args.simulate_noise,
+                    ))
+                except Exception as exc:
+                    console.print(f"  [{_AMBER}]Skipped {src.get('name','?')}: {exc}[/]")
+        if not frames:
+            if args.real_capture:
+                console.print(f"  [{_AMBER}]No usable real frames — falling back to synthetic {sensor_key}[/]")
+            frames.append(build_frame(
+                input_raw=None, gain=args.gain,
+                temporal_frames=args.temporal_frames, patch=args.patch_size,
+                sensor=sensor, seed=args.seed,
+            ))
+        psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
+        console.print(f"  [{_MUTED}]{sensor_key}: input PSNR {psnr_in:.1f} dB  ·  "
+                      f"{len(frames)} frame(s)  ·  {frames[0].width}×{frames[0].height}px[/]")
+        _frames_cache[sensor_key] = frames
+        return frames
 
     # -- Search loop ---------------------------------------------------------
     results: list[SearchResult] = []
     n = len(feasible)
+    multi_sensor = len(sensors) > 1
 
-    def _evaluate(fam, ch, dep, ct, act, tag):
+    def _evaluate(fam, ch, dep, ct, act, tag, sensor_key, frames):
         cfg = _build_search_cfg(
-            hardware=args.hardware, sensor_key=args.sensor, gain=args.gain,
+            hardware=args.hardware, sensor_key=sensor_key, gain=args.gain,
             patch_size=args.patch_size, temporal_frames=args.temporal_frames,
             calibration_steps=args.search_steps, real_capture=args.real_capture,
             dataset_path=args.dataset_path, simulate_noise=args.simulate_noise,
@@ -460,8 +495,9 @@ def main() -> int:
             model_family=fam, base_channels=ch, block_depth=dep,
             conv_type=ct, activation=act,
         )
-        label = f"{fam.upper()} {ch}ch×{dep} {ct[:3]} {act}"
-        console.print(f"  [{_MUTED}]{tag}[/]  {label:<34}", end="")
+        spref = f"{sensor_key:<7} " if multi_sensor else ""
+        label = f"{spref}{fam.upper()} {ch}ch×{dep} {ct[:3]} {act}"
+        console.print(f"  [{_MUTED}]{tag}[/]  {label:<42}", end="")
         try:
             sr = _run_candidate(cfg, frames)
             results.append(sr)
@@ -502,10 +538,12 @@ def main() -> int:
             dep = trial.suggest_categorical("block_depth", dep_opts)
             ct = trial.suggest_categorical("conv_type", ct_opts)
             act = trial.suggest_categorical("activation", act_opts)
+            sk = trial.suggest_categorical("sensor", sensors) if multi_sensor else sensors[0]
             ok, _ = _is_feasible(args.hardware, act, ch, dep, args.patch_size)
             if not ok:
                 raise optuna.TrialPruned()
-            sr = _evaluate(fam, ch, dep, ct, act, f"[t{trial.number+1:>3}]")
+            sr = _evaluate(fam, ch, dep, ct, act, f"[t{trial.number+1:>3}]",
+                           sk, load_frames(sk))
             if sr is None:
                 raise optuna.TrialPruned()
             return sr.fitness
@@ -514,9 +552,15 @@ def main() -> int:
                                     sampler=optuna.samplers.TPESampler(seed=args.seed))
         study.optimize(_objective, n_trials=args.optuna)
     else:
-        console.print(f"  [{_MUTED}]Running {n} candidates...[/]\n")
-        for idx, (fam, ch, dep, ct, act) in enumerate(feasible, 1):
-            _evaluate(fam, ch, dep, ct, act, f"[{idx:>3}/{n}]")
+        total = n * len(sensors)
+        console.print(f"  [{_MUTED}]Running {total} candidates...[/]\n")
+        idx = 0
+        for sensor_key in sensors:
+            frames = load_frames(sensor_key)
+            for (fam, ch, dep, ct, act) in feasible:
+                idx += 1
+                _evaluate(fam, ch, dep, ct, act, f"[{idx:>3}/{total}]",
+                          sensor_key, frames)
 
     if not results:
         console.print(f"\n[bold {_RED}]All candidates failed.[/]")
@@ -527,7 +571,7 @@ def main() -> int:
     top_n = results[: args.top]
 
     console.print()
-    console.print(_results_table(top_n, f"Top {min(args.top, len(results))} Configurations — {caps['label']}"))
+    console.print(_results_table(top_n, f"Top {min(args.top, len(results))} Configurations — {caps['label']}", show_sensor=args.all_sensors))
 
     winner = results[0]
     console.print()
@@ -535,7 +579,9 @@ def main() -> int:
         f"  [bold {_BRIGHT}]Best framework for[/] [bold {_GREEN}]{caps['label']}[/]\n\n"
         f"  [bold {_GREEN}]{winner.model_family.upper()}[/]"
         f"  {winner.base_channels}ch × depth {winner.block_depth}"
-        f"  ·  {winner.conv_type}  ·  {winner.activation}\n\n"
+        f"  ·  {winner.conv_type}  ·  {winner.activation}"
+        + (f"  ·  sensor [bold]{winner.sensor}[/]" if args.all_sensors else "")
+        + "\n\n"
         f"  PSNR  [bold]{winner.psnr_out:.1f} dB[/]   "
         f"Latency  [bold]{winner.latency_ms:.1f} ms[/]   "
         f"Fitness  [bold {_grade_colour(winner.grade)}]{winner.fitness:.1f} / 100  [{winner.grade}][/]\n"
@@ -551,7 +597,8 @@ def main() -> int:
         console.print()
         console.print(_results_table(
             sorted(front, key=lambda r: r.latency_ms),
-            f"Pareto Front — {len(front)} non-dominated configs (PSNR ↑ / latency ↓ / params ↓)"))
+            f"Pareto Front — {len(front)} non-dominated configs (PSNR ↑ / latency ↓ / params ↓)",
+            show_sensor=args.all_sensors))
     pareto_path = _save_pareto(results, front, winner, caps, args)
     console.print(f"\n  [{_MUTED}]Saved sweep results -> {pareto_path}[/]")
 
@@ -579,7 +626,7 @@ def main() -> int:
         "--block-depth",   str(winner.block_depth),
         "--conv-type",     winner.conv_type,
         "--activation",    winner.activation,
-        "--sensor",        args.sensor,
+        "--sensor",        winner.sensor,
         "--gain",          str(args.gain),
         "--steps",         str(args.final_steps),
         "--seed",          str(args.seed),

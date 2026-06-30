@@ -150,6 +150,20 @@ GREEN = "#6CC04A"
 LINE = "#E4E4E4"
 FIELD = "#F4F4F4"
 HOVER = "#F2F2F2"
+AMBER = "#C98A1B"
+
+# Fitness rating -> colour (clear words: OPTIMAL > STRONG > FAIR > WEAK).
+GRADE_COLORS = {"OPTIMAL": GREEN, "STRONG": "#3F9142", "FAIR": AMBER,
+                "WEAK": RASPBERRY}
+
+# Per-chip suitability verdict -> colour + short label.
+VERDICT_COLORS = {"SUITABLE": GREEN, "CAVEATS": AMBER, "UNSUITABLE": RASPBERRY}
+VERDICT_LABEL = {"SUITABLE": "RUNS WELL", "CAVEATS": "WITH CAVEATS",
+                 "UNSUITABLE": "NOT REC."}
+VERDICT_RANK = {"SUITABLE": 0, "CAVEATS": 1, "UNSUITABLE": 2}
+CHIP_LABEL = {"all": "ALL CHIPS", "rpi5_cpu": "PI 5 CPU",
+              "hailo8": "HAILO-8", "deepx": "DEEPX"}
+SENSOR_SHORT = {"imx219": "219", "imx662": "662", "imxng": "NG", "all": "all"}
 
 LEVELS = [
     ("1", "Sensor"),
@@ -549,7 +563,8 @@ class App(tk.Tk):
         if desc:
             tk.Label(fr, text="     " + desc, bg=WHITE,
                      fg=(SUBTLE if enabled else "#C4C4C4"),
-                     font=font(9)).pack(anchor="w")
+                     font=font(9), wraplength=S(560),
+                     justify="left").pack(anchor="w")
 
     def _coming_soon(self, parent, text, desc, badge="COMING SOON"):
         fr = tk.Frame(parent, bg=WHITE)
@@ -576,7 +591,8 @@ class App(tk.Tk):
         cb.pack(anchor="w")
         if desc:
             tk.Label(fr, text="     " + desc, bg=WHITE, fg=SUBTLE,
-                     font=font(9)).pack(anchor="w")
+                     font=font(9), wraplength=S(560),
+                     justify="left").pack(anchor="w")
         return cb
 
     def _entry_row(self, parent, key, title, desc, default=""):
@@ -593,7 +609,13 @@ class App(tk.Tk):
         self.entries[key] = var
         return var
 
-    # -- Form view ------------------------------------------------------------
+    # -- Form view (step-by-step wizard) -------------------------------------
+    def _add_rows(self, parent, specs):
+        for key, title, desc, values, default in specs:
+            row = ConfigRow(parent, title, desc, values, default)
+            row.pack(fill="x", pady=S(6))
+            self.rows[key] = row
+
     def _build_form(self):
         try:
             self.unbind_all("<MouseWheel>")
@@ -603,22 +625,7 @@ class App(tk.Tk):
             w.destroy()
 
         pad = S(34)
-        header = tk.Frame(self.main, bg=WHITE)
-        header.pack(fill="x", padx=pad, pady=(S(24), S(4)))
-        tk.Label(header, text="Compilation Profile", bg=WHITE, fg=INK,
-                 font=font(19, "bold")).pack(anchor="w")
-        tk.Label(header, text="Configure the 6-level stack, then compile a "
-                 "hardware-ready denoiser.",
-                 bg=WHITE, fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))
-        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(12), 0))
-
-        # footer first so it stays pinned; body fills the space above it.
-        self._build_footer()
-
-        outer = tk.Frame(self.main, bg=WHITE)
-        outer.pack(fill="both", expand=True, padx=pad, pady=(S(4), 0))
-        body = self._make_scrollable(outer)
-
+        # Persistent state (kept alive across steps; steps only show/hide).
         self.rows = {}
         self.entries = {}
         self.mode_var = tk.StringVar(value="single")
@@ -626,46 +633,100 @@ class App(tk.Tk):
         self.sim_noise_var = tk.BooleanVar(value=False)
         self.quantize_var = tk.BooleanVar(value=True)
         self.qat_var = tk.BooleanVar(value=False)
-        self.eval_var = tk.StringVar(value="single")   # single | sweep
-        def add_rows(specs):
-            for key, title, desc, values, default in specs:
-                row = ConfigRow(body, title, desc, values, default)
-                row.pack(fill="x", pady=S(6))
-                self.rows[key] = row
+        self.eval_var = tk.StringVar(value="single")     # single | sweep
+        self.all_sensors_var = tk.BooleanVar(value=False)
 
-        # -- PRIMARY INPUT: IMAGE SENSOR -------------------------------------
-        # The sensor is the root of the whole stack: it sets the noise physics,
-        # which image data is loaded, and how aggressive the denoiser must be.
+        # Wizard chrome: a header (step indicator) + a content area + nav footer.
+        self._wiz_header = tk.Frame(self.main, bg=WHITE)
+        self._wiz_header.pack(fill="x", padx=pad, pady=(S(20), S(4)))
+        tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(8), 0))
+
+        self._build_footer()                              # pinned nav at the bottom
+
+        self.content = tk.Frame(self.main, bg=WHITE)
+        self.content.pack(fill="both", expand=True, padx=pad, pady=(S(4), 0))
+
+        # Step registry: (key, title, subtitle, builder).
+        self._step_defs = [
+            ("eval", "What do you want to do?",
+             "Test one specific model, or sweep & rank many to find the best.",
+             self._step_eval),
+            ("sensor", "Image sensor",
+             "Pick the camera module you're optimising for — everything adapts to it.",
+             self._step_sensor),
+            ("data", "Capture source & data",
+             "Where the frames come from, the ground truth, and the run mode.",
+             self._step_data),
+            ("model", "Model architecture",
+             "The network family and its parameters (Level 3).",
+             self._step_model),
+            ("hw", "Hardware & calibration",
+             "Target chip (Levels 4 & 6) and the calibration / quantization (Level 5).",
+             self._step_hw),
+            ("review", "Review & run",
+             "Check your choices, then launch.",
+             self._step_review),
+        ]
+
+        self._steps = []
+        for key, title, subtitle, builder in self._step_defs:
+            holder = tk.Frame(self.content, bg=WHITE)
+            body = self._make_scrollable(holder)
+            builder(body)
+            self._steps.append({"key": key, "title": title,
+                                "subtitle": subtitle, "holder": holder})
+
+        # Initialise dependent UI state, then show the first step.
+        self._step = 0
+        self._on_sensor_change()
+        self._on_mode_change()
+        self._on_source_change()
+        self._on_eval_change()
+        self._goto_step(0)
+
+    # -- Individual wizard steps ---------------------------------------------
+    def _step_eval(self, body):
+        self._radio(body, "Test one specific model", "single", enabled=True,
+                    variable=self.eval_var, badge="TEST ONE",
+                    desc="Pick an exact architecture and compile it into "
+                         "hardware-ready artifacts + a performance report.",
+                    command=self._on_eval_change)
+        self._radio(body, "Sweep & rank models (find the best)", "sweep",
+                    enabled=True, variable=self.eval_var, badge="COMPARE",
+                    desc="Train all 9 model families at each depth (your chosen "
+                         "width/conv/activation stay fixed) and show a ranked, "
+                         "clickable leaderboard you can filter by Pi chip. Takes a "
+                         "few minutes; click any row to run that exact model.",
+                    command=self._on_eval_change)
+
+    def _step_sensor(self, body):
         self._section(body, "PRIMARY INPUT · IMAGE SENSOR")
         tk.Label(body, text="     Pick the camera module you're optimising for. "
-                 "Everything below (noise model, data, network) adapts to it.",
+                 "Everything after this (noise model, data, network) adapts to it.",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(8)))
         sensor_sel = SensorSelector(body, SENSOR_CARDS, "imx662",
                                     command=self._on_sensor_change)
         sensor_sel.pack(fill="x", pady=(0, S(4)))
         self.rows["sensor"] = sensor_sel
+
+        self.all_sensors_cb = self._check(
+            body, "Test ALL sensor profiles (sweep only)",
+            "Sweep mode only: also vary the sensor (IMX219 · IMX662 · IMX-NG) so the "
+            "leaderboard shows which model suits which camera. Slower (3× the runs).",
+            self.all_sensors_var, command=self._on_eval_change)
+
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(10), 0))
+        self._section(body, "LEVEL 1 · SENSOR GAIN")
+        self.sensor_echo = tk.Label(
+            body, text="", bg=WHITE, fg=RASPBERRY, font=font(9, "bold"),
+            wraplength=S(560), justify="left")
+        self.sensor_echo.pack(anchor="w", pady=(0, S(4)))
+        self._add_rows(body, [
+            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
+        ])
 
-        # -- MODE -------------------------------------------------------------
-        self._section(body, "MODE")
-        self._radio(body, "Single Frame Calibration", "single", enabled=True,
-                    desc="Calibrate + evaluate on one frame.",
-                    command=self._on_mode_change)
-        self._radio(body, "Batch Folder Calibration", "batch", enabled=True,
-                    badge="MULTI-IMAGE",
-                    desc="Train across many frames in a folder; metrics are averaged.",
-                    command=self._on_mode_change)
-        self._radio(body, "Temporal Video Denoise", "temporal", enabled=True,
-                    badge="VIDEO",
-                    desc="Recursive burst denoising of a frame sequence (IIR blend).",
-                    command=self._on_mode_change)
-        self.batch_var = self._entry_row(
-            body, "batch", "Batch Size", "Frames to load in batch mode", "6")
-        self.burst_var = self._entry_row(
-            body, "burst", "Temporal Burst", "Frames in a temporal-denoise burst", "8")
-
-        # -- LEVEL 1: CAPTURE SOURCE -----------------------------------------
+    def _step_data(self, body):
         self._section(body, "LEVEL 1 · CAPTURE SOURCE")
         self._radio(body, "Simulated capture", "sim", enabled=True,
                     variable=self.source_var,
@@ -676,7 +737,6 @@ class App(tk.Tk):
                     desc="Load real frames; paired noisy/gt folders are auto-detected.",
                     command=self._on_source_change)
 
-        # Dataset / upload controls (real mode).
         ds_row = tk.Frame(body, bg=WHITE)
         ds_row.pack(fill="x", pady=(S(8), S(2)))
         ds_row.columnconfigure(0, weight=1)
@@ -703,19 +763,8 @@ class App(tk.Tk):
                     "Inject the selected sensor's physics on top of the real frames.",
                     self.sim_noise_var)
 
-        self._section(body, "LEVEL 1 · SENSOR GAIN")
-        self.sensor_echo = tk.Label(
-            body, text="", bg=WHITE, fg=RASPBERRY, font=font(9, "bold"),
-            wraplength=S(560), justify="left")
-        self.sensor_echo.pack(anchor="w", pady=(0, S(4)))
-        add_rows([
-            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
-        ])
-        self._on_sensor_change()
-
-        # -- LEVEL 2: GROUND TRUTH -------------------------------------------
         self._section(body, "LEVEL 2 · GROUND TRUTH / DATA")
-        add_rows([
+        self._add_rows(body, [
             ("frames", "Temporal Frames",
              "Reads averaged for synthetic ground truth", [64, 128, 256], 256),
         ])
@@ -723,31 +772,76 @@ class App(tk.Tk):
                  "detail-scored patch selection (denoise-hw logic).",
                  bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(0, S(4)))
 
-        # -- LEVEL 3: MODEL --------------------------------------------------
+        self._section(body, "RUN MODE")
+        self._radio(body, "Single Frame Calibration", "single", enabled=True,
+                    desc="Calibrate + evaluate on one frame.",
+                    command=self._on_mode_change)
+        self._radio(body, "Batch Folder Calibration", "batch", enabled=True,
+                    badge="MULTI-IMAGE",
+                    desc="Train across many frames in a folder; metrics are averaged.",
+                    command=self._on_mode_change)
+        self._radio(body, "Temporal Video Denoise", "temporal", enabled=True,
+                    badge="VIDEO",
+                    desc="Recursive burst denoising of a frame sequence (IIR blend).",
+                    command=self._on_mode_change)
+        self.batch_var = self._entry_row(
+            body, "batch", "Batch Size", "Frames to load in batch mode", "6")
+        self.burst_var = self._entry_row(
+            body, "burst", "Temporal Burst", "Frames in a temporal-denoise burst", "8")
+
+        cache_row = tk.Frame(body, bg=WHITE)
+        cache_row.pack(fill="x", pady=S(6))
+        cache_row.columnconfigure(0, weight=1)
+        cache_left = tk.Frame(cache_row, bg=WHITE); cache_left.grid(row=0, column=0, sticky="w")
+        tk.Label(cache_left, text="Patch-cache training set builder", bg=WHITE, fg=INK,
+                 font=font(11, "bold")).pack(anchor="w")
+        tk.Label(cache_left, text="Pre-scan the chosen dataset into detail-scored "
+                 "patches (needs a real dataset/folder).", bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w")
+        RoundButton(cache_row, "BUILD CACHE", self._build_cache, kind="secondary",
+                    width=160, height=36).grid(row=0, column=1, sticky="e")
+
+    def _step_model(self, body):
         self._section(body, "LEVEL 3 · MODEL ARCHITECTURE")
-        tk.Label(body, text="     Pick a model family first — the options below "
-                 "adapt to it (e.g. NAFNet has no separate activation, it uses a "
-                 "built-in SimpleGate). These are the STARTING parameters for a "
-                 "single compile; use the Pareto sweep to rank many.", bg=WHITE,
-                 fg=RASPBERRY, font=font(9, "bold"), wraplength=S(560),
-                 justify="left").pack(anchor="w", pady=(0, S(4)))
+        self.model_intro = tk.Label(
+            body, text="", bg=WHITE, fg=RASPBERRY, font=font(9, "bold"),
+            wraplength=S(560), justify="left")
+        self.model_intro.pack(anchor="w", pady=(0, S(4)))
         fam_row = ConfigRow(body, "Model Family",
-                            "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet",
-                            ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet"],
+                            "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet · "
+                            "FFDNet · DRUNet · Restormer",
+                            ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet",
+                             "ffdnet", "drunet", "restormer"],
                             "nafnet", command=self._on_family_change)
         fam_row.pack(fill="x", pady=S(6))
         self.rows["model_family"] = fam_row
-        # Container whose contents change with the selected family.
         self.model_box = tk.Frame(body, bg=WHITE)
         self.model_box.pack(fill="x")
         self._render_model_options()
 
-        # -- LEVELS 4 & 6: HARDWARE ------------------------------------------
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(14), 0))
+        self._section(body, "EXTERNAL MODELS · HUGGING FACE HUB")
+        tk.Label(body, text="     Source a pretrained model the safe way: filter to "
+                 "Apache-2.0 / MIT licenses, benchmark a small model first, step up "
+                 "only if the accuracy gap justifies the compute, then freeze the "
+                 "exact commit hash so production never drifts. (Discovery + "
+                 "license-vetting + freeze — the on-device compile above stays with "
+                 "the built-in denoisers.)",
+                 bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(6)))
+        hf_row = tk.Frame(body, bg=WHITE); hf_row.pack(fill="x", pady=S(4))
+        RoundButton(hf_row, "BROWSE HUGGING FACE", self._hf_browser,
+                    kind="secondary", width=220, height=38).pack(side="left")
+
+    def _step_hw(self, body):
         self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
-        add_rows([
+        self._add_rows(body, [
             ("hardware", "Target Hardware", "Pi 5 CPU · Hailo-8 (est.) · DeepX (est.)",
              ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
         ])
+        self.hw_note = tk.Label(body, text="", bg=WHITE, fg=SUBTLE, font=font(9),
+                                wraplength=S(560), justify="left")
+        self.hw_note.pack(anchor="w", pady=(0, S(2)))
         dep_row = tk.Frame(body, bg=WHITE)
         dep_row.pack(fill="x", pady=S(6))
         dep_row.columnconfigure(0, weight=1)
@@ -765,9 +859,8 @@ class App(tk.Tk):
                  justify="left").pack(anchor="w", pady=(S(4), 0))
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
 
-        # -- LEVEL 5: CALIBRATION / QUANTIZATION -----------------------------
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
-        add_rows([
+        self._add_rows(body, [
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
              [70, 160, 220], 160),
         ])
@@ -790,45 +883,115 @@ class App(tk.Tk):
                     "quantization loss. Auto-on for gelu→DeepX / non-native acts.",
                     self.qat_var)
 
-        # -- EVALUATION ------------------------------------------------------
-        self._section(body, "EVALUATION")
-        self._radio(body, "Compile this single model", "single", enabled=True,
-                    variable=self.eval_var, badge="TEST ONE",
-                    desc="Run the exact config above and produce artifacts + report.",
-                    command=self._on_eval_change)
-        self._radio(body, "Sweep & rank models (find the best)", "sweep",
-                    enabled=True, variable=self.eval_var, badge="COMPARE",
-                    desc="Train every model family at each depth (your chosen "
-                         "width/conv/activation are kept fixed) and show a ranked, "
-                         "clickable leaderboard + Pareto front. Takes a couple of "
-                         "minutes; click any row to run that exact model.",
-                    command=self._on_eval_change)
-        cache_row = tk.Frame(body, bg=WHITE)
-        cache_row.pack(fill="x", pady=S(6))
-        cache_row.columnconfigure(0, weight=1)
-        cache_left = tk.Frame(cache_row, bg=WHITE); cache_left.grid(row=0, column=0, sticky="w")
-        tk.Label(cache_left, text="Patch-cache training set builder", bg=WHITE, fg=INK,
-                 font=font(11, "bold")).pack(anchor="w")
-        tk.Label(cache_left, text="Pre-scan the chosen dataset into detail-scored "
-                 "patches (needs a real dataset/folder).", bg=WHITE, fg=SUBTLE,
-                 font=font(9)).pack(anchor="w")
-        RoundButton(cache_row, "BUILD CACHE", self._build_cache, kind="secondary",
-                    width=160, height=36).grid(row=0, column=1, sticky="e")
+    def _step_review(self, body):
+        self._section(body, "REVIEW")
+        self._review_box = tk.Frame(body, bg=WHITE)
+        self._review_box.pack(fill="x", pady=(S(2), 0))
+        tk.Label(body, text="     Use BACK to change anything, or press the button "
+                 "below to launch. A sweep takes a few minutes; a single compile is "
+                 "quicker.", bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(S(10), 0))
 
-        self._on_mode_change()
-        self._on_source_change()
-        self._on_eval_change()
+    # -- Wizard navigation ----------------------------------------------------
+    def _goto_step(self, i):
+        i = max(0, min(i, len(self._steps) - 1))
+        self._step = i
+        for j, st in enumerate(self._steps):
+            if j == i:
+                st["holder"].pack(fill="both", expand=True)
+            else:
+                st["holder"].pack_forget()
+        if self._steps[i]["key"] == "review":
+            self._refresh_review()
+        self._render_wiz_header()
+        self._render_nav()
+        try:
+            self.sidebar.set_active(min(i, len(LEVELS) - 1))
+        except Exception:
+            pass
+
+    def _render_wiz_header(self):
+        for w in self._wiz_header.winfo_children():
+            w.destroy()
+        st = self._steps[self._step]
+        tk.Label(self._wiz_header, text=f"STEP {self._step + 1} OF "
+                 f"{len(self._steps)}", bg=WHITE, fg=RASPBERRY,
+                 font=font(9, "bold")).pack(anchor="w")
+        tk.Label(self._wiz_header, text=st["title"], bg=WHITE, fg=INK,
+                 font=font(19, "bold")).pack(anchor="w")
+        tk.Label(self._wiz_header, text=st["subtitle"], bg=WHITE, fg=SUBTLE,
+                 font=font(10)).pack(anchor="w", pady=(S(2), 0))
+
+    def _render_nav(self):
+        for w in self._nav.winfo_children():
+            w.destroy()
+        RoundButton(self._nav, "APP OPTIONS", self._app_options, kind="secondary",
+                    width=140, height=44).pack(side="left")
+        if self._step > 0:
+            RoundButton(self._nav, "◀ BACK", lambda: self._goto_step(self._step - 1),
+                        kind="secondary", width=120,
+                        height=44).pack(side="left", padx=(S(8), 0))
+        last = self._step == len(self._steps) - 1
+        if last:
+            label = "RUN SWEEP" if self.eval_var.get() == "sweep" else "RUN COMPILE"
+            self.run_btn = RoundButton(self._nav, label, self._run, kind="primary",
+                                       width=180, height=44)
+            self.run_btn.pack(side="right")
+        else:
+            RoundButton(self._nav, "NEXT ▶", lambda: self._goto_step(self._step + 1),
+                        kind="primary", width=150, height=44).pack(side="right")
+
+    def _refresh_review(self):
+        if not hasattr(self, "_review_box"):
+            return
+        for w in self._review_box.winfo_children():
+            w.destroy()
+        sweep = self.eval_var.get() == "sweep"
+        fam = self._row_get("model_family", "nafnet")
+        sensor_key = self._row_get("sensor", "imx662")
+        sensor_card = next((c for c in SENSOR_CARDS if c["key"] == sensor_key), None)
+        sensor_name = sensor_card["name"] if sensor_card else sensor_key
+        if sweep and self.all_sensors_var.get():
+            sensor_name = "All profiles (IMX219 · IMX662 · IMX-NG)"
+        hw_key = self._row_get("hardware", "hailo8")
+        hw_name = {"rpi5_cpu": "Raspberry Pi 5 (CPU)", "hailo8": "Pi 5 + Hailo-8",
+                   "deepx": "DeepX DX-M1"}.get(hw_key, hw_key)
+        if sweep:
+            goal = "Sweep & rank all 9 model families"
+            model_txt = (f"swept · width {self._row_get('base_channels','32')}ch, "
+                         f"depth varies")
+        else:
+            goal = "Compile one specific model"
+            model_txt = (f"{fam.upper()}  {self._row_get('base_channels','32')}ch × "
+                         f"depth {self._row_get('block_depth','4')}")
+        src = "Real captures" if self.source_var.get() == "real" else "Simulated physics"
+        mode = {"single": "Single frame", "batch": "Batch folder",
+                "temporal": "Temporal video"}.get(self.mode_var.get(), self.mode_var.get())
+        q = "INT8 PTQ" + (" + QAT" if self.qat_var.get() else "") if self.quantize_var.get() else "off"
+
+        rows = [
+            ("Goal", goal, RASPBERRY),
+            ("Image sensor", f"{sensor_name}  @{self._row_get('gain','512')}×", INK),
+            ("Capture source", src, INK),
+            ("Run mode", mode, INK),
+            ("Model", model_txt, INK),
+            ("Target chip", hw_name, INK),
+            ("Calibration", f"{self._row_get('steps','160')} steps  ·  "
+             f"quant {q}", INK),
+        ]
+        for label, val, col in rows:
+            rr = tk.Frame(self._review_box, bg=WHITE); rr.pack(fill="x", pady=S(3))
+            tk.Label(rr, text=label, bg=WHITE, fg=SUBTLE, font=font(10),
+                     width=16, anchor="w").pack(side="left")
+            tk.Label(rr, text=val, bg=WHITE, fg=col, font=font(11, "bold"),
+                     wraplength=S(420), justify="left").pack(side="left")
 
     def _build_footer(self):
         pad = S(34)
-        footer = tk.Frame(self.main, bg=WHITE)
-        footer.pack(side="bottom", fill="x", padx=pad, pady=S(16))
         tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
-        RoundButton(footer, "APP OPTIONS", self._app_options, kind="secondary",
-                    width=150, height=44).pack(side="left")
-        self.run_btn = RoundButton(footer, "RUN COMPILE", self._run, kind="primary",
-                                   width=180, height=44)
-        self.run_btn.pack(side="right")
+        self._nav = tk.Frame(self.main, bg=WHITE)
+        self._nav.pack(side="bottom", fill="x", padx=pad, pady=S(16))
+        # Buttons are (re)created per step by _render_nav().
 
     def _on_source_change(self):
         real = self.source_var.get() == "real"
@@ -922,6 +1085,14 @@ class App(tk.Tk):
             self.naf_dec_var = self._entry_row(
                 self.model_box, "naf_dec", "NAFNet Decoders",
                 "Per-level decoder block counts, e.g. 2 2 1", "")
+        elif fam == "restormer":
+            tk.Label(self.model_box,
+                     text="     Restormer uses LayerNorm + transposed self-attention "
+                          "+ a GELU gated feed-forward — no separate activation or "
+                          "conv-type to pick. Best on the Pi 5 CPU; the attention "
+                          "graph gets caveats on INT8 NPUs.",
+                     bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                     justify="left").pack(anchor="w", pady=(S(2), 0))
         else:
             cfgrow("conv_type", "Convolution", "Standard or depthwise-separable",
                    ["standard", "depthwise"], prev.get("conv_type", "depthwise"))
@@ -930,12 +1101,34 @@ class App(tk.Tk):
                    ["relu", "gelu", "silu"], prev.get("activation", "relu"))
 
     def _on_eval_change(self):
-        if not hasattr(self, "run_btn"):
-            return
-        if self.eval_var.get() == "sweep":
-            self.run_btn.set_text("RUN SWEEP")
-        else:
-            self.run_btn.set_text("RUN COMPILE")
+        sweep = self.eval_var.get() == "sweep"
+        if hasattr(self, "model_intro"):
+            if sweep:
+                self.model_intro.config(
+                    text="     Sweep mode: all 9 families are trained & ranked. The "
+                         "settings below pin the width / conv / activation used for "
+                         "every family (depth is swept); the family choice itself is "
+                         "ignored.")
+            else:
+                self.model_intro.config(
+                    text="     Pick a family first — the options adapt to it (e.g. "
+                         "NAFNet / Restormer have no separate activation). These are "
+                         "the exact parameters that get compiled.")
+        if hasattr(self, "all_sensors_cb"):
+            try:
+                self.all_sensors_cb.config(state="normal" if sweep else "disabled")
+            except Exception:
+                pass
+            if not sweep:
+                self.all_sensors_var.set(False)
+        if hasattr(self, "hw_note"):
+            self.hw_note.config(
+                text=("     The sweep compiles for this chip, but the leaderboard "
+                      "can re-rank by any Pi chip afterwards." if sweep else ""))
+        if getattr(self, "_steps", None):
+            if self._steps[self._step]["key"] == "review":
+                self._refresh_review()
+            self._render_nav()
 
     def _choose_dataset(self):
         if self.source_var.get() != "real":
@@ -1175,6 +1368,8 @@ class App(tk.Tk):
                "--patch-size", "128",
                "--top", "10",
                "--no-final-run"]
+        if self.all_sensors_var.get():
+            cmd += ["--all-sensors"]
         if self.source_var.get() == "real":
             dataset = self.dataset_path or self._materialise_uploads()
             if dataset:
@@ -1205,6 +1400,224 @@ class App(tk.Tk):
             cmd += ["--filter", *tokens]
         self._run_command(cmd, "Building patch cache…",
                           "Scanning the dataset into detail-scored patches")
+
+    # -- Hugging Face Hub browser -------------------------------------------
+    def _hf_browser(self):
+        try:
+            from nsa import hub  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Hugging Face",
+                                 f"Could not load the Hub module:\n{exc}")
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("Hugging Face — model sourcing")
+        dlg.configure(bg=WHITE)
+        dlg.transient(self)
+        try:
+            dlg.geometry(f"{S(740)}x{S(640)}+{self.winfo_rootx()+S(60)}"
+                         f"+{self.winfo_rooty()+S(30)}")
+        except Exception:
+            pass
+        self._grab_when_ready(dlg)
+        self._hf_dlg = dlg
+        self._hf_q = queue.Queue()
+        self._hf_rows = []
+        self._hf_busy = False
+        self._hf_lock = ROOT / "outputs" / "hf_lock.json"
+
+        pad = tk.Frame(dlg, bg=WHITE)
+        pad.pack(fill="both", expand=True, padx=S(20), pady=S(16))
+        tk.Label(pad, text="Hugging Face model sourcing", bg=WHITE, fg=INK,
+                 font=font(16, "bold")).pack(anchor="w")
+        tk.Label(pad, text="1 license-safe  →  2 benchmark small  →  3 test the gap "
+                 " →  4 freeze the weights", bg=WHITE, fg=RASPBERRY,
+                 font=font(9, "bold")).pack(anchor="w", pady=(S(2), S(8)))
+
+        ctl = tk.Frame(pad, bg=WHITE); ctl.pack(fill="x")
+        self._hf_license = tk.StringVar(value="both")
+        lf = tk.Frame(ctl, bg=WHITE); lf.pack(fill="x", pady=S(2))
+        tk.Label(lf, text="License", bg=WHITE, fg=INK, font=font(10, "bold"),
+                 width=9, anchor="w").pack(side="left")
+        for val, label in [("apache-2.0", "Apache-2.0"), ("mit", "MIT"),
+                           ("both", "Both")]:
+            tk.Radiobutton(lf, text=label, variable=self._hf_license, value=val,
+                           bg=WHITE, fg=INK, selectcolor=WHITE,
+                           activebackground=WHITE, font=font(10),
+                           highlightthickness=0, bd=0).pack(side="left", padx=(0, S(8)))
+
+        self._hf_size = tk.StringVar(value="small")
+        self._hf_task = tk.StringVar(value="text-generation")
+        self._hf_query = tk.StringVar(value="")
+
+        def field(label, var, values=None, width=26):
+            fr = tk.Frame(ctl, bg=WHITE); fr.pack(fill="x", pady=S(2))
+            tk.Label(fr, text=label, bg=WHITE, fg=INK, font=font(10, "bold"),
+                     width=9, anchor="w").pack(side="left")
+            if values:
+                ttk.Combobox(fr, textvariable=var, values=values, state="readonly",
+                             width=width, style="Rpi.TCombobox").pack(side="left")
+            else:
+                ent = ttk.Entry(fr, textvariable=var, width=width + 3, font=font(10))
+                ent.pack(side="left")
+                ent.bind("<Return>", lambda _e: self._hf_run_search())
+
+        field("Size", self._hf_size, values=["small", "mid", "large", "any"], width=24)
+        tk.Label(ctl, text="          small = 1-8B  ·  mid = 8-20B  ·  large = 20-80B",
+                 bg=WHITE, fg=SUBTLE, font=font(8)).pack(anchor="w")
+        field("Task", self._hf_task)
+        field("Query", self._hf_query)
+
+        srow = tk.Frame(ctl, bg=WHITE); srow.pack(fill="x", pady=(S(6), 0))
+        self._hf_search_btn = RoundButton(srow, "SEARCH", self._hf_run_search,
+                                          kind="primary", width=140, height=38)
+        self._hf_search_btn.pack(side="left")
+        self._hf_status = tk.Label(srow, text="", bg=WHITE, fg=SUBTLE, font=font(9),
+                                   wraplength=S(440), justify="left")
+        self._hf_status.pack(side="left", padx=(S(10), 0))
+
+        tk.Frame(pad, bg=LINE, height=1).pack(fill="x", pady=(S(10), S(4)))
+        hdr = tk.Frame(pad, bg=WHITE); hdr.pack(fill="x")
+        for label, w in [("MODEL", 34), ("PARAMS", 8), ("TIER", 6), ("LICENSE", 11)]:
+            tk.Label(hdr, text=label, bg=WHITE, fg=SUBTLE, font=font(8, "bold"),
+                     width=w, anchor="w").pack(side="left")
+        self._hf_results = tk.Frame(pad, bg=WHITE)
+        self._hf_results.pack(fill="both", expand=True, pady=(S(2), 0))
+
+        tk.Frame(pad, bg=LINE, height=1).pack(fill="x", pady=(S(6), S(6)))
+        ftr = tk.Frame(pad, bg=WHITE); ftr.pack(fill="x")
+        RoundButton(ftr, "CLOSE", dlg.destroy, kind="secondary",
+                    width=110, height=40).pack(side="left")
+        RoundButton(ftr, "OPEN LOCK FILE", self._hf_open_lock, kind="secondary",
+                    width=170, height=40).pack(side="left", padx=(S(8), 0))
+        tk.Label(ftr, text="frozen → outputs/hf_lock.json", bg=WHITE, fg=SUBTLE,
+                 font=font(8)).pack(side="right")
+
+        self._hf_set_status("Pick a license + size, then SEARCH. Start small; "
+                            "step up only if accuracy demands it.")
+        self.after(150, lambda: self._hf_poll(dlg))
+
+    def _hf_set_status(self, text, color=None):
+        if hasattr(self, "_hf_status") and self._hf_status.winfo_exists():
+            self._hf_status.config(text=text, fg=color or SUBTLE)
+
+    def _hf_run_search(self):
+        if self._hf_busy:
+            return
+        from nsa import hub
+        licenses = (["apache-2.0", "mit"] if self._hf_license.get() == "both"
+                    else [self._hf_license.get()])
+        size = self._hf_size.get()
+        task = self._hf_task.get().strip()
+        query = self._hf_query.get().strip()
+        self._hf_busy = True
+        self._hf_search_btn.set_enabled(False)
+        self._hf_set_status("Searching the Hugging Face Hub…", RASPBERRY)
+
+        def work():
+            try:
+                rows = hub.search_models(query=query, licenses=licenses, task=task,
+                                         size=size, limit=10)
+                self._hf_q.put(("search_ok", rows))
+            except Exception as exc:  # noqa: BLE001
+                self._hf_q.put(("search_err", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _hf_poll(self, dlg):
+        if not dlg.winfo_exists() or getattr(self, "_hf_dlg", None) is not dlg:
+            return
+        try:
+            kind, payload = self._hf_q.get_nowait()
+        except queue.Empty:
+            self.after(150, lambda: self._hf_poll(dlg))
+            return
+        if kind == "search_ok":
+            self._hf_busy = False
+            self._hf_search_btn.set_enabled(True)
+            self._hf_rows = payload
+            self._hf_render_results()
+            self._hf_set_status(
+                f"{len(payload)} license-safe model(s). Click FREEZE to lock one's "
+                f"exact commit." if payload else
+                "No models matched — try Size = any or a different query.",
+                GREEN if payload else AMBER)
+        elif kind == "search_err":
+            self._hf_busy = False
+            self._hf_search_btn.set_enabled(True)
+            self._hf_set_status(payload, RASPBERRY)
+        elif kind == "freeze_ok":
+            self._hf_busy = False
+            e = payload
+            self._hf_set_status(
+                f"Froze {e['id']} @ {e['sha'][:12]} · {e['license']} · "
+                f"{e['params_human']}. Production now pinned to this SHA.", GREEN)
+            self._hf_render_results()
+        elif kind == "freeze_err":
+            self._hf_busy = False
+            self._hf_set_status(payload, RASPBERRY)
+        self.after(150, lambda: self._hf_poll(dlg))
+
+    def _hf_render_results(self):
+        from nsa import hub
+        holder = self._hf_results
+        for w in holder.winfo_children():
+            w.destroy()
+        if not self._hf_rows:
+            tk.Label(holder, text="No models to show. Search with Size = any or a "
+                     "broader query.", bg=WHITE, fg=SUBTLE,
+                     font=font(9)).pack(anchor="w", pady=S(8))
+            return
+        locked = {e.get("id") for e in hub.load_lock(self._hf_lock)}
+        tcol = {"tiny": SUBTLE, "small": GREEN, "mid": AMBER,
+                "large": RASPBERRY, "xl": RASPBERRY}
+        for r in self._hf_rows:
+            row = tk.Frame(holder, bg=WHITE); row.pack(fill="x", pady=1)
+            tk.Label(row, text=r.get("id", ""), bg=WHITE, fg=INK, font=font(9),
+                     width=34, anchor="w").pack(side="left")
+            tk.Label(row, text=hub.human_params(r.get("params")), bg=WHITE, fg=INK,
+                     font=font(9, "bold"), width=8, anchor="w").pack(side="left")
+            t = r.get("tier") or "—"
+            tk.Label(row, text=t, bg=WHITE, fg=tcol.get(t, SUBTLE), font=font(9),
+                     width=6, anchor="w").pack(side="left")
+            tk.Label(row, text=r.get("license", "?"), bg=WHITE, fg=GREEN,
+                     font=font(9), width=11, anchor="w").pack(side="left")
+            if r.get("id") in locked:
+                tk.Label(row, text="✓ frozen", bg=WHITE, fg=GREEN,
+                         font=font(8, "bold")).pack(side="left", padx=(S(4), 0))
+            else:
+                RoundButton(row, "FREEZE", lambda rr=r: self._hf_freeze(rr),
+                            kind="secondary", width=92, height=30).pack(side="left")
+
+    def _hf_freeze(self, r):
+        if self._hf_busy:
+            return
+        from nsa import hub
+        mid = r.get("id")
+        self._hf_busy = True
+        self._hf_set_status(f"Freezing {mid} — resolving exact commit SHA…", RASPBERRY)
+
+        def work():
+            try:
+                e = hub.freeze_model(mid, lock_path=self._hf_lock)
+                self._hf_q.put(("freeze_ok", e))
+            except Exception as exc:  # noqa: BLE001
+                self._hf_q.put(("freeze_err", f"Freeze failed: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _hf_open_lock(self):
+        p = ROOT / "outputs" / "hf_lock.json"
+        if not p.exists():
+            messagebox.showinfo("Lock file", "No models frozen yet. Search, then "
+                                "click FREEZE on a model to lock its commit hash.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Lock file", str(exc))
 
     def _build_deploy(self):
         if not (ROOT / "outputs" / "summary.json").exists():
@@ -1448,8 +1861,7 @@ class App(tk.Tk):
         # -- Fitness banner --------------------------------------------------
         if s:
             grade = s.get("grade", "")
-            gcol = {"OPTIMAL": GREEN, "BALANCED": "#C98A1B",
-                    "SUBOPTIMAL": "#C98A1B", "INFEASIBLE": RASPBERRY}.get(grade, INK)
+            gcol = GRADE_COLORS.get(grade, INK)
             fb = tk.Frame(body, bg=WHITE)
             fb.pack(fill="x", pady=(S(8), S(10)))
             tk.Label(fb, text=f"{s.get('fitness','—')}", bg=WHITE, fg=gcol,
@@ -1579,8 +1991,15 @@ class App(tk.Tk):
             data = json.loads((ROOT / "outputs" / "pareto.json").read_text(encoding="utf-8"))
         except Exception:
             data = {}
-        rows = data.get("all_results", [])
-        winner = data.get("winner", {})
+        self._rank_rows = data.get("all_results", [])
+        self._rank_winner = data.get("winner", {})
+        self._rank_target_label = data.get("target_label", "")
+        # Default the filter to the chip the sweep actually compiled for.
+        target = data.get("target", "all")
+        self._rank_have_chips = any(r.get("chips") for r in self._rank_rows)
+        self._rank_filter = target if (self._rank_have_chips and target in CHIP_LABEL) else "all"
+        rows = self._rank_rows
+        winner = self._rank_winner
         pad = S(34)
         try:
             self.unbind_all("<MouseWheel>")
@@ -1593,10 +2012,21 @@ class App(tk.Tk):
         header.pack(fill="x", padx=pad, pady=(S(22), S(2)))
         tk.Label(header, text="Model Ranking", bg=WHITE, fg=INK,
                  font=font(19, "bold")).pack(anchor="w")
-        tk.Label(header, text=f"{data.get('target_label','')}  ·  "
-                 f"{len(rows)} models trained & ranked by Pareto fitness  ·  "
+        tk.Label(header, text=f"{self._rank_target_label}  ·  "
+                 f"{len(rows)} models trained  ·  "
                  f"✦ = Pareto-optimal  ·  click any row to run it", bg=WHITE,
                  fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))
+
+        # -- Hardware preference filter --------------------------------------
+        if self._rank_have_chips:
+            fbar = tk.Frame(self.main, bg=WHITE)
+            fbar.pack(fill="x", padx=pad, pady=(S(8), 0))
+            tk.Label(fbar, text="Best for:", bg=WHITE, fg=INK,
+                     font=font(10, "bold")).pack(side="left", padx=(0, S(8)))
+            self._rank_filter_row = tk.Frame(fbar, bg=WHITE)
+            self._rank_filter_row.pack(side="left")
+            self._render_filter_buttons()
+
         tk.Frame(self.main, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
 
         # Footer (pinned).
@@ -1622,38 +2052,160 @@ class App(tk.Tk):
                      bg=WHITE, fg=SUBTLE, font=font(11)).pack(anchor="w", pady=S(10))
             return
 
-        # Column header.
-        cols = [("#", 3), ("MODEL", 20), ("PARAMS", 9), ("PSNR", 9),
-                ("LATENCY", 10), ("FITNESS", 9), ("GRADE", 12)]
-        hrow = tk.Frame(body, bg=WHITE); hrow.pack(fill="x", pady=(S(6), S(2)))
+        # Table container (re-rendered when the filter changes) + winner callout.
+        self._rank_table_holder = tk.Frame(body, bg=WHITE)
+        self._rank_table_holder.pack(fill="x")
+        self._render_rank_table()
+
+        if winner:
+            self._section(body, "OVERALL WINNER (highest fitness)")
+            tk.Label(body, text=f"{winner.get('family','').upper()}  "
+                     f"{winner.get('base_channels')}ch × depth {winner.get('block_depth')}",
+                     bg=WHITE, fg=GREEN, font=font(13, "bold")).pack(anchor="w")
+            tk.Label(body, text=f"PSNR {winner.get('psnr')} dB   ·   "
+                     f"{winner.get('latency_ms')} ms   ·   "
+                     f"fitness {winner.get('fitness')} / 100 ({winner.get('grade')})",
+                     bg=WHITE, fg=INK, font=font(10)).pack(anchor="w", pady=(S(2), 0))
+            tk.Label(body, text="Use the 'Best for' filter above to re-rank by which "
+                     "Raspberry Pi chip a model is suitable for. Click USE WINNER to "
+                     "load this config, or click any row to run that exact model.",
+                     bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(620),
+                     justify="left").pack(anchor="w", pady=(S(4), S(10)))
+
+    def _render_filter_buttons(self):
+        for w in self._rank_filter_row.winfo_children():
+            w.destroy()
+        for key in ("all", "rpi5_cpu", "hailo8", "deepx"):
+            sel = (key == self._rank_filter)
+            RoundButton(self._rank_filter_row, CHIP_LABEL[key],
+                        lambda k=key: self._set_rank_filter(k),
+                        kind="primary" if sel else "secondary",
+                        width=120, height=34).pack(side="left", padx=(0, S(6)))
+
+    def _set_rank_filter(self, key: str):
+        self._rank_filter = key
+        self._render_filter_buttons()
+        self._render_rank_table()
+
+    def _rank_standouts(self, rows: list) -> dict:
+        """Identify the standout model in each axis so each row can say *why*."""
+        def _num(r, k):
+            v = r.get(k)
+            return v if isinstance(v, (int, float)) else None
+        tags = {}
+        psnr_rows = [r for r in rows if _num(r, "psnr") is not None]
+        lat_rows = [r for r in rows if _num(r, "latency_ms") is not None]
+        par_rows = [r for r in rows if _num(r, "params") is not None]
+        if psnr_rows:
+            tags["sharp"] = id(max(psnr_rows, key=lambda r: r["psnr"]))
+        if lat_rows:
+            tags["fast"] = id(min(lat_rows, key=lambda r: r["latency_ms"]))
+        if par_rows:
+            tags["lean"] = id(min(par_rows, key=lambda r: r["params"]))
+        if rows:
+            tags["best"] = id(max(rows, key=lambda r: r.get("fitness", 0)))
+        return tags
+
+    def _why_tag(self, r: dict, standouts: dict):
+        """Return (text, colour) describing what this model is best at."""
+        rid = id(r)
+        if standouts.get("best") == rid:
+            return "top pick", GREEN
+        if standouts.get("sharp") == rid:
+            return "sharpest", "#3F6FB0"
+        if standouts.get("fast") == rid:
+            return "fastest", "#3F6FB0"
+        if standouts.get("lean") == rid:
+            return "leanest", AMBER
+        return "", SUBTLE
+
+    def _render_rank_table(self):
+        holder = self._rank_table_holder
+        for w in holder.winfo_children():
+            w.destroy()
+        rows = list(self._rank_rows)
+        flt = self._rank_filter
+        chip_mode = flt != "all" and self._rank_have_chips
+        multi_sensor = len({r.get("sensor") for r in rows if r.get("sensor")}) > 1
+        # When the sensor column is shown, trim others so the row still fits.
+        sensor_col = [("SENSOR", 6)] if multi_sensor else []
+        mw = 12 if multi_sensor else 14
+        sw = 8 if multi_sensor else 10
+
+        if chip_mode:
+            def _key(r):
+                c = (r.get("chips") or {}).get(flt, {})
+                vr = VERDICT_RANK.get(c.get("verdict"), 3)
+                return (vr, -float(r.get("fitness", 0)))
+            rows.sort(key=_key)
+            cols = ([("#", 3), ("MODEL", mw)] + sensor_col +
+                    [("PARAMS", 7), ("PSNR", 8), ("FPS", 6), ("FIT", 6),
+                     (f"ON {CHIP_LABEL[flt]}", 11), ("STANDOUT", sw)])
+        else:
+            rows.sort(key=lambda r: -float(r.get("fitness", 0)))
+            cols = ([("#", 3), ("MODEL", mw)] + sensor_col +
+                    [("PARAMS", 7), ("PSNR", 8), ("LATENCY", 9), ("FIT", 6),
+                     ("RATING", 8), ("STANDOUT", sw)])
+
+        if chip_mode:
+            tk.Label(holder, text=f"Ranked by suitability for "
+                     f"{CHIP_LABEL[flt]} (best fit first), then fitness.",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(6), 0))
+
+        hrow = tk.Frame(holder, bg=WHITE); hrow.pack(fill="x", pady=(S(6), S(2)))
         for label, w in cols:
             tk.Label(hrow, text=label, bg=WHITE, fg=SUBTLE, font=font(8, "bold"),
                      width=w, anchor="w").pack(side="left")
-        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(0, S(2)))
+        tk.Frame(holder, bg=LINE, height=1).pack(fill="x", pady=(0, S(2)))
 
-        gcol = {"OPTIMAL": GREEN, "BALANCED": "#C98A1B",
-                "SUBOPTIMAL": "#C98A1B", "INFEASIBLE": RASPBERRY}
+        standouts = self._rank_standouts(self._rank_rows)
         for i, r in enumerate(rows, 1):
             best = (i == 1)
             bg = FIELD if best else WHITE
-            row = tk.Frame(body, bg=bg, cursor="hand2"); row.pack(fill="x", pady=1)
+            row = tk.Frame(holder, bg=bg, cursor="hand2"); row.pack(fill="x", pady=1)
             star = "✦ " if r.get("pareto") else "  "
             model = (f"{r.get('family','').upper()} {r.get('base_channels')}ch×"
-                     f"{r.get('block_depth')} {r.get('conv_type','')[:2]}")
+                     f"{r.get('block_depth')}")
             g = r.get("grade", "")
-            cells = [
-                (f"{i}", 3, INK),
-                (star + model, 20, INK if not best else RASPBERRY),
-                (f"{r.get('params',0)/1000:.1f}K", 9, SUBTLE),
-                (f"{r.get('psnr','—')} dB", 9, INK),
-                (f"{r.get('latency_ms','—')} ms", 10, SUBTLE),
-                (f"{r.get('fitness','—')}", 9, gcol.get(g, INK)),
-                (g, 12, gcol.get(g, INK)),
-            ]
+            why, why_col = self._why_tag(r, standouts)
+            sensor_cell = ([(SENSOR_SHORT.get(r.get("sensor"), r.get("sensor", "—")),
+                             7, SUBTLE, False)] if multi_sensor else [])
+
+            if chip_mode:
+                c = (r.get("chips") or {}).get(flt, {})
+                verdict = c.get("verdict", "")
+                vlabel = VERDICT_LABEL.get(verdict, "—")
+                vcol = VERDICT_COLORS.get(verdict, SUBTLE)
+                fps = c.get("fps")
+                fps_txt = f"{fps:.0f}" if isinstance(fps, (int, float)) else "—"
+                cells = [
+                    (f"{i}", 3, INK, False),
+                    (star + model, mw, RASPBERRY if best else INK, False),
+                ] + sensor_cell + [
+                    (f"{r.get('params',0)/1000:.1f}K", 7, SUBTLE, False),
+                    (f"{r.get('psnr','—')} dB", 8, INK, False),
+                    (fps_txt, 6, INK, False),
+                    (f"{r.get('fitness','—')}", 6, GRADE_COLORS.get(g, INK), False),
+                    (vlabel, 11, vcol, True),
+                    (why, sw, why_col, True),
+                ]
+            else:
+                cells = [
+                    (f"{i}", 3, INK, False),
+                    (star + model, mw, RASPBERRY if best else INK, False),
+                ] + sensor_cell + [
+                    (f"{r.get('params',0)/1000:.1f}K", 7, SUBTLE, False),
+                    (f"{r.get('psnr','—')} dB", 8, INK, False),
+                    (f"{r.get('latency_ms','—')} ms", 9, SUBTLE, False),
+                    (f"{r.get('fitness','—')}", 6, GRADE_COLORS.get(g, INK), False),
+                    (g, 8, GRADE_COLORS.get(g, INK), True),
+                    (why, sw, why_col, True),
+                ]
+
             cell_widgets = [row]
-            for text, w, fg in cells:
+            for text, w, fg, bold in cells:
                 lbl = tk.Label(row, text=text, bg=bg, fg=fg,
-                               font=font(9, "bold" if best else "normal"),
+                               font=font(9, "bold" if (best or bold) else "normal"),
                                width=w, anchor="w")
                 lbl.pack(side="left")
                 cell_widgets.append(lbl)
@@ -1662,21 +2214,6 @@ class App(tk.Tk):
                 wdg.bind("<Button-1>", lambda _e, rr=r: self._ranking_row_clicked(rr))
                 wdg.bind("<Enter>", lambda _e, ws=cell_widgets: [x.configure(bg=hi) for x in ws])
                 wdg.bind("<Leave>", lambda _e, ws=cell_widgets, b=bg: [x.configure(bg=b) for x in ws])
-
-        # Winner call-out.
-        if winner:
-            self._section(body, "RECOMMENDED (rank 1)")
-            tk.Label(body, text=f"{winner.get('family','').upper()}  "
-                     f"{winner.get('base_channels')}ch × depth {winner.get('block_depth')}  ·  "
-                     f"{winner.get('conv_type')}  ·  {winner.get('activation')}",
-                     bg=WHITE, fg=GREEN, font=font(13, "bold")).pack(anchor="w")
-            tk.Label(body, text=f"PSNR {winner.get('psnr')} dB   ·   "
-                     f"{winner.get('latency_ms')} ms   ·   "
-                     f"fitness {winner.get('fitness')} / 100 ({winner.get('grade')})",
-                     bg=WHITE, fg=INK, font=font(10)).pack(anchor="w", pady=(S(2), 0))
-            tk.Label(body, text="Click USE WINNER to load this config into the form, "
-                     "then RUN COMPILE for the full pipeline + artifacts.",
-                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(4), S(10)))
 
     def _use_winner(self, winner: dict):
         self._use_config(winner)
@@ -1687,6 +2224,10 @@ class App(tk.Tk):
         self._build_form()                     # rebuilds self.rows with defaults
         self.eval_var.set("single")
         self._on_eval_change()
+        sensor = r.get("sensor")
+        if sensor and sensor != "all" and "sensor" in self.rows:
+            self.rows["sensor"].set(sensor)
+            self._on_sensor_change()
         fam = r.get("family")
         if fam and "model_family" in self.rows:
             self.rows["model_family"].set(fam)
@@ -1697,6 +2238,11 @@ class App(tk.Tk):
             val = r.get(key)
             if val is not None and key in self.rows:
                 self.rows[key].set(val)
+        # Jump straight to the review step so the loaded config is visible.
+        try:
+            self._goto_step(len(self._steps) - 1)
+        except Exception:
+            pass
 
     def _ranking_row_clicked(self, r: dict):
         """Popup: show a clicked model's config + options to run it."""
@@ -1705,8 +2251,8 @@ class App(tk.Tk):
         dlg.configure(bg=WHITE)
         dlg.transient(self)
         try:
-            dlg.geometry(f"{S(470)}x{S(380)}+{self.winfo_rootx()+S(120)}"
-                         f"+{self.winfo_rooty()+S(120)}")
+            dlg.geometry(f"{S(500)}x{S(500)}+{self.winfo_rootx()+S(120)}"
+                         f"+{self.winfo_rooty()+S(90)}")
         except Exception:
             pass
         self._grab_when_ready(dlg)
@@ -1719,24 +2265,52 @@ class App(tk.Tk):
                  f"depth {r.get('block_depth')}")
         tk.Label(pad, text=title, bg=WHITE, fg=RASPBERRY,
                  font=font(13, "bold")).pack(anchor="w", pady=(S(8), 0))
-        tk.Label(pad, text=f"{r.get('conv_type','')} conv  ·  "
-                 f"{r.get('activation','')} activation",
-                 bg=WHITE, fg=INK, font=font(10)).pack(anchor="w")
+        fam = r.get("family", "")
+        if fam in ("nafnet", "restormer"):
+            sub = ("SimpleGate + depthwise" if fam == "nafnet"
+                   else "transposed attention + GELU FFN")
+        else:
+            sub = f"{r.get('conv_type','')} conv  ·  {r.get('activation','')} activation"
+        tk.Label(pad, text=sub, bg=WHITE, fg=INK, font=font(10)).pack(anchor="w")
 
         g = r.get("grade", "")
-        gcol = {"OPTIMAL": GREEN, "BALANCED": "#C98A1B",
-                "SUBOPTIMAL": "#C98A1B", "INFEASIBLE": RASPBERRY}.get(g, INK)
-        for label, val, col in [
+        gcol = GRADE_COLORS.get(g, INK)
+        metrics = []
+        if r.get("sensor") and r.get("sensor") != "all":
+            metrics.append(("Sensor", r.get("sensor"), RASPBERRY))
+        metrics += [
             ("Sweep PSNR", f"{r.get('psnr','—')} dB", INK),
             ("Sweep latency", f"{r.get('latency_ms','—')} ms", INK),
             ("Parameters", f"{r.get('params',0):,}", INK),
             ("Sweep fitness", f"{r.get('fitness','—')} / 100  ({g})", gcol),
-        ]:
+        ]
+        for label, val, col in metrics:
             rr = tk.Frame(pad, bg=WHITE); rr.pack(fill="x", pady=S(2))
             tk.Label(rr, text=label, bg=WHITE, fg=SUBTLE, font=font(9),
                      width=14, anchor="w").pack(side="left")
             tk.Label(rr, text=val, bg=WHITE, fg=col,
                      font=font(10, "bold")).pack(side="left")
+
+        # -- Per-chip suitability for this exact model -----------------------
+        chips = r.get("chips") or {}
+        if chips:
+            tk.Label(pad, text="Runs on these chips", bg=WHITE, fg=INK,
+                     font=font(10, "bold")).pack(anchor="w", pady=(S(8), S(2)))
+            for key in ("rpi5_cpu", "hailo8", "deepx"):
+                c = chips.get(key)
+                if not c:
+                    continue
+                v = c.get("verdict", "")
+                vcol = VERDICT_COLORS.get(v, SUBTLE)
+                fps = c.get("fps")
+                fps_txt = f"{fps:.0f} FPS" if isinstance(fps, (int, float)) else "—"
+                cr = tk.Frame(pad, bg=WHITE); cr.pack(fill="x", pady=S(1))
+                tk.Label(cr, text=CHIP_LABEL.get(key, key), bg=WHITE, fg=INK,
+                         font=font(9, "bold"), width=11, anchor="w").pack(side="left")
+                tk.Label(cr, text=VERDICT_LABEL.get(v, "—"), bg=WHITE, fg=vcol,
+                         font=font(9, "bold"), width=14, anchor="w").pack(side="left")
+                tk.Label(cr, text=fps_txt, bg=WHITE, fg=SUBTLE,
+                         font=font(9), width=9, anchor="w").pack(side="left")
 
         tk.Label(pad, text="Sweep values come from a fast calibration. Run the full "
                  "pipeline to get final artifacts, the validation panel and the "
