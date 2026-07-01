@@ -156,9 +156,11 @@ def _recommendations(d: dict) -> list[str]:
             "    include-system-site-packages = true")
     elif not d["picamera2_system_dir"]:
         rec.append(
-            "picamera2 not found on this image. Without sudo apt, try pip-only "
-            "(Bookworm Pi):\n"
-            "    pip install -r requirements-pi.txt")
+            "picamera2 not on the system image. Install into your venv (no sudo):\n"
+            "    pip install -r requirements-pi.txt\n"
+            "    python pi_camera_check.py\n"
+            "Note: rpicam-hello/vid are NOT pip packages — ask admin for "
+            "libcamera-apps if picamera2 alone fails.")
     if d["rpicam_vid"]:
         rec.append(
             f"Fallback: {Path(d['rpicam_vid']).name} is installed — live.py will "

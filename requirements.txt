@@ -32,20 +32,14 @@ onnx>=1.15
 # filtering and freezing the commit hash work without it (stdlib HTTP only).
 # huggingface_hub>=0.23
 
-# Raspberry Pi CSI camera (live testing) — usually NO sudo needed
+# Raspberry Pi CSI camera (Python stack — auto-installed on Pi / ARM Linux only)
 #
-# On Raspberry Pi OS, python3-picamera2 is typically PRE-INSTALLED. You do not
-# need sudo apt if you let your venv see system packages:
+# pip CAN install picamera2 + rpi-libcamera into your venv (no sudo).
+# pip CANNOT install rpicam-hello / rpicam-vid — those are system binaries from
+# the libcamera-apps package (needs: sudo apt install libcamera-apps).
 #
-#     python3 -m venv --system-site-packages .venv
-#     source .venv/bin/activate
-#     pip install -r requirements.txt
-#
-# Or edit .venv/pyvenv.cfg →  include-system-site-packages = true
-#
-# Diagnose what works on your Pi (no sudo):
-#     python pi_camera_check.py
-#
-# live.py also tries rpicam-vid / libcamera-vid (preinstalled on Pi OS) when
-# picamera2 is not importable. Pip-only fallback (no apt):
-#     pip install -r requirements-pi.txt
+# On Pi:  pip install -r requirements.txt   (markers below apply on aarch64 Linux)
+# Or:     pip install -r requirements-pi.txt
+# Check:  python pi_camera_check.py
+picamera2>=0.3.0; platform_machine == "aarch64" and sys_platform == "linux"
+rpi-libcamera>=0.1.0; platform_machine == "aarch64" and sys_platform == "linux"
