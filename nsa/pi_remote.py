@@ -1,7 +1,7 @@
 """Run live camera testing on a Raspberry Pi over SSH.
 
-When you compile on Windows or the AI server and click LIVE TEST in the GUI,
-this syncs ``outputs/model.pt`` to the Pi and opens an SSH terminal that runs
+When you compile on the AI server and click LIVE TEST in the GUI, this syncs
+``outputs/model.pt`` to the Pi and opens an SSH terminal that runs
 ``live.py --source picamera`` on Pi hardware (where the CSI camera works).
 """
 
@@ -42,13 +42,14 @@ def load_pi_live_settings(project_root: Path | None = None) -> dict:
 
 
 def should_use_pi_remote(project_root: Path | None = None) -> bool:
-    """True when LIVE TEST should SSH to the Pi instead of opening a local webcam."""
+    """True on Linux AI server — SSH to Pi for CSI camera (not Windows / not on-Pi)."""
+    if sys.platform.startswith("win"):
+        return False
     if os.environ.get("RPI_LIVE_LOCAL", "").lower() in ("1", "true", "yes"):
         return False
     settings = load_pi_live_settings(project_root)
     if not settings.get("enabled", True):
         return False
-    # GUI running on the Pi itself — use local LiveView + picamera2.
     if on_raspberry_pi():
         return False
     return True
@@ -107,21 +108,7 @@ def sync_model_to_pi(project_root: Path, host: str, repo: str) -> str | None:
 
 
 def launch_pi_terminal(host: str, remote_cmd: str) -> str | None:
-    """Open a new terminal running ``ssh host 'remote_cmd'``."""
-    if sys.platform.startswith("win"):
-        # Keep the window open if live.py errors out.
-        inner = f'ssh {host} "{remote_cmd}"'
-        wt = shutil.which("wt") or shutil.which("wt.exe")
-        if wt:
-            subprocess.Popen(
-                [wt, "new-tab", "cmd", "/k", inner],
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-            )
-            return None
-        subprocess.Popen(["cmd", "/c", "start", "cmd", "/k", inner], shell=False)
-        return None
-
-    # Linux / macOS — try a new terminal emulator, else foreground ssh.
+    """Open a new terminal running ``ssh host 'remote_cmd'`` (Linux)."""
     ssh_args = ["ssh", "-t", host, remote_cmd]
     for spec in (
         ["gnome-terminal", "--", *ssh_args],
@@ -150,9 +137,8 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
 
     if not ssh_reachable(host):
         return (
-            f"Cannot SSH to '{host}'. On Windows run once:\n"
-            f"  .\\setup_ssh_pi.ps1\n"
-            f"Or set pi_live.ssh_host in config.yaml to your Pi alias/IP."
+            f"Cannot SSH to '{host}'. Add a Host alias in ~/.ssh/config "
+            f"(see pi_live.ssh_host in config.yaml)."
         )
 
     err = sync_model_to_pi(root, host, repo)

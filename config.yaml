@@ -76,10 +76,9 @@ output:
   show_window: true         # open the 3-panel validation matrix
   seed: 662
 
-# ---- Pi live testing (GUI LIVE TEST on Windows / AI server) ------------------
-# Compiles here; camera runs on the Pi over SSH. One-time:  setup_ssh_pi.ps1
+# ---- Pi live testing (GUI LIVE TEST on AI server → Pi camera over SSH) ------
 pi_live:
-  enabled: true             # false = local webcam LiveView only
-  ssh_host: rpi             # SSH config alias (from setup_ssh_pi.ps1)
+  enabled: true             # false = local LiveView only
+  ssh_host: rpi             # ~/.ssh/config Host alias for the Pi
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto

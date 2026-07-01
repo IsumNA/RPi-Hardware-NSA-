@@ -2427,7 +2427,7 @@ class App(tk.Tk):
                          "FREEZE on a model to lock its commit hash."))
 
     def _live_test(self):
-        """Live camera: Pi CSI over SSH (Windows/AI server) or local LiveView on Pi."""
+        """Live camera: Pi over SSH from AI server, local LiveView elsewhere."""
         if not (ROOT / "outputs" / "model.pt").exists():
             if not messagebox.askyesno(
                 "Live testing",
@@ -2442,17 +2442,13 @@ class App(tk.Tk):
                 if err is None:
                     messagebox.showinfo(
                         "Live testing",
-                        "Opened a Pi terminal running live.py on the CSI camera.\n\n"
+                        "Opened a Pi SSH session running live.py on the CSI camera.\n\n"
                         "Press q or ESC in that window to stop.\n"
                         "(Copied outputs/model.pt to the Pi first.)")
                     return
-                if messagebox.askyesno(
-                    "Pi live testing unavailable",
-                    f"{err}\n\nUse local webcam / simulated LiveView instead?"):
-                    src = "opencv" if sys.platform.startswith("win") else "auto"
-                    LiveView(self, source=src)
+                messagebox.showerror("Pi live testing", err)
                 return
-            src = "auto" if not sys.platform.startswith("win") else "opencv"
+            src = "opencv" if sys.platform.startswith("win") else "auto"
             LiveView(self, source=src)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Live testing", str(exc))
