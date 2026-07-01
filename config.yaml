@@ -79,6 +79,7 @@ output:
 # ---- Pi live testing (GUI LIVE TEST on AI server → Pi camera over SSH) ------
 pi_live:
   enabled: true             # false = local LiveView only
-  ssh_host: rpi             # ~/.ssh/config Host alias for the Pi
+  ssh_host: rpi             # or YOUR_USER@10.x.x.x (Pi IP on lab network)
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto
+  # One-time on AI server:  ./setup_ssh_pi.sh YOUR_USER PI_IP

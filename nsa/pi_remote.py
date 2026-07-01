@@ -55,15 +55,34 @@ def should_use_pi_remote(project_root: Path | None = None) -> bool:
     return True
 
 
-def ssh_reachable(host: str, timeout: int = 8) -> bool:
+def ssh_reachable(host: str, timeout: int = 8) -> tuple[bool, str]:
+    """Return (ok, detail) from a quick BatchMode SSH probe."""
     try:
         r = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=" + str(timeout),
              "-o", "StrictHostKeyChecking=accept-new", host, "true"],
-            capture_output=True, timeout=timeout + 5, check=False)
-        return r.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+            capture_output=True, text=True, timeout=timeout + 5, check=False)
+        if r.returncode == 0:
+            return True, ""
+        detail = (r.stderr or r.stdout or "").strip()
+        return False, detail or f"exit {r.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+
+
+def ssh_setup_help(host: str, detail: str) -> str:
+    return (
+        f"Cannot SSH to '{host}'.\n\n"
+        f"Detail: {detail}\n\n"
+        "Fix on the AI server (one time):\n"
+        "  1. Run:  ./setup_ssh_pi.sh YOUR_USER PI_IP\n"
+        "     (needs Pi SSH enabled by lab admin + password once)\n"
+        "  2. Or edit config.yaml:\n"
+        "       pi_live:\n"
+        "         ssh_host: YOUR_USER@PI_IP\n"
+        "  3. Test:  ssh YOUR_USER@PI_IP\n"
+        "     or:    python -m nsa.pi_remote --check"
+    )
 
 
 def remote_live_shell_command(repo: str, source: str = "picamera") -> str:
@@ -135,11 +154,9 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     repo = str(s["repo"])
     source = str(s["source"])
 
-    if not ssh_reachable(host):
-        return (
-            f"Cannot SSH to '{host}'. Add a Host alias in ~/.ssh/config "
-            f"(see pi_live.ssh_host in config.yaml)."
-        )
+    ok, detail = ssh_reachable(host)
+    if not ok:
+        return ssh_setup_help(host, detail)
 
     err = sync_model_to_pi(root, host, repo)
     if err:
@@ -156,6 +173,15 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         print("\nSettings: config.yaml pi_live:  or  RPI_SSH_HOST / RPI_REPO env vars")
         return 0
+    if argv and argv[0] in ("--check", "-c"):
+        s = load_pi_live_settings(root)
+        host = str(s["ssh_host"])
+        ok, detail = ssh_reachable(host)
+        if ok:
+            print(f"SSH OK: {host}")
+            return 0
+        print(ssh_setup_help(host, detail), file=sys.stderr)
+        return 1
     err = run_live_on_pi(root)
     if err:
         print(err, file=sys.stderr)
