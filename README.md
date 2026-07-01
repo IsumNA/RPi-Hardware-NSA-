@@ -193,22 +193,28 @@ frame to `outputs/live_preview.png`. (You can also run it standalone with
 
 Camera backends are auto-detected (override with `--source`):
 
-1. **picamera2** — the Raspberry Pi CSI camera (e.g. the **IMX662 low-light**
-   module); `--cam-gain` / `--exposure` push it into the noisy low-light regime.
-2. **OpenCV** — any USB / V4L2 webcam (`--source opencv --camera-index N`).
-3. **simulated** — a synthetic low-light stream from the sensor noise model
-   (`--source sim --sensor imx662`), so the feature is demonstrable on a dev
-   machine with no camera attached.
+1. **picamera2** — the Raspberry Pi CSI camera (usually **already on Pi OS** — no
+   `sudo apt` needed; recreate the venv with `--system-site-packages`).
+2. **rpicam-vid** — CSI via the preinstalled `rpicam-vid` / `libcamera-vid` CLI
+   when picamera2 isn't importable (also no extra apt).
+3. **OpenCV** — USB / V4L2 webcam (`--source opencv --camera-index N`).
+4. **simulated** — synthetic low-light stream for dev machines with no camera.
 
-`picamera2` is a **system** package (it binds to libcamera), so on the Pi install
-it with apt and make the virtualenv able to see it — pip can't do this:
+**No sudo?** On the Pi run `python pi_camera_check.py` — it tells you exactly
+what works and how to fix the venv. Most common fix (picamera2 already installed
+on the image):
 
 ```bash
-sudo apt install -y python3-picamera2
-python3 -m venv --system-site-packages .venv   # so the venv sees system picamera2
+deactivate
+rm -rf .venv
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python pi_camera_check.py
 ```
+
+If picamera2 truly isn't on the image and you can't use apt, try
+`pip install -r requirements-pi.txt` (pip-only wheels for Bookworm).
 
 In the GUI view, click **CLOSE** (or press `ESC`) to stop. With the standalone
 `python live.py`, press `q` or `ESC` in the window; on a headless box it saves a
@@ -261,10 +267,14 @@ screen). Each past run shows its profile, target chip, sensor and key metrics
 3. **Visual validation matrix** — `outputs/validation_panel.png` and a pop-up
    window with three panels: **A** raw input · **B** ground truth · **C** model output.
 
-4. **Pareto fitness report** — a scorecard balancing image quality, latency and
+4. **Resolution vs TOPS scaling** — `outputs/resolution_tops_scaling.png` plots
+   how effective throughput scales with input pixels for each Pi-class target
+   (Pi 5 CPU, Hailo-8, DeepX); peak TOPS shown as dashed lines.
+
+5. **Pareto fitness report** — a scorecard balancing image quality, latency and
    INT8 robustness into a single `FINAL PARETO FITNESS SCORE`.
 
-5. **Target suitability matrix** — a cross-chip verdict (`✓ SUITABLE` /
+6. **Target suitability matrix** — a cross-chip verdict (`✓ SUITABLE` /
    `▲ WITH CAVEATS` / `✗ NOT RECOMMENDED`) telling you whether this exact model
    is deployable on each Raspberry Pi-class target (Pi 5 CPU, Hailo-8, DeepX),
    derived from each chip's specs: precision, native ops, on-chip SRAM budget

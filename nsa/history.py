@@ -20,8 +20,8 @@ HISTORY_DIR = Path("outputs/history")
 INDEX_NAME = "index.jsonl"
 
 # Files copied verbatim from outputs/ into each run's snapshot folder.
-_COPY_COMPILE = ("summary.json", "validation_panel.png", "model.pt",
-                 "exported_model.onnx")
+_COPY_COMPILE = ("summary.json", "validation_panel.png", "resolution_tops_scaling.png",
+                 "model.pt", "exported_model.onnx")
 
 
 def _safe(text) -> str:

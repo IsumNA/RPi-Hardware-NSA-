@@ -30,17 +30,20 @@ onnx>=1.15
 # filtering and freezing the commit hash work without it (stdlib HTTP only).
 # huggingface_hub>=0.23
 
-# Optional: live testing against the Raspberry Pi CSI camera (live.py / the GUI
-# LIVE TESTING button). picamera2 is a SYSTEM package on the Pi (it binds to
-# libcamera), so it is installed with apt, NOT pip -- `pip install -r` cannot do
-# this for you. On the Raspberry Pi run:
+# Raspberry Pi CSI camera (live testing) — usually NO sudo needed
 #
-#     sudo apt install -y python3-picamera2
-#     # recreate the venv so it can see the system picamera2:
+# On Raspberry Pi OS, python3-picamera2 is typically PRE-INSTALLED. You do not
+# need sudo apt if you let your venv see system packages:
+#
 #     python3 -m venv --system-site-packages .venv
 #     source .venv/bin/activate
 #     pip install -r requirements.txt
 #
-# (On a dev machine / no CSI camera, skip this -- live.py falls back to a USB
-# webcam via OpenCV, or a simulated low-light stream.)
-# picamera2>=0.3   # Raspberry Pi only -- prefer the apt package above
+# Or edit .venv/pyvenv.cfg →  include-system-site-packages = true
+#
+# Diagnose what works on your Pi (no sudo):
+#     python pi_camera_check.py
+#
+# live.py also tries rpicam-vid / libcamera-vid (preinstalled on Pi OS) when
+# picamera2 is not importable. Pip-only fallback (no apt):
+#     pip install -r requirements-pi.txt

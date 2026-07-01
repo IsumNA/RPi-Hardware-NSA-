@@ -6,10 +6,14 @@ next to the denoised output in real time — the on-Pi proof that the optimizati
 actually cleans up the low-light camera.
 
 Camera backends are tried in order (override with --source):
-  1. picamera2  — the Raspberry Pi CSI camera (e.g. the IMX662 low-light module)
-  2. OpenCV     — any USB / V4L2 webcam (--camera-index N)
-  3. simulated  — a synthetic low-light stream from the sensor noise model, so the
-                  feature is demonstrable on a dev machine with no camera.
+  1. picamera2  — Python CSI API (usually pre-installed on Pi OS; venv needs
+                  --system-site-packages, NO sudo apt required)
+  2. rpicam-vid — Pi CSI via the preinstalled libcamera CLI (no picamera2)
+  3. GStreamer  — libcamerasrc when OpenCV was built with GStreamer
+  4. OpenCV     — USB / V4L2 webcam (--camera-index N)
+  5. simulated  — synthetic low-light stream for dev machines
+
+  Run ``python pi_camera_check.py`` on the Pi to see what works without sudo.
 
 It loads the exact model trained by the last compile (outputs/model.pt). If that
 checkpoint is missing it rebuilds from flags and does a quick calibration so the
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -124,7 +129,7 @@ def _on_raspberry_pi() -> bool:
 
 
 def _picamera2_available() -> bool:
-    """picamera2 is a system apt package on the Pi — skip elsewhere."""
+    """picamera2 is usually pre-installed on Pi OS; venv may need system-site-packages."""
     if not _on_raspberry_pi():
         return False
     try:
@@ -132,6 +137,20 @@ def _picamera2_available() -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _picamera2_setup_hint() -> str:
+    try:
+        from nsa.pi_camera import format_report, diagnose
+        d = diagnose()
+        if d.get("recommendations"):
+            return d["recommendations"][0]
+        return format_report(d)
+    except Exception:  # noqa: BLE001
+        return (
+            "picamera2 not importable. On Pi OS it is usually already installed — "
+            "recreate your venv with: python3 -m venv --system-site-packages .venv"
+        )
 
 
 class PiCam:
@@ -163,6 +182,113 @@ class PiCam:
             self.cam.stop()
         except Exception:  # noqa: BLE001
             pass
+
+
+class RpicamVidCam:
+    """CSI camera via the preinstalled rpicam-vid / libcamera-vid CLI (no picamera2)."""
+
+    def __init__(self, args, exe: str):
+        self.exe = exe
+        self.name = f"Raspberry Pi CSI ({Path(exe).name} pipe)"
+        cmd = [
+            exe, "-t", "0", "--codec", "mjpeg", "--inline", "-o", "-", "-n",
+            "--width", str(args.width), "--height", str(args.height),
+            "--framerate", "30",
+        ]
+        if args.cam_gain and args.cam_gain > 1:
+            cmd += ["--gain", str(float(args.cam_gain))]
+        self._buf = b""
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def read(self):
+        if self.proc.poll() is not None:
+            return None
+        while True:
+            chunk = self.proc.stdout.read(8192)
+            if not chunk:
+                return None
+            self._buf += chunk
+            start = self._buf.find(b"\xff\xd8")
+            end = self._buf.find(b"\xff\xd9")
+            if start != -1 and end != -1 and end > start:
+                jpg = self._buf[start:end + 2]
+                self._buf = self._buf[end + 2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return frame
+
+    def close(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class GStreamerPiCam:
+    """CSI camera via GStreamer libcamerasrc (when OpenCV is built with GStreamer)."""
+
+    name = "Raspberry Pi CSI (GStreamer libcamerasrc)"
+
+    def __init__(self, args):
+        pipeline = (
+            f"libcamerasrc ! video/x-raw,width={args.width},height={args.height},"
+            f"format=RGB ! videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink drop=1 max-buffers=1"
+        )
+        self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if not self.cap.isOpened():
+            raise RuntimeError("GStreamer libcamerasrc pipeline failed to open")
+        if _warm_read(self.cap, attempts=25) is None:
+            self.cap.release()
+            raise RuntimeError("GStreamer opened but delivered no frames")
+
+    def read(self):
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+    def close(self):
+        try:
+            self.cap.release()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _try_rpicam_vid(args):
+    from nsa.pi_camera import find_rpicam_tool
+    exe = find_rpicam_tool("rpicam-vid", "libcamera-vid")
+    if not exe:
+        return None
+    try:
+        cam = RpicamVidCam(args, exe)
+        # Verify the pipe actually delivers a frame.
+        frame = cam.read()
+        if frame is None:
+            cam.close()
+            return None
+        cam._buf = b""  # consumed test frame; stream continues
+        return cam
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _try_gstreamer_pi(args):
+    if not _on_raspberry_pi():
+        return None
+    try:
+        if "GStreamer" not in (cv2.getBuildInformation() or ""):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        from nsa.pi_camera import _gst_has_element
+        if not _gst_has_element("libcamerasrc"):
+            return None
+        return GStreamerPiCam(args)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class CvCam:
@@ -274,10 +400,10 @@ def probe_cameras(max_index: int = 9, width: int = 640, height: int = 480) -> li
 
 # Human-readable hint when no camera is found (shown in the GUI).
 _CAMERA_HELP = (
-    "No webcam found. Close Zoom/Teams/browser tabs using the camera, check "
-    "Windows Settings → Privacy → Camera (allow desktop apps), then pick another "
-    "index below and click CONNECT. On a Pi CSI module you need picamera2 "
-    "(sudo apt install python3-picamera2) — USB webcams work without that."
+    "No camera found. On a Pi CSI module without sudo apt: run "
+    "python pi_camera_check.py — picamera2 is usually already on Pi OS; "
+    "recreate the venv with --system-site-packages, or live.py will try "
+    "rpicam-vid automatically. USB webcams use OpenCV (index 0–9)."
 )
 
 
@@ -320,13 +446,31 @@ def open_camera(args, sensor_key, gain):
         except Exception as exc:  # noqa: BLE001
             if src == "picamera":
                 raise SystemExit(f"picamera2 backend failed: {exc}")
-            log(f"picamera2 unavailable ({exc}); trying a USB/V4L2 camera…", "warn")
+            log(f"picamera2 unavailable ({exc}); trying Pi CSI fallbacks…", "warn")
     elif src == "picamera":
-        raise SystemExit(
-            "picamera2 is not installed. On the Pi: "
-            "sudo apt install -y python3-picamera2  "
-            "(then recreate the venv with --system-site-packages). "
-            "For a USB webcam use --source opencv instead.")
+        raise SystemExit(_picamera2_setup_hint())
+
+    # Pi CSI without picamera2: rpicam-vid / libcamera-vid (preinstalled on Pi OS).
+    if src in ("auto", "rpicam", "picamera") and _on_raspberry_pi():
+        cam = _try_rpicam_vid(args)
+        if cam is not None:
+            log(f"Camera: {cam.name}", "ok")
+            return cam
+        if src == "rpicam":
+            raise SystemExit(
+                "rpicam-vid / libcamera-vid not found or not streaming. "
+                "Run: python pi_camera_check.py")
+
+    if src in ("auto", "gstreamer", "picamera") and _on_raspberry_pi():
+        try:
+            cam = _try_gstreamer_pi(args)
+            if cam is not None:
+                log(f"Camera: {cam.name}", "ok")
+                return cam
+        except Exception as exc:  # noqa: BLE001
+            if src == "gstreamer":
+                raise SystemExit(f"GStreamer CSI camera failed: {exc}") from exc
+            log(f"GStreamer CSI unavailable ({exc})", "warn")
 
     if src in ("auto", "opencv"):
         # Probe the requested index first, then 0..max (many laptops use index 1).
@@ -429,7 +573,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="live.py",
         description="NSA live testing — run the compiled denoiser on a camera stream.",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    p.add_argument("--source", choices=["auto", "picamera", "opencv", "sim"],
+    p.add_argument("--source",
+                   choices=["auto", "picamera", "rpicam", "gstreamer", "opencv", "sim"],
                    default="auto", help="camera backend (default: auto-detect)")
     p.add_argument("--camera-index", dest="camera_index", type=int, default=0,
                    help="OpenCV/V4L2 camera index (default: 0)")

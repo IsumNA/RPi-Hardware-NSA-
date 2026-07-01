@@ -566,7 +566,8 @@ class LiveView(tk.Toplevel):
                     width=130, height=34).pack(side="left", padx=(S(10), 0))
         self._cam_hint = tk.Label(
             camrow,
-            text="Probing for webcams…  (USB / built-in — no apt install needed)",
+            text=("Probing for cameras…  On Pi: run python pi_camera_check.py "
+                  "if CSI camera is not detected (usually no sudo needed)"),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(420), justify="left")
         self._cam_hint.pack(side="left", padx=(S(10), 0))
 
@@ -633,13 +634,15 @@ class LiveView(tk.Toplevel):
         def work():
             try:
                 import live as _live
+                from nsa.pi_camera import diagnose, on_raspberry_pi
                 found = _live.probe_cameras()
-                self.after(0, lambda: self._on_probe_done(found))
+                pi = diagnose() if on_raspberry_pi() else None
+                self.after(0, lambda: self._on_probe_done(found, pi))
             except Exception:  # noqa: BLE001
                 pass
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_probe_done(self, found: list[int]):
+    def _on_probe_done(self, found: list[int], pi_diag=None):
         if not self.winfo_exists():
             return
         if found:
@@ -655,11 +658,28 @@ class LiveView(tk.Toplevel):
                 on_sim = "simulated" in self._status.lower()
             if on_sim:
                 self._reconnect_camera()
-        else:
-            self._cam_hint.config(
-                text="No webcam yet — try index 0–9, close other camera apps, "
-                     "check Windows Privacy → Camera, then CONNECT",
-                fg=AMBER)
+            return
+        if pi_diag:
+            if pi_diag.get("picamera2_importable"):
+                self._cam_hint.config(
+                    text="CSI camera via picamera2 is ready — reconnecting…",
+                    fg=GREEN)
+                self._reconnect_camera()
+                return
+            if pi_diag.get("rpicam_vid"):
+                self._cam_hint.config(
+                    text=f"CSI via {Path(pi_diag['rpicam_vid']).name} "
+                         "(no picamera2) — click CONNECT",
+                    fg=GREEN)
+                return
+            rec = (pi_diag.get("recommendations") or [""])[0]
+            short = rec.split("\n")[0] if rec else "Run: python pi_camera_check.py"
+            self._cam_hint.config(text=short[:120], fg=AMBER)
+            return
+        self._cam_hint.config(
+            text="No webcam yet — try index 0–9, close other camera apps, "
+                 "check Windows Privacy → Camera, then CONNECT",
+            fg=AMBER)
 
     def _reconnect_camera(self):
         """Ask the worker to reopen the webcam at the selected index."""
@@ -2409,6 +2429,34 @@ class App(tk.Tk):
                          bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
         else:
             tk.Label(body, text="validation_panel.png not found in outputs/",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+
+        # -- Resolution vs TOPS scaling chart ---------------------------------
+        scale_path = None
+        if s and s.get("scaling_chart"):
+            scale_path = Path(s["scaling_chart"])
+        if scale_path is None:
+            scale_path = ROOT / "outputs" / "resolution_tops_scaling.png"
+        self._section(body, "RESOLUTION vs TOPS SCALING")
+        tk.Label(body, text="How effective throughput scales with input pixels "
+                 "for each Pi-class target (dashed = peak TOPS).",
+                 bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(6)))
+        if ImageTk and scale_path.exists():
+            try:
+                im = Image.open(scale_path)
+                target_w = S(640)
+                ratio = target_w / im.width
+                im = im.resize((target_w, int(im.height * ratio)), Image.LANCZOS)
+                self._scaling_img = ImageTk.PhotoImage(im)
+                tk.Label(body, image=self._scaling_img, bg=WHITE).pack(
+                    anchor="w", pady=(S(4), S(12)))
+            except Exception:
+                tk.Label(body, text="(could not render resolution_tops_scaling.png)",
+                         bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+        else:
+            tk.Label(body, text="resolution_tops_scaling.png not found — "
+                     "re-run a compile to generate it.",
                      bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
 
     def _show_ranking(self):

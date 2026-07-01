@@ -22,6 +22,7 @@ CAPS = {
         "needs_quant": False,
         "sram_kb": 1_000_000,   # main memory, effectively unlimited
         "format": "ONNX Runtime (.ort)",
+        "tops_peak": 0.04,      # ~40 GFLOPS FP16 class (shown on TOPS chart)
     },
     "hailo8": {
         "label": "Hailo-8 (26 TOPS, Dataflow)",
@@ -30,14 +31,16 @@ CAPS = {
         "needs_quant": True,
         "sram_kb": 20_000,      # on-chip SRAM budget
         "format": "Hailo Executable Format (.hef)",
+        "tops_peak": 26.0,
     },
     "deepx": {
-        "label": "DeepX DX-M1 (NPU)",
+        "label": "DeepX DX-M1 (25 TOPS NPU)",
         "precision": "int8",
         "native_acts": {"relu", "silu"},
         "needs_quant": True,
         "sram_kb": 16_000,
         "format": "DeepX Runtime Binary (.bin)",
+        "tops_peak": 25.0,
     },
 }
 

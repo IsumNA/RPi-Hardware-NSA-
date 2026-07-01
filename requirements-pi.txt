@@ -1,0 +1,17 @@
+# Raspberry Pi CSI camera — pip-only install (NO sudo apt)
+#
+# Use this ONLY if picamera2 is not already on your Pi OS image AND you cannot
+# run sudo apt. On most Raspberry Pi OS Bookworm images, picamera2 is already
+# installed system-wide — you do NOT need this file. Instead recreate your venv:
+#
+#     python3 -m venv --system-site-packages .venv
+#     source .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# If that still fails, try:
+#     pip install -r requirements-pi.txt
+#
+# Or run:  python pi_camera_check.py  for a full diagnosis.
+
+picamera2>=0.3.0
+rpi-libcamera>=0.1.0

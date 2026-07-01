@@ -37,6 +37,7 @@ from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
                         list_frames)
 from nsa.sensors import get_sensor
 from nsa.report import compute_fitness, print_report, print_target_suitability
+from nsa.scaling import render_scaling_chart, scaling_curves
 from nsa.theme import (RPI_GREEN, banner, console, kv_table, level_rule, log,
                        pause)
 from nsa.visualize import render_panel
@@ -369,6 +370,19 @@ def main() -> int:
                                  chosen=cfg.hardware)
     print_target_suitability(assessments, chosen=cfg.hardware)
 
+    # Resolution vs TOPS scaling chart (all Pi-class targets).
+    scaling_path = out_dir / "resolution_tops_scaling.png"
+    try:
+        render_scaling_chart(
+            model, scaling_path,
+            current_patch=cfg.optimization.patch_size,
+            selected_hardware=cfg.hardware,
+            show=False)
+        log(f"Saved resolution/TOPS scaling chart -> {scaling_path}", "ok")
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not render scaling chart: {exc}", "warn")
+        scaling_path = None
+
     # Machine-readable summary so the GUI can render a rich results screen.
     summary = {
         "hardware": cfg.hardware,
@@ -423,9 +437,12 @@ def main() -> int:
             for a in assessments
         ],
         "panel": str((out_dir / "validation_panel.png").resolve()),
+        "scaling_chart": str(scaling_path.resolve()) if scaling_path else None,
+        "scaling": scaling_curves(model) if scaling_path else None,
         "artifacts": [str((out_dir / f).resolve()) for f in (
             "exported_model.onnx", f"hardware_ready{cfg.artifact_ext}",
-            "validation_panel.png") if (out_dir / f).exists()],
+            "validation_panel.png", "resolution_tops_scaling.png")
+            if (out_dir / f).exists()],
     }
     try:
         (out_dir / "summary.json").write_text(json.dumps(summary, indent=2),
