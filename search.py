@@ -293,6 +293,7 @@ def _save_pareto(results: list[SearchResult], front: list[SearchResult],
         }
 
     payload = {
+        "kind": "sweep",
         "target": args.hardware, "target_label": caps["label"],
         "sensor": "all" if args.all_sensors else args.sensor,
         "all_sensors": bool(args.all_sensors), "gain": args.gain,

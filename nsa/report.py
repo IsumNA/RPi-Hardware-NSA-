@@ -83,17 +83,21 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
     fps = 1000.0 / max(latency_ms, 1e-6)
 
     # Quality: reward measurable denoising (gain over the noisy input), not speed alone.
+    gain = None
     if psnr_in is not None:
         gain = psnr - psnr_in
-        gain_score = _clamp01(gain / 12.0)          # +12 dB recovery ≈ excellent
-        abs_score = _clamp01((psnr - 16.0) / 10.0)  # usable output ≈ 16–26 dB
-        quality = 0.75 * gain_score + 0.25 * abs_score
-        if gain < 1.0:
-            # Barely changes the frame (or makes it worse) — do not let latency inflate score.
-            quality *= _clamp01(max(gain, 0.0))
+        if gain <= 0:
+            gain_score = 0.0
+        else:
+            # Any real improvement starts above zero; +12 dB recovery ≈ excellent.
+            gain_score = 0.18 + 0.82 * _clamp01(gain / 12.0)
+        abs_score = _clamp01((psnr - 14.0) / 12.0)
+        quality = 0.80 * gain_score + 0.20 * abs_score
+        if gain > 0:
+            quality = max(quality, 0.12)
     else:
         # Legacy path when input PSNR is unknown (absolute band only).
-        quality = _clamp01((psnr - 16.0) / 10.0)
+        quality = _clamp01((psnr - 14.0) / 12.0)
 
     # Latency: at/above target fps -> full marks, degrades below.
     latency_s = _clamp01(fps / target_fps)
@@ -117,6 +121,8 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
 
     # Speed / robustness / memory only amplify a model that actually denoises.
     score = 100.0 * quality * (quality_weight + (1.0 - quality_weight) * eff)
+    if gain is not None and gain > 0:
+        score = max(score, 6.0 + min(gain, 12.0) * 1.5)
 
     score = round(score, 1)
     grade = ("OPTIMAL" if score >= 85 else

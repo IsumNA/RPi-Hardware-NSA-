@@ -1107,7 +1107,18 @@ class App(tk.Tk):
                  text="     Uses config.yaml plus the defaults below. "
                       "Press Edit Config to walk through every option.",
                  bg=WHITE, fg=SUBTLE, font=font(10), wraplength=S(560),
-                 justify="left").pack(anchor="w", pady=(0, S(12)))
+                 justify="left").pack(anchor="w", pady=(0, S(10)))
+        eval_box = tk.Frame(home_body, bg=WHITE)
+        eval_box.pack(fill="x", pady=(0, S(10)))
+        self._section(eval_box, "RUN TYPE")
+        self._radio(eval_box, "Single model compile", "single", enabled=True,
+                    variable=self.eval_var, badge="COMPILE",
+                    desc="Train and export one architecture with a full report.",
+                    command=self._on_eval_change)
+        self._radio(eval_box, "Architecture sweep (rank all families)", "sweep",
+                    enabled=True, variable=self.eval_var, badge="SWEEP",
+                    desc="Train every family, rank by Pareto fitness, pick a winner.",
+                    command=self._on_eval_change)
         self._home_summary = tk.Frame(home_body, bg=WHITE)
         self._home_summary.pack(fill="x")
 
@@ -1119,7 +1130,6 @@ class App(tk.Tk):
         self._on_mode_change()
         self._on_source_change()
         self._on_eval_change()
-        self.eval_var.set("single")
         self._show_home()
 
     # -- Individual wizard steps ---------------------------------------------
@@ -1341,7 +1351,6 @@ class App(tk.Tk):
     def _show_home(self):
         """Quick-run landing: prominent Run, optional full config wizard."""
         self._wizard_mode = "home"
-        self.eval_var.set("single")
         for st in self._steps:
             st["holder"].pack_forget()
         self._home.pack(fill="both", expand=True)
@@ -1387,7 +1396,11 @@ class App(tk.Tk):
                 "temporal": "Temporal video"}.get(self.mode_var.get(), self.mode_var.get())
         q = ("INT8 PTQ" + (" + QAT" if self.qat_var.get() else "")
              if self.quantize_var.get() else "off")
+        sweep = self.eval_var.get() == "sweep"
+        run_type = ("Architecture sweep (all 9 families)"
+                    if sweep else "Single model compile")
         return [
+            ("Run type", run_type, AMBER if sweep else RASPBERRY),
             ("Image sensor", f"{sensor_name}  @{self._row_get('gain','512')}×", RASPBERRY),
             ("Capture source", src, INK),
             ("Run mode", mode, INK),
@@ -1448,7 +1461,9 @@ class App(tk.Tk):
             RoundButton(self._nav, "EDIT CONFIG", self._enter_config_wizard,
                         kind="secondary", width=150, height=44).pack(side="right",
                                                                      padx=(S(8), 0))
-            self.run_btn = RoundButton(self._nav, "▶  RUN COMPILE", self._run,
+            run_lbl = ("▶  RUN SWEEP" if self.eval_var.get() == "sweep"
+                       else "▶  RUN COMPILE")
+            self.run_btn = RoundButton(self._nav, run_lbl, self._run,
                                        kind="hero", width=300, height=58)
             self.run_btn.pack(side="right")
             return
@@ -1762,6 +1777,9 @@ class App(tk.Tk):
         if getattr(self, "_steps", None):
             if self._steps[self._step]["key"] == "review":
                 self._refresh_review()
+            self._render_nav()
+        if getattr(self, "_wizard_mode", "") == "home":
+            self._refresh_home_summary()
             self._render_nav()
 
     def _choose_dataset(self):
@@ -2560,7 +2578,9 @@ class App(tk.Tk):
                  font=font(19, "bold")).pack(anchor="w")
         if s:
             m = s.get("model", {})
-            subtitle = (f"{s.get('hardware_name','')}   ·   "
+            kind = s.get("kind", "compile")
+            kind_lbl = "SWEEP" if kind == "sweep" else "COMPILE"
+            subtitle = (f"{kind_lbl}   ·   {s.get('hardware_name','')}   ·   "
                         f"{m.get('display') or ''}   ·   "
                         f"{s.get('precision','')}")
         else:
@@ -2785,9 +2805,9 @@ class App(tk.Tk):
 
         header = tk.Frame(self.main, bg=WHITE)
         header.pack(fill="x", padx=pad, pady=(S(22), S(2)))
-        tk.Label(header, text="Model Ranking", bg=WHITE, fg=INK,
+        tk.Label(header, text="Sweep Complete", bg=WHITE, fg=INK,
                  font=font(19, "bold")).pack(anchor="w")
-        tk.Label(header, text=f"{self._rank_target_label}  ·  "
+        tk.Label(header, text=f"SWEEP   ·   {self._rank_target_label}  ·  "
                  f"{len(rows)} models trained  ·  "
                  f"✦ = Pareto-optimal  ·  click any row to run it", bg=WHITE,
                  fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))

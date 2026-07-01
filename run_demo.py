@@ -426,6 +426,7 @@ def main() -> int:
     # Machine-readable summary so the GUI can render a rich results screen.
     prof = dict(profile_rows(cfg.model))
     summary = {
+        "kind": "compile",
         "hardware": cfg.hardware,
         "hardware_name": cfg.hardware_name,
         "model": {
