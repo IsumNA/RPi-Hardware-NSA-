@@ -13,9 +13,11 @@ rich>=13.0
 torch>=2.2
 onnx>=1.15
 
-# Optional: enables running inference directly from the exported .onnx graph.
-# The demo falls back to the live torch runtime if this is not installed.
+# Optional: running Hugging Face ONNX models directly.
 # onnxruntime>=1.17
+#
+# Optional: NAFNet models from deepghs/image_restoration (recommended Hub source).
+# dghs-imgutils>=0.19
 
 # Optional: enables loading real .dng captures (e.g. denoise-hw PI_RAW datasets).
 # .npy / .png / .tif inputs work without it.

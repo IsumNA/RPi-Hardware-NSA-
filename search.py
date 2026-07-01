@@ -413,14 +413,18 @@ def main() -> int:
     args = build_parser().parse_args()
 
     if not args.simulated:
-        from nsa.config import Config
-        from nsa.denoise_hw_data import apply_auto_dataset
-        _cfg = Config()
-        if apply_auto_dataset(_cfg, Path(__file__).resolve().parent):
-            args.real_capture = True
-            args.dataset_path = args.dataset_path or _cfg.sensor.dataset_path
-            if not args.filter:
-                args.filter = list(_cfg.sensor.filter or [])
+        from nsa.config import finalize_dataset_config, load_config, project_root
+        _cfg = load_config(project_root() / "config.yaml")
+        _cfg.sensor.real_capture = True
+        if args.dataset_path:
+            _cfg.sensor.dataset_path = args.dataset_path
+        if args.filter:
+            _cfg.sensor.filter = list(args.filter)
+        finalize_dataset_config(_cfg, project_root())
+        args.real_capture = True
+        args.dataset_path = args.dataset_path or _cfg.sensor.dataset_path
+        if not args.filter:
+            args.filter = list(_cfg.sensor.filter or [])
 
     banner("NSA Architecture Search")
 

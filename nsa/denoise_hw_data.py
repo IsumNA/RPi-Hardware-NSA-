@@ -43,23 +43,109 @@ def _pi_raw_search_paths() -> tuple[Path | None, ...]:
 PI_RAW_SEARCH = _pi_raw_search_paths()
 
 
-def resolve_pi_raw(explicit: str | Path | None = None) -> Path | None:
+def resolve_pi_raw(explicit: str | Path | None = None,
+                   project_root: Path | None = None) -> Path | None:
     """Return the first usable PI_RAW root (folder with paired captures)."""
+    root = project_root or Path(__file__).resolve().parents[1]
     candidates: list[Path] = []
     if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates.extend(p for p in PI_RAW_SEARCH if p)
+        p = Path(explicit).expanduser()
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        candidates.append(p)
+    for rel in PI_RAW_SEARCH:
+        if rel is None:
+            continue
+        p = rel if rel.is_absolute() else (root / rel)
+        candidates.append(p)
     seen: set[str] = set()
-    for root in candidates:
-        key = str(root.resolve()) if root.exists() else str(root)
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        key = str(candidate.resolve())
         if key in seen:
             continue
         seen.add(key)
-        if not root.exists():
-            continue
-        if find_paired_folders(str(root)):
-            return root.resolve()
+        if find_paired_folders(str(candidate)):
+            return candidate.resolve()
     return None
+
+
+def _is_default_dataset_path(path: Path, project_root: Path) -> bool:
+    norm = str(path).replace("\\", "/")
+    if norm.rstrip("/") == DEFAULT_DATASET_PATH:
+        return True
+    try:
+        return path.resolve() == (project_root / DEFAULT_DATASET_PATH).resolve()
+    except OSError:
+        return False
+
+
+SYSTEM_PI_RAW = Path("/opt/datasets/PI_RAW")
+
+
+def prefer_system_pi_raw() -> Path | None:
+    """Real PI_RAW on the AI machine (/opt/datasets/PI_RAW) wins over bundled samples."""
+    if SYSTEM_PI_RAW.exists() and find_paired_folders(str(SYSTEM_PI_RAW)):
+        return SYSTEM_PI_RAW.resolve()
+    return None
+
+
+def _apply_default_filter(cfg, root: Path) -> None:
+    if not cfg.sensor.filter:
+        test_dir = root / DEFAULT_TEST_REL
+        if test_dir.is_dir():
+            cfg.sensor.filter = list(DEFAULT_FILTER)
+
+
+def finalize_dataset_config(cfg, project_root: Path | None = None) -> bool:
+    """Pick the dataset root after YAML + CLI — never stomp a custom ``dataset_path``."""
+    root_dir = project_root or Path(__file__).resolve().parents[1]
+    if not cfg.sensor.real_capture:
+        return False
+
+    if cfg.sensor.dataset_path:
+        cfg.sensor.dataset_path = str(
+            resolve_data_path(cfg.sensor.dataset_path, root_dir) or cfg.sensor.dataset_path
+        )
+
+    explicit = Path(cfg.sensor.dataset_path) if cfg.sensor.dataset_path else None
+
+    # Custom path from yaml or ``--dataset`` — use it if it has paired data.
+    if explicit and explicit.exists() and not _is_default_dataset_path(explicit, root_dir):
+        resolved = resolve_pi_raw(explicit, root_dir) or normalize_dataset_root(explicit)
+        if find_paired_folders(str(resolved)):
+            cfg.sensor.dataset_path = str(resolved)
+            _apply_default_filter(cfg, Path(resolved))
+            return True
+
+    # Default / bundled path — prefer system PI_RAW on the AI machine.
+    system = prefer_system_pi_raw()
+    default_local = (root_dir / DEFAULT_DATASET_PATH).resolve()
+    if system is not None and (
+        explicit is None or _is_default_dataset_path(explicit, root_dir)
+    ):
+        cfg.sensor.dataset_path = str(system)
+        _apply_default_filter(cfg, system)
+        return True
+
+    if not find_paired_folders(str(default_local)):
+        ensure_project_dataset(root_dir)
+    resolved = resolve_pi_raw(default_local, root_dir) or default_local
+    cfg.sensor.dataset_path = str(resolved)
+    _apply_default_filter(cfg, Path(resolved))
+    return True
+
+
+def resolve_data_path(path: str | Path | None, project_root: Path | None = None) -> Path | None:
+    """Anchor relative data paths to the project root."""
+    if not path:
+        return None
+    root = project_root or Path(__file__).resolve().parents[1]
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = (root / p).resolve()
+    return p
 
 
 def normalize_dataset_root(path: str | Path) -> Path:
@@ -93,52 +179,9 @@ def dataset_summary(root: Path | None) -> dict:
     }
 
 
-SYSTEM_PI_RAW = Path("/opt/datasets/PI_RAW")
-
-
-def _has_dng_pairs(root: Path) -> bool:
-    return any(root.rglob("noisy.dng")) and any(root.rglob("gt.dng"))
-
-
-def prefer_system_pi_raw() -> Path | None:
-    """Real PI_RAW on the AI machine (/opt/datasets/PI_RAW) wins over bundled samples."""
-    if SYSTEM_PI_RAW.exists() and find_paired_folders(str(SYSTEM_PI_RAW)):
-        return SYSTEM_PI_RAW.resolve()
-    return None
-
-
 def apply_auto_dataset(cfg, project_root: Path | None = None) -> bool:
-    """Enable PI_RAW real captures when a dataset is available (bundled or linked)."""
-    root_dir = project_root or Path(__file__).resolve().parents[1]
-    system = prefer_system_pi_raw()
-    if system is not None:
-        cfg.sensor.dataset_path = str(system)
-        cfg.sensor.real_capture = True
-        if not cfg.sensor.filter:
-            test_dir = system / DEFAULT_TEST_REL
-            if test_dir.is_dir():
-                cfg.sensor.filter = list(DEFAULT_FILTER)
-        return True
-
-    explicit = cfg.sensor.dataset_path or DEFAULT_DATASET_PATH
-    root = resolve_pi_raw(explicit)
-    if root is None and cfg.sensor.real_capture:
-        ensure_project_dataset(root_dir)
-        root = resolve_pi_raw(explicit) or resolve_pi_raw(root_dir / DEFAULT_DATASET_PATH)
-    if root is None:
-        return False
-    # Bundled PNG samples — if /opt exists with real DNGs, never use synthetics.
-    local = (root_dir / DEFAULT_DATASET_PATH).resolve()
-    if (root.resolve() == local and not _has_dng_pairs(local)
-            and prefer_system_pi_raw() is not None):
-        root = prefer_system_pi_raw()
-    cfg.sensor.dataset_path = str(root)
-    cfg.sensor.real_capture = True
-    if not cfg.sensor.filter:
-        test_dir = root / DEFAULT_TEST_REL
-        if test_dir.is_dir():
-            cfg.sensor.filter = list(DEFAULT_FILTER)
-    return True
+    """Backward-compatible alias — prefer ``finalize_dataset_config`` after CLI overrides."""
+    return finalize_dataset_config(cfg, project_root)
 
 
 def parse_remote_spec(spec: str) -> tuple[str, str]:

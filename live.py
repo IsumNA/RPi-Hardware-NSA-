@@ -70,8 +70,46 @@ _DARK = (40, 40, 40)
 def load_model(args) -> tuple[torch.nn.Module, dict]:
     """Load the last-compiled model, or rebuild + quick-calibrate from flags."""
     if CKPT.exists() and not args.fresh:
-        ck = torch.load(CKPT, map_location="cpu")
+        ck = torch.load(CKPT, map_location="cpu", weights_only=False)
         m = ck.get("model", {})
+        if m.get("hf_imgutils") and m.get("hf_variant"):
+            from nsa.hf_runner import ImgutilsNafnetDenoiser
+            model = ImgutilsNafnetDenoiser(m["hf_variant"])
+            model.eval()
+            log(f"Loaded Hugging Face NAFNet ({m['hf_variant']}) via imgutils", "ok")
+            ck.setdefault("sensor", args.sensor)
+            ck.setdefault("gain", args.gain)
+            return model, ck
+        hf_onnx = m.get("hf_onnx")
+        if hf_onnx and Path(hf_onnx).is_file():
+            from nsa.hf_runner import OnnxDenoiser
+            model = OnnxDenoiser(Path(hf_onnx))
+            model.eval()
+            log(f"Loaded Hugging Face ONNX: {Path(hf_onnx).name}", "ok")
+            ck.setdefault("sensor", args.sensor)
+            ck.setdefault("gain", args.gain)
+            return model, ck
+        if m.get("hf_model"):
+            from nsa.hf_runner import load_hf_model
+            cfg = ModelConfig(
+                model_family=m.get("family", "nafnet"),
+                base_channels=m.get("base_channels", 32),
+                block_depth=m.get("block_depth", 4),
+                conv_type=m.get("conv_type", "depthwise"),
+                activation=m.get("activation", "relu"),
+                nafnet_enc_blocks=list(m.get("nafnet_enc", []) or []),
+                nafnet_middle_blocks=m.get("nafnet_middle", 1),
+                nafnet_dec_blocks=list(m.get("nafnet_dec", []) or []),
+                hf_model=m.get("hf_model"),
+                hf_weight=m.get("hf_weight"),
+            )
+            model, spec = load_hf_model(
+                m["hf_model"], cfg, weight=m.get("hf_weight"), download=False)
+            log(f"Loaded Hugging Face model: {spec.model_id} "
+                f"({spec.weight_path.name})", "ok")
+            ck.setdefault("sensor", args.sensor)
+            ck.setdefault("gain", args.gain)
+            return model, ck
         cfg = ModelConfig(
             model_family=m.get("family", "nafnet"),
             base_channels=m.get("base_channels", 32),

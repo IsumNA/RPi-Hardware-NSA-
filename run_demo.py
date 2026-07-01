@@ -28,8 +28,13 @@ from rich.progress import (BarColumn, Progress, TextColumn, TimeElapsedColumn)
 
 from nsa import __version__
 from nsa.compiler import assess_targets, compile_stack
-from nsa.config import apply_overrides, build_parser, load_config, ConfigError
+from nsa.config import (apply_overrides, build_parser, finalize_dataset_config,
+                        load_config, project_root, resolve_config_path, ConfigError)
+
+ROOT = Path(__file__).resolve().parent
 from nsa.export import export_onnx, write_device_artifact
+from nsa.hf_runner import (calibration_steps_for_hf, copy_hf_onnx,
+                           is_hf_pretrained, load_hf_model)
 from nsa.inference import (calibrate, calibrate_multi, estimate_device_latency_ms,
                            fake_quantize_int8, psnr, run, temporal_denoise)
 from nsa.models import build_model, count_params
@@ -54,7 +59,8 @@ def _has_display() -> bool:
 
 def main() -> int:
     args = build_parser().parse_args()
-    cfg = apply_overrides(load_config(args.config), args)
+    cfg = apply_overrides(load_config(resolve_config_path(args.config, ROOT)), args)
+    finalize_dataset_config(cfg, ROOT)
 
     # Headless box (e.g. Pi over SSH with no X): never try to open a window.
     headless = cfg.output.show_window and not _has_display()
@@ -77,7 +83,9 @@ def main() -> int:
     # -- Configuration summary --------------------------------------------------
     console.print(kv_table(
         [("hardware", f"{cfg.hardware}  ({cfg.hardware_name})")]
-        + profile_rows(cfg.model) + [
+        + profile_rows(cfg.model)
+        + ([("hf_model", cfg.model.hf_model)] if cfg.model.hf_model else [])
+        + [
             ("sensor", f"{sensor.label} — {sensor.family}  ·  "
                        f"{sensor.bayer}  {sensor.bit_depth}-bit"),
             ("gain", f"{cfg.sensor.gain}×"),
@@ -176,11 +184,29 @@ def main() -> int:
     # LEVEL 3 - MODEL ARCHITECTURE
     # ===========================================================================
     level_rule(3, "ARCHITECTURE  ·  building denoiser graph")
-    model = build_model(cfg.model)
-    n_params = count_params(model)
+    hf_spec = None
     custom_naf = bool(cfg.model.model_family == "nafnet" and cfg.model.nafnet_enc_blocks)
-    log(instantiate_summary(cfg.model), "step")
-    log(f"Trainable parameters: {n_params:,}", "ok")
+    if cfg.model.hf_model:
+        log(f"Hugging Face model: {cfg.model.hf_model}", "step")
+        try:
+            model, hf_spec = load_hf_model(
+                cfg.model.hf_model, cfg.model,
+                weight=cfg.model.hf_weight, download=True, root=ROOT)
+        except Exception as exc:  # noqa: BLE001
+            log(f"Could not load Hugging Face model: {exc}", "err")
+            return 2
+        n_params = count_params(model)
+        log(f"Loaded Hub weights: {hf_spec.weight_path.name} "
+            f"({hf_spec.weight_kind}) @ {hf_spec.sha[:12]}", "ok")
+        if n_params:
+            log(f"Trainable parameters: {n_params:,}", "ok")
+        else:
+            log("ONNX graph — parameter count not applicable", "info")
+    else:
+        model = build_model(cfg.model)
+        n_params = count_params(model)
+        log(instantiate_summary(cfg.model), "step")
+        log(f"Trainable parameters: {n_params:,}", "ok")
 
     # ===========================================================================
     # LEVEL 4 - COMPILER / OPTIMIZATION  (live compilation log)
@@ -192,28 +218,38 @@ def main() -> int:
     # LEVEL 5 - CALIBRATION + QUANTIZATION
     # ===========================================================================
     level_rule(5, "CALIBRATION  ·  live fit + INT8 quantization")
+    hf_onnx = bool(hf_spec and hf_spec.weight_kind in ("onnx", "imgutils"))
+    cal_steps = calibration_steps_for_hf(cfg, cfg.optimization.calibration_steps)
+    if is_hf_pretrained(cfg.model) and hf_onnx:
+        cal_steps = 0
+        log("Skipping calibration — using pretrained Hugging Face ONNX weights", "info")
+    elif is_hf_pretrained(cfg.model) and cal_steps < cfg.optimization.calibration_steps:
+        log(f"Light calibration ({cal_steps} steps) on top of Hub pretrained weights",
+            "info")
     use_qat = bool(cfg.uses_accelerator and cfg.optimization.quantize
+                   and not hf_onnx
                    and (cfg.optimization.qat or result.quant_scheme == "QAT"))
     if use_qat:
         log("QAT enabled -> training with INT8 fake-quant in the loop "
             "(straight-through estimator)", "step")
-    with Progress(
-        TextColumn("[muted]{task.description}"),
-        BarColumn(complete_style=RPI_GREEN, finished_style=RPI_GREEN),
-        TextColumn("[muted]{task.percentage:>3.0f}%"),
-        TextColumn("[val]loss {task.fields[loss]:.4f}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
-        task = progress.add_task("calibrating", total=cfg.optimization.calibration_steps, loss=1.0)
+    if cal_steps > 0:
+        with Progress(
+            TextColumn("[muted]{task.description}"),
+            BarColumn(complete_style=RPI_GREEN, finished_style=RPI_GREEN),
+            TextColumn("[muted]{task.percentage:>3.0f}%"),
+            TextColumn("[val]loss {task.fields[loss]:.4f}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            task = progress.add_task("calibrating", total=cal_steps, loss=1.0)
 
-        def on_step(i, total, loss):
-            progress.update(task, completed=i, loss=loss)
+            def on_step(i, total, loss):
+                progress.update(task, completed=i, loss=loss)
 
-        pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
-        calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
-                        cfg.output.seed, on_step, qat=use_qat)
+            pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
+            calibrate_multi(model, pairs, cal_steps,
+                            cfg.output.seed, on_step, qat=use_qat)
 
     fp32_out, fwd_ms = run(model, frame.noisy_rgb)
     psnr_fp32 = float(np.mean([psnr(run(model, f.noisy_rgb)[0], f.clean_rgb)
@@ -222,7 +258,7 @@ def main() -> int:
     log(f"FP32 inference complete  ·  forward pass {fwd_ms:.1f} ms (host) "
         f"·  {lbl} {psnr_fp32:.2f} dB", "ok")
 
-    quantized = bool(cfg.uses_accelerator and cfg.optimization.quantize)
+    quantized = bool(cfg.uses_accelerator and cfg.optimization.quantize and not hf_onnx)
     if quantized:
         qmodel = fake_quantize_int8(model)
         int8_out, _ = run(qmodel, frame.noisy_rgb)
@@ -276,7 +312,15 @@ def main() -> int:
     # ===========================================================================
     level_rule(6, "EXPORT  ·  writing hardware-ready artifacts")
     onnx_path = out_dir / "exported_model.onnx"
-    if export_onnx(model, cfg.optimization.patch_size, onnx_path) and onnx_path.exists():
+    if hf_spec and hf_spec.weight_kind == "imgutils" and hf_spec.weight_path.is_file():
+        import shutil
+        shutil.copy2(hf_spec.weight_path, onnx_path)
+        log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
+            f"[Hub ONNX: {hf_spec.weight_path.name}]", "ok")
+    elif hf_spec and copy_hf_onnx(hf_spec, onnx_path):
+        log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
+            f"[Hub ONNX: {hf_spec.weight_path.name}]", "ok")
+    elif export_onnx(model, cfg.optimization.patch_size, onnx_path) and onnx_path.exists():
         log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
             "[FP32 baseline graph]", "ok")
     else:
@@ -293,7 +337,7 @@ def main() -> int:
     try:
         ckpt_path = out_dir / "model.pt"
         torch.save({
-            "state_dict": model.state_dict(),
+            "state_dict": model.state_dict() if hasattr(model, "state_dict") else {},
             "model": {
                 "family": cfg.model.model_family,
                 "base_channels": cfg.model.base_channels,
@@ -303,6 +347,11 @@ def main() -> int:
                 "nafnet_enc": list(cfg.model.nafnet_enc_blocks),
                 "nafnet_middle": cfg.model.nafnet_middle_blocks,
                 "nafnet_dec": list(cfg.model.nafnet_dec_blocks),
+                "hf_model": cfg.model.hf_model,
+                "hf_weight": cfg.model.hf_weight,
+                "hf_onnx": str(hf_spec.weight_path) if hf_spec and hf_spec.weight_kind == "onnx" else None,
+                "hf_imgutils": bool(hf_spec and hf_spec.weight_kind == "imgutils"),
+                "hf_variant": hf_spec.imgutils_variant if hf_spec else None,
             },
             "sensor": cfg.sensor.sensor,
             "gain": cfg.sensor.gain,

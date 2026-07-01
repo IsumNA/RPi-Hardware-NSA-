@@ -44,6 +44,9 @@ class ModelConfig:
     nafnet_enc_blocks: list = field(default_factory=list)   # e.g. [1, 2, 2]
     nafnet_middle_blocks: int = 1
     nafnet_dec_blocks: list = field(default_factory=list)   # e.g. [2, 2, 1]
+    # Frozen Hugging Face Hub model to run (see nsa.hf_runner).
+    hf_model: str | None = None
+    hf_weight: str | None = None   # optional filename inside the snapshot
 
 
 @dataclass
@@ -148,6 +151,36 @@ class Config:
                 raise ConfigError("nafnet_dec_blocks must match the length of nafnet_enc_blocks.")
 
 
+def project_root() -> Path:
+    """Repository root (parent of the ``nsa`` package)."""
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_config_path(path: str | Path, root: Path | None = None) -> Path:
+    """Resolve ``config.yaml`` against the project root, not the process CWD."""
+    root = root or project_root()
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    in_project = root / p
+    if in_project.is_file():
+        return in_project.resolve()
+    if p.is_file():
+        return p.resolve()
+    return in_project
+
+
+def resolve_data_path(path: str | Path | None, root: Path | None = None) -> Path | None:
+    """Anchor relative data paths to the project root."""
+    if not path:
+        return None
+    root = root or project_root()
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = (root / p).resolve()
+    return p
+
+
 def _merge(dc, data: dict) -> None:
     """Assign known dict keys onto a dataclass instance."""
     for key, val in (data or {}).items():
@@ -155,11 +188,13 @@ def _merge(dc, data: dict) -> None:
             setattr(dc, key, val)
 
 
-def load_config(path: str | Path) -> Config:
+def load_config(path: str | Path = "config.yaml") -> Config:
+    """Load ``config.yaml`` only — no dataset auto-detection (see ``finalize_dataset_config``)."""
+    root = project_root()
+    cfg_path = resolve_config_path(path, root)
     raw = {}
-    p = Path(path)
-    if p.exists():
-        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if cfg_path.is_file():
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
 
     cfg = Config()
     cfg.hardware = raw.get("hardware", cfg.hardware)
@@ -169,14 +204,22 @@ def load_config(path: str | Path) -> Config:
     _merge(cfg.optimization, raw.get("optimization", {}))
     _merge(cfg.output, raw.get("output", {}))
     _merge(cfg.run, raw.get("run", {}))
-    try:
-        from nsa.denoise_hw_data import apply_auto_dataset
-        project = Path(__file__).resolve().parents[1]
-        if cfg.sensor.real_capture:
-            apply_auto_dataset(cfg, project)
-    except Exception:
-        pass
+
+    if cfg.sensor.dataset_path:
+        resolved = resolve_data_path(cfg.sensor.dataset_path, root)
+        if resolved is not None:
+            cfg.sensor.dataset_path = str(resolved)
+    if cfg.sensor.input_raw:
+        resolved = resolve_data_path(cfg.sensor.input_raw, root)
+        if resolved is not None:
+            cfg.sensor.input_raw = str(resolved)
     return cfg
+
+
+def finalize_dataset_config(cfg: Config, root: Path | None = None) -> bool:
+    """After YAML + CLI overrides: resolve dataset path without overriding user intent."""
+    from nsa.denoise_hw_data import finalize_dataset_config as _finalize
+    return _finalize(cfg, root or project_root())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -228,6 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="build a transferable hardware deployment package (.zip) at the end")
     p.add_argument("--no-window", action="store_true", help="do not open the validation window")
     p.add_argument("--seed", type=int)
+    p.add_argument("--hf-model", dest="hf_model",
+                   help="frozen Hugging Face model id to run (downloads snapshot if needed)")
+    p.add_argument("--hf-weight", dest="hf_weight",
+                   help="specific weight file inside the Hub snapshot (e.g. NAFNet-SIDD-width64.onnx)")
     return p
 
 
@@ -250,6 +297,10 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.model.nafnet_middle_blocks = int(args.nafnet_middle)
     if getattr(args, "nafnet_dec", None):
         cfg.model.nafnet_dec_blocks = list(args.nafnet_dec)
+    if getattr(args, "hf_model", None):
+        cfg.model.hf_model = args.hf_model
+    if getattr(args, "hf_weight", None):
+        cfg.model.hf_weight = args.hf_weight
     if args.sensor:
         cfg.sensor.sensor = args.sensor
     if args.input_raw:

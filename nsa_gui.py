@@ -150,6 +150,7 @@ SENSOR_CARDS = [
 # ready-made list of denoising / low-light / restoration models without the user
 # having to think up a search query. (label -> search query, pipeline tag).
 HF_CATEGORIES = [
+    ("NAFNet restoration (recommended)", "deepghs image_restoration", "image-to-image"),
     ("Low-light enhancement", "low-light", "image-to-image"),
     ("Image denoising", "denoise", "image-to-image"),
     ("Image restoration", "restoration", "image-to-image"),
@@ -206,7 +207,11 @@ class RoundButton(tk.Canvas):
     """Flat rounded button matching the Imager's primary/secondary styles."""
 
     def __init__(self, parent, text, command, kind="primary", width=170, height=44):
-        w, h = S(width), S(height)
+        self._is_hero = kind == "hero"
+        if self._is_hero:
+            w, h = S(width if width != 170 else 300), S(height if height != 44 else 58)
+        else:
+            w, h = S(width), S(height)
         super().__init__(parent, width=w, height=h, bg=parent["bg"],
                          highlightthickness=0, bd=0)
         self.command = command
@@ -220,6 +225,11 @@ class RoundButton(tk.Canvas):
         self._draw()
 
     def _palette(self, hover):
+        if self.kind == "hero":
+            fill = RASPBERRY_DK if hover else RASPBERRY
+            if not self._enabled:
+                fill = "#E2A9B8"
+            return fill, RASPBERRY_DK, "white"
         if self.kind == "primary":
             fill = RASPBERRY_DK if hover else RASPBERRY
             if not self._enabled:
@@ -230,11 +240,13 @@ class RoundButton(tk.Canvas):
     def _draw(self, hover=False):
         self.delete("all")
         fill, border, fg = self._palette(hover)
-        r = self.h // 2
+        r = self.h * 2 // 5 if self._is_hero else self.h // 2
+        outline = 2.5 if self._is_hero else 1.5
         self.create_polygon(_round_points(2, 2, self.w - 2, self.h - 2, r),
-                            smooth=True, fill=fill, outline=border, width=1.5)
+                            smooth=True, fill=fill, outline=border, width=outline)
+        fsize = 13 if self._is_hero else 11
         self.create_text(self.w / 2, self.h / 2, text=self.text, fill=fg,
-                        font=font(11, "bold"))
+                        font=font(fsize, "bold"))
 
     def _click(self, _e):
         if self._enabled and self.command:
@@ -877,6 +889,8 @@ class App(tk.Tk):
         self.input_raw = None
         self.dataset_path = None
         self.upload_files = []
+        self.hf_model_id = None
+        self.hf_weight = None
 
         self._build_chrome()
 
@@ -1042,6 +1056,7 @@ class App(tk.Tk):
         self.qat_var = tk.BooleanVar(value=False)
         self.eval_var = tk.StringVar(value="single")     # single | sweep
         self.all_sensors_var = tk.BooleanVar(value=False)
+        self._nafnet_topo = {"enc": "", "mid": "", "dec": ""}
 
         # Wizard chrome: a header (step indicator) + a content area + nav footer.
         self._wiz_header = tk.Frame(self.main, bg=WHITE)
@@ -1083,14 +1098,29 @@ class App(tk.Tk):
             self._steps.append({"key": key, "title": title,
                                 "subtitle": subtitle, "holder": holder})
 
-        # Initialise dependent UI state, then show the first step.
+        self._home = tk.Frame(self.content, bg=WHITE)
+        home_body = self._make_scrollable(self._home)
+        tk.Label(home_body, text="Compile with your current settings",
+                 bg=WHITE, fg=INK, font=font(15, "bold")).pack(anchor="w",
+                                                                pady=(S(4), S(2)))
+        tk.Label(home_body,
+                 text="     Uses config.yaml plus the defaults below. "
+                      "Press Edit Config to walk through every option.",
+                 bg=WHITE, fg=SUBTLE, font=font(10), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(12)))
+        self._home_summary = tk.Frame(home_body, bg=WHITE)
+        self._home_summary.pack(fill="x")
+
+        # Initialise dependent UI state, then show the quick-run home screen.
+        self._wizard_mode = "home"
         self._apply_denoise_hw_defaults()
         self._step = 0
         self._on_sensor_change()
         self._on_mode_change()
         self._on_source_change()
         self._on_eval_change()
-        self._goto_step(0)
+        self.eval_var.set("single")
+        self._show_home()
 
     # -- Individual wizard steps ---------------------------------------------
     def _step_eval(self, body):
@@ -1234,17 +1264,19 @@ class App(tk.Tk):
 
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(14), 0))
         self._section(body, "EXTERNAL MODELS · HUGGING FACE HUB")
-        tk.Label(body, text="     Source a pretrained model the safe way: filter to "
-                 "Apache-2.0 / MIT licenses, benchmark a small model first, step up "
-                 "only if the accuracy gap justifies the compute, then freeze the "
-                 "exact commit hash so production never drifts. (Discovery + "
-                 "license-vetting + freeze — the on-device compile above stays with "
-                 "the built-in denoisers.)",
+        tk.Label(body, text="     Source pretrained denoisers from the Hub (Apache-2.0 / "
+                 "MIT only). Search, freeze the commit SHA, then click "
+                 "DOWNLOAD & USE — the next RUN COMPILE will load those weights "
+                 "(ONNX or PyTorch) instead of training from scratch.",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(6)))
         hf_row = tk.Frame(body, bg=WHITE); hf_row.pack(fill="x", pady=S(4))
         RoundButton(hf_row, "BROWSE HUGGING FACE", self._hf_browser,
                     kind="secondary", width=220, height=38).pack(side="left")
+        self.hf_active_lbl = tk.Label(hf_row, text="", bg=WHITE, fg=GREEN,
+                                      font=font(9), wraplength=S(320), justify="left")
+        self.hf_active_lbl.pack(side="left", padx=(S(12), 0))
+        self._refresh_hf_active_label()
 
     def _step_hw(self, body):
         self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
@@ -1306,8 +1338,69 @@ class App(tk.Tk):
                  justify="left").pack(anchor="w", pady=(S(10), 0))
 
     # -- Wizard navigation ----------------------------------------------------
+    def _show_home(self):
+        """Quick-run landing: prominent Run, optional full config wizard."""
+        self._wizard_mode = "home"
+        self.eval_var.set("single")
+        for st in self._steps:
+            st["holder"].pack_forget()
+        self._home.pack(fill="both", expand=True)
+        self._refresh_home_summary()
+        self._render_wiz_header()
+        self._render_nav()
+        try:
+            self.sidebar.reset()
+        except Exception:
+            pass
+
+    def _enter_config_wizard(self):
+        self._wizard_mode = "steps"
+        self._home.pack_forget()
+        self._goto_step(0)
+
+    def _refresh_home_summary(self):
+        if not hasattr(self, "_home_summary"):
+            return
+        for w in self._home_summary.winfo_children():
+            w.destroy()
+        for label, val, col in self._config_summary_rows():
+            rr = tk.Frame(self._home_summary, bg=WHITE)
+            rr.pack(fill="x", pady=S(4))
+            tk.Label(rr, text=label, bg=WHITE, fg=SUBTLE, font=font(10),
+                     width=16, anchor="w").pack(side="left")
+            tk.Label(rr, text=val, bg=WHITE, fg=col, font=font(11, "bold"),
+                     wraplength=S(420), justify="left").pack(side="left")
+
+    def _config_summary_rows(self):
+        """Key/value lines for the home screen and review step."""
+        sensor_key = self._row_get("sensor", "imx219")
+        sensor_card = next((c for c in SENSOR_CARDS if c["key"] == sensor_key), None)
+        sensor_name = sensor_card["name"] if sensor_card else sensor_key
+        hw_key = self._row_get("hardware", "hailo8")
+        hw_name = {"rpi5_cpu": "Raspberry Pi 5 (CPU)", "hailo8": "Pi 5 + Hailo-8",
+                   "deepx": "DeepX DX-M1"}.get(hw_key, hw_key)
+        fam = self._row_get("model_family", "nafnet")
+        model_txt = (f"{fam.upper()}  {self._row_get('base_channels','32')}ch × "
+                     f"depth {self._row_get('block_depth','4')}")
+        src = "Real captures" if self.source_var.get() == "real" else "Simulated physics"
+        mode = {"single": "Single frame", "batch": "Batch folder",
+                "temporal": "Temporal video"}.get(self.mode_var.get(), self.mode_var.get())
+        q = ("INT8 PTQ" + (" + QAT" if self.qat_var.get() else "")
+             if self.quantize_var.get() else "off")
+        return [
+            ("Image sensor", f"{sensor_name}  @{self._row_get('gain','512')}×", RASPBERRY),
+            ("Capture source", src, INK),
+            ("Run mode", mode, INK),
+            ("Model", model_txt, INK),
+            ("Target chip", hw_name, INK),
+            ("Calibration", f"{self._row_get('steps','160')} steps · quant {q}", INK),
+        ]
+
     def _goto_step(self, i):
         i = max(0, min(i, len(self._steps) - 1))
+        self._wizard_mode = "steps"
+        if hasattr(self, "_home"):
+            self._home.pack_forget()
         self._step = i
         for j, st in enumerate(self._steps):
             if j == i:
@@ -1326,6 +1419,15 @@ class App(tk.Tk):
     def _render_wiz_header(self):
         for w in self._wiz_header.winfo_children():
             w.destroy()
+        if getattr(self, "_wizard_mode", "home") == "home":
+            tk.Label(self._wiz_header, text="READY", bg=WHITE, fg=RASPBERRY,
+                     font=font(9, "bold")).pack(anchor="w")
+            tk.Label(self._wiz_header, text="Neural Architecture Search",
+                     bg=WHITE, fg=INK, font=font(19, "bold")).pack(anchor="w")
+            tk.Label(self._wiz_header,
+                     text="One click to compile with config.yaml — or edit first.",
+                     bg=WHITE, fg=SUBTLE, font=font(10)).pack(anchor="w", pady=(S(2), 0))
+            return
         st = self._steps[self._step]
         tk.Label(self._wiz_header, text=f"STEP {self._step + 1} OF "
                  f"{len(self._steps)}", bg=WHITE, fg=RASPBERRY,
@@ -1338,15 +1440,29 @@ class App(tk.Tk):
     def _render_nav(self):
         for w in self._nav.winfo_children():
             w.destroy()
+        if getattr(self, "_wizard_mode", "home") == "home":
+            RoundButton(self._nav, "APP OPTIONS", self._app_options, kind="secondary",
+                        width=140, height=44).pack(side="left")
+            RoundButton(self._nav, "HISTORY", self._show_history, kind="secondary",
+                        width=120, height=44).pack(side="left", padx=(S(8), 0))
+            RoundButton(self._nav, "EDIT CONFIG", self._enter_config_wizard,
+                        kind="secondary", width=150, height=44).pack(side="right",
+                                                                     padx=(S(8), 0))
+            self.run_btn = RoundButton(self._nav, "▶  RUN COMPILE", self._run,
+                                       kind="hero", width=300, height=58)
+            self.run_btn.pack(side="right")
+            return
         RoundButton(self._nav, "APP OPTIONS", self._app_options, kind="secondary",
                     width=140, height=44).pack(side="left")
         if self._step == 0:
-            RoundButton(self._nav, "HISTORY", self._show_history, kind="secondary",
+            RoundButton(self._nav, "◀ HOME", self._show_home, kind="secondary",
                         width=120, height=44).pack(side="left", padx=(S(8), 0))
-        if self._step > 0:
+        elif self._step > 0:
             RoundButton(self._nav, "◀ BACK", lambda: self._goto_step(self._step - 1),
                         kind="secondary", width=120,
                         height=44).pack(side="left", padx=(S(8), 0))
+        RoundButton(self._nav, "HISTORY", self._show_history, kind="secondary",
+                    width=120, height=44).pack(side="left", padx=(S(8), 0))
         last = self._step == len(self._steps) - 1
         if last:
             label = "RUN SWEEP" if self.eval_var.get() == "sweep" else "RUN COMPILE"
@@ -1363,38 +1479,32 @@ class App(tk.Tk):
         for w in self._review_box.winfo_children():
             w.destroy()
         sweep = self.eval_var.get() == "sweep"
-        fam = self._row_get("model_family", "nafnet")
-        sensor_key = self._row_get("sensor", "imx662")
-        sensor_card = next((c for c in SENSOR_CARDS if c["key"] == sensor_key), None)
-        sensor_name = sensor_card["name"] if sensor_card else sensor_key
         if sweep and self.all_sensors_var.get():
             sensor_name = "All profiles (IMX219 · IMX662 · IMX-NG)"
-        hw_key = self._row_get("hardware", "hailo8")
-        hw_name = {"rpi5_cpu": "Raspberry Pi 5 (CPU)", "hailo8": "Pi 5 + Hailo-8",
-                   "deepx": "DeepX DX-M1"}.get(hw_key, hw_key)
+        else:
+            sensor_key = self._row_get("sensor", "imx219")
+            sensor_card = next((c for c in SENSOR_CARDS if c["key"] == sensor_key), None)
+            sensor_name = sensor_card["name"] if sensor_card else sensor_key
+        goal = ("Sweep & rank all 9 model families" if sweep
+                else "Compile one specific model")
+        fam = self._row_get("model_family", "nafnet")
         if sweep:
-            goal = "Sweep & rank all 9 model families"
             model_txt = (f"swept · width {self._row_get('base_channels','32')}ch, "
                          f"depth varies")
         else:
-            goal = "Compile one specific model"
             model_txt = (f"{fam.upper()}  {self._row_get('base_channels','32')}ch × "
                          f"depth {self._row_get('block_depth','4')}")
-        src = "Real captures" if self.source_var.get() == "real" else "Simulated physics"
-        mode = {"single": "Single frame", "batch": "Batch folder",
-                "temporal": "Temporal video"}.get(self.mode_var.get(), self.mode_var.get())
-        q = "INT8 PTQ" + (" + QAT" if self.qat_var.get() else "") if self.quantize_var.get() else "off"
-
-        rows = [
-            ("Goal", goal, RASPBERRY),
-            ("Image sensor", f"{sensor_name}  @{self._row_get('gain','512')}×", INK),
-            ("Capture source", src, INK),
-            ("Run mode", mode, INK),
-            ("Model", model_txt, INK),
-            ("Target chip", hw_name, INK),
-            ("Calibration", f"{self._row_get('steps','160')} steps  ·  "
-             f"quant {q}", INK),
-        ]
+        rows = [("Goal", goal, RASPBERRY)]
+        for row in self._config_summary_rows():
+            if row[0] == "Model":
+                rows.append(("Model", model_txt, INK))
+            elif row[0] != "Image sensor" or not sweep:
+                rows.append(row)
+        if sweep and self.all_sensors_var.get():
+            for i, row in enumerate(rows):
+                if row[0] == "Image sensor":
+                    rows[i] = ("Image sensor", sensor_name, RASPBERRY)
+                    break
         for label, val, col in rows:
             rr = tk.Frame(self._review_box, bg=WHITE); rr.pack(fill="x", pady=S(3))
             tk.Label(rr, text=label, bg=WHITE, fg=SUBTLE, font=font(10),
@@ -1410,19 +1520,46 @@ class App(tk.Tk):
         # Buttons are (re)created per step by _render_nav().
 
     def _apply_denoise_hw_defaults(self):
-        """Use denoise-hw PI_RAW when config.yaml or datasets/PI_RAW is present."""
+        """Load config.yaml into the form so quick-run uses the right defaults."""
         try:
-            from nsa.config import load_config
+            from nsa.config import finalize_dataset_config, load_config, project_root
             from nsa.denoise_hw_data import ensure_project_dataset
             ensure_project_dataset(ROOT)
             cfg = load_config(ROOT / "config.yaml")
+            finalize_dataset_config(cfg, ROOT)
+
+            if cfg.hardware and "hardware" in self.rows:
+                self.rows["hardware"].set(cfg.hardware)
+            if cfg.model.model_family and "model_family" in self.rows:
+                self.rows["model_family"].set(cfg.model.model_family)
+            enc_blocks = list(cfg.model.nafnet_enc_blocks or [])
+            self._write_nafnet_topo(
+                " ".join(str(x) for x in enc_blocks),
+                str(cfg.model.nafnet_middle_blocks or "") if enc_blocks else "",
+                " ".join(str(x) for x in (cfg.model.nafnet_dec_blocks or [])),
+            )
+            if "model_family" in self.rows:
+                self._render_model_options()
+            for key, val in (
+                ("base_channels", cfg.model.base_channels),
+                ("block_depth", cfg.model.block_depth),
+                ("conv_type", cfg.model.conv_type),
+                ("activation", cfg.model.activation),
+                ("gain", cfg.sensor.gain),
+                ("steps", cfg.optimization.calibration_steps),
+                ("frames", cfg.data.temporal_frames),
+            ):
+                if key in self.rows and val is not None:
+                    self.rows[key].set(val)
+            self.quantize_var.set(cfg.optimization.quantize)
+            self.qat_var.set(cfg.optimization.qat)
+            self.mode_var.set(cfg.run.mode)
             if cfg.sensor.real_capture:
                 self.source_var.set("real")
+            else:
+                self.source_var.set("sim")
             if cfg.sensor.dataset_path:
-                self.dataset_path = str(
-                    (ROOT / cfg.sensor.dataset_path).resolve()
-                    if not Path(cfg.sensor.dataset_path).is_absolute()
-                    else Path(cfg.sensor.dataset_path))
+                self.dataset_path = cfg.sensor.dataset_path
             if cfg.sensor.filter and hasattr(self, "filter_var"):
                 self.filter_var.set(" ".join(cfg.sensor.filter))
             if cfg.sensor.sensor and "sensor" in self.rows:
@@ -1433,6 +1570,8 @@ class App(tk.Tk):
                 self.dataset_label.config(text=str(label), fg=SUBTLE)
             self._on_source_change()
             self._on_sensor_change()
+            if hasattr(self, "_home_summary"):
+                self._refresh_home_summary()
         except Exception:
             pass
 
@@ -1478,6 +1617,37 @@ class App(tk.Tk):
         except tk.TclError:
             win.after(40, lambda: self._grab_when_ready(win))
 
+    def _read_nafnet_topo(self) -> tuple[str, str, str]:
+        """NAFNet topology strings (enc / mid / dec) from widgets or cached defaults."""
+        if hasattr(self, "naf_enc_var"):
+            return (
+                (self.naf_enc_var.get() or "").strip(),
+                (self.naf_mid_var.get() or "").strip(),
+                (self.naf_dec_var.get() or "").strip(),
+            )
+        t = getattr(self, "_nafnet_topo", {"enc": "", "mid": "", "dec": ""})
+        return t["enc"], t["mid"], t["dec"]
+
+    def _write_nafnet_topo(self, enc: str, mid: str, dec: str) -> None:
+        self._nafnet_topo = {"enc": enc, "mid": mid, "dec": dec}
+        if hasattr(self, "naf_enc_var"):
+            self.naf_enc_var.set(enc)
+            self.naf_mid_var.set(mid)
+            self.naf_dec_var.set(dec)
+
+    def _append_nafnet_cli_args(self, cmd: list) -> None:
+        if self._row_get("model_family", "") != "nafnet":
+            return
+        enc_s, mid_s, dec_s = self._read_nafnet_topo()
+        enc = enc_s.split()
+        dec = dec_s.split()
+        if enc and all(t.isdigit() for t in enc):
+            cmd += ["--nafnet-enc", *enc]
+            if mid_s.isdigit():
+                cmd += ["--nafnet-middle", mid_s]
+            if dec and all(t.isdigit() for t in dec):
+                cmd += ["--nafnet-dec", *dec]
+
     def _on_family_change(self):
         self._render_model_options()
 
@@ -1491,6 +1661,12 @@ class App(tk.Tk):
         prev = {k: self.rows[k].get()
                 for k in ("base_channels", "block_depth", "conv_type", "activation")
                 if k in self.rows}
+        if hasattr(self, "naf_enc_var"):
+            self._write_nafnet_topo(
+                self.naf_enc_var.get() or "",
+                self.naf_mid_var.get() or "",
+                self.naf_dec_var.get() or "",
+            )
         for w in self.model_box.winfo_children():
             w.destroy()
         for k in ("base_channels", "block_depth", "conv_type", "activation"):
@@ -1500,6 +1676,7 @@ class App(tk.Tk):
                 delattr(self, attr)
 
         fam = self.rows["model_family"].get()
+        topo = getattr(self, "_nafnet_topo", {"enc": "", "mid": "", "dec": ""})
 
         def cfgrow(key, title, desc, values, default):
             r = ConfigRow(self.model_box, title, desc, values, default)
@@ -1535,13 +1712,13 @@ class App(tk.Tk):
                      justify="left").pack(anchor="w", pady=(S(2), 0))
             self.naf_enc_var = self._entry_row(
                 self.model_box, "naf_enc", "NAFNet Encoders",
-                "Per-level encoder block counts, e.g. 1 2 2", "")
+                "Per-level encoder block counts, e.g. 1 2 2", topo["enc"])
             self.naf_mid_var = self._entry_row(
                 self.model_box, "naf_mid", "NAFNet Middle",
-                "Bottleneck block count, e.g. 4", "")
+                "Bottleneck block count, e.g. 4", topo["mid"])
             self.naf_dec_var = self._entry_row(
                 self.model_box, "naf_dec", "NAFNet Decoders",
-                "Per-level decoder block counts, e.g. 2 2 1", "")
+                "Per-level decoder block counts, e.g. 2 2 1", topo["dec"])
         elif fam == "restormer":
             tk.Label(self.model_box,
                      text="     Restormer uses LayerNorm + transposed self-attention "
@@ -1801,16 +1978,7 @@ class App(tk.Tk):
             cmd += ["--burst", bu if bu.isdigit() else "8"]
 
         # Custom NAFNet topology (nafnet family only).
-        if self.rows["model_family"].get() == "nafnet":
-            enc = (self.naf_enc_var.get() or "").split()
-            mid = (self.naf_mid_var.get() or "").strip()
-            dec = (self.naf_dec_var.get() or "").split()
-            if enc and all(t.isdigit() for t in enc):
-                cmd += ["--nafnet-enc", *enc]
-                if mid.isdigit():
-                    cmd += ["--nafnet-middle", mid]
-                if dec and all(t.isdigit() for t in dec):
-                    cmd += ["--nafnet-dec", *dec]
+        self._append_nafnet_cli_args(cmd)
 
         if self.source_var.get() == "real":
             cmd += ["--real"]
@@ -1829,6 +1997,10 @@ class App(tk.Tk):
 
         if self.input_raw:
             cmd += ["--input-raw", self.input_raw]
+        if self.hf_model_id:
+            cmd += ["--hf-model", self.hf_model_id]
+            if self.hf_weight:
+                cmd += ["--hf-weight", self.hf_weight]
         return cmd
 
     def _build_sweep_command(self):
@@ -1886,6 +2058,24 @@ class App(tk.Tk):
                           "Scanning the dataset into detail-scored patches")
 
     # -- Hugging Face Hub browser -------------------------------------------
+    def _refresh_hf_active_label(self):
+        if not hasattr(self, "hf_active_lbl"):
+            return
+        if self.hf_model_id:
+            txt = f"Active: {self.hf_model_id}"
+            if self.hf_weight:
+                txt += f" · {self.hf_weight}"
+            self.hf_active_lbl.config(text=txt, fg=GREEN)
+        else:
+            self.hf_active_lbl.config(
+                text="No Hub model — built-in arch trains from scratch.",
+                fg=SUBTLE)
+
+    def _hf_clear_selection(self):
+        self.hf_model_id = None
+        self.hf_weight = None
+        self._refresh_hf_active_label()
+
     def _hf_browser(self):
         try:
             from nsa import hub  # noqa: F401
@@ -2039,8 +2229,8 @@ class App(tk.Tk):
             self._hf_rows = payload
             self._hf_render_results()
             self._hf_set_status(
-                f"{len(payload)} license-safe model(s). Click FREEZE to lock one's "
-                f"exact commit." if payload else
+                f"{len(payload)} license-safe model(s). "
+                f"Click DOWNLOAD & USE to run one in compile." if payload else
                 "No models in this category for that license/size — try another "
                 "Category, Size = any, or License = Both.",
                 GREEN if payload else AMBER)
@@ -2053,8 +2243,28 @@ class App(tk.Tk):
             e = payload
             self._hf_set_status(
                 f"Froze {e['id']} @ {e['sha'][:12]} · {e['license']} · "
-                f"{e['params_human']}. Production now pinned to this SHA.", GREEN)
+                f"{e['params_human']}. Click DOWNLOAD & USE to run it.", GREEN)
             self._hf_render_results()
+        elif kind == "use_ok":
+            self._hf_busy = False
+            e, weight = payload
+            self.hf_model_id = e["id"]
+            self.hf_weight = weight
+            self._refresh_hf_active_label()
+            self._hf_set_status(
+                f"Ready to compile: {e['id']}"
+                + (f" · {weight}" if weight else ""), GREEN)
+            try:
+                messagebox.showinfo(
+                    "Hugging Face",
+                    f"Hub model set for the next compile:\n\n{e['id']}\n"
+                    f"{('Weight: ' + weight) if weight else ''}\n\n"
+                    "Click RUN COMPILE (home or results) to load these weights.")
+            except Exception:
+                pass
+        elif kind == "use_err":
+            self._hf_busy = False
+            self._hf_set_status(payload, RASPBERRY)
         elif kind == "freeze_err":
             self._hf_busy = False
             self._hf_set_status(payload, RASPBERRY)
@@ -2089,7 +2299,34 @@ class App(tk.Tk):
                          font=font(8, "bold")).pack(side="left", padx=(S(4), 0))
             else:
                 RoundButton(row, "FREEZE", lambda rr=r: self._hf_freeze(rr),
-                            kind="secondary", width=92, height=30).pack(side="left")
+                            kind="secondary", width=72, height=30).pack(side="left")
+            RoundButton(row, "DOWNLOAD & USE", lambda rr=r: self._hf_download_use(rr),
+                        kind="primary", width=130, height=30).pack(side="left", padx=(S(4), 0))
+
+    def _hf_download_use(self, r):
+        if self._hf_busy:
+            return
+        from nsa import hub
+        from nsa.hf_runner import pick_weight_file
+        mid = r.get("id")
+        fam = self._row_get("model_family", "nafnet")
+        self._hf_busy = True
+        self._hf_set_status(f"Downloading {mid} — fetching pinned snapshot…", RASPBERRY)
+
+        def work():
+            try:
+                e = hub.freeze_model(mid, lock_path=self._hf_lock, download=True)
+                files = []
+                if e.get("local_path"):
+                    from pathlib import Path
+                    files = [p.name for p in Path(e["local_path"]).rglob("*") if p.is_file()]
+                if not files:
+                    files = hub.model_details(mid).get("files") or []
+                weight = pick_weight_file(files, family=fam, hint=mid)
+                self._hf_q.put(("use_ok", e, weight))
+            except Exception as exc:  # noqa: BLE001
+                self._hf_q.put(("use_err", f"Download failed: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
 
     def _hf_freeze(self, r):
         if self._hf_busy:
