@@ -2872,7 +2872,8 @@ class App(tk.Tk):
         lat_rows = [r for r in rows if _num(r, "latency_ms") is not None]
         par_rows = [r for r in rows if _num(r, "params") is not None]
         if psnr_rows:
-            tags["sharp"] = id(max(psnr_rows, key=lambda r: r["psnr"]))
+            tags["sharp"] = id(max(psnr_rows,
+                                    key=lambda r: r.get("psnr_gain", r.get("psnr", 0))))
         if lat_rows:
             tags["fast"] = id(min(lat_rows, key=lambda r: r["latency_ms"]))
         if par_rows:
@@ -2902,10 +2903,11 @@ class App(tk.Tk):
         flt = self._rank_filter
         chip_mode = flt != "all" and self._rank_have_chips
         multi_sensor = len({r.get("sensor") for r in rows if r.get("sensor")}) > 1
-        # When the sensor column is shown, trim others so the row still fits.
         sensor_col = [("SENSOR", 6)] if multi_sensor else []
-        mw = 12 if multi_sensor else 14
-        sw = 8 if multi_sensor else 10
+        have_gain = any(r.get("psnr_gain") is not None for r in rows)
+        gain_col = [("GAIN", 7)] if have_gain else []
+        mw = 11 if (multi_sensor or have_gain) else 14
+        sw = 7 if (multi_sensor or have_gain) else 10
 
         if chip_mode:
             def _key(r):
@@ -2914,13 +2916,13 @@ class App(tk.Tk):
                 return (vr, -float(r.get("fitness", 0)))
             rows.sort(key=_key)
             cols = ([("#", 3), ("MODEL", mw)] + sensor_col +
-                    [("PARAMS", 7), ("PSNR", 8), ("FPS", 6), ("FIT", 6),
+                    [("PARAMS", 7)] + gain_col + [("PSNR", 7), ("FPS", 6), ("FIT", 6),
                      (f"ON {CHIP_LABEL[flt]}", 11), ("STANDOUT", sw)])
         else:
             rows.sort(key=lambda r: -float(r.get("fitness", 0)))
             cols = ([("#", 3), ("MODEL", mw)] + sensor_col +
-                    [("PARAMS", 7), ("PSNR", 8), ("LATENCY", 9), ("FIT", 6),
-                     ("RATING", 8), ("STANDOUT", sw)])
+                    [("PARAMS", 7)] + gain_col + [("PSNR", 7), ("LATENCY", 8), ("FIT", 6),
+                     ("RATING", 7), ("STANDOUT", sw)])
 
         if chip_mode:
             tk.Label(holder, text=f"Ranked by suitability for "
@@ -2945,6 +2947,16 @@ class App(tk.Tk):
             why, why_col = self._why_tag(r, standouts)
             sensor_cell = ([(SENSOR_SHORT.get(r.get("sensor"), r.get("sensor", "—")),
                              7, SUBTLE, False)] if multi_sensor else [])
+            gain = r.get("psnr_gain")
+            if gain is None and r.get("psnr_in") is not None and r.get("psnr") is not None:
+                gain = float(r["psnr"]) - float(r["psnr_in"])
+            if gain is not None:
+                gain_txt = f"+{gain:.1f}" if gain >= 0 else f"{gain:.1f}"
+                gain_col = (f"{gain_txt} dB", 7,
+                            GREEN if gain >= 8 else AMBER if gain >= 3 else RASPBERRY,
+                            gain >= 3)
+            else:
+                gain_col = None
 
             if chip_mode:
                 c = (r.get("chips") or {}).get(flt, {})
@@ -2958,7 +2970,8 @@ class App(tk.Tk):
                     (star + model, mw, RASPBERRY if best else INK, False),
                 ] + sensor_cell + [
                     (f"{r.get('params',0)/1000:.1f}K", 7, SUBTLE, False),
-                    (f"{r.get('psnr','—')} dB", 8, INK, False),
+                ] + ([gain_col] if gain_col else []) + [
+                    (f"{r.get('psnr','—')} dB", 7, INK, False),
                     (fps_txt, 6, INK, False),
                     (f"{r.get('fitness','—')}", 6, GRADE_COLORS.get(g, INK), False),
                     (vlabel, 11, vcol, True),
@@ -2970,8 +2983,9 @@ class App(tk.Tk):
                     (star + model, mw, RASPBERRY if best else INK, False),
                 ] + sensor_cell + [
                     (f"{r.get('params',0)/1000:.1f}K", 7, SUBTLE, False),
-                    (f"{r.get('psnr','—')} dB", 8, INK, False),
-                    (f"{r.get('latency_ms','—')} ms", 9, SUBTLE, False),
+                ] + ([gain_col] if gain_col else []) + [
+                    (f"{r.get('psnr','—')} dB", 7, INK, False),
+                    (f"{r.get('latency_ms','—')} ms", 8, SUBTLE, False),
                     (f"{r.get('fitness','—')}", 6, GRADE_COLORS.get(g, INK), False),
                     (g, 8, GRADE_COLORS.get(g, INK), True),
                     (why, sw, why_col, True),

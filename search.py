@@ -84,6 +84,7 @@ class SearchResult:
     conv_type: str
     activation: str
     psnr_out: float
+    psnr_in: float
     latency_ms: float
     quant_drop: float
     fitness: float
@@ -179,6 +180,7 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
     calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
                     cfg.output.seed, progress=None)
 
+    psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
     psnr_fp32 = float(np.mean(
         [psnr(run(model, f.noisy_rgb)[0], f.clean_rgb) for f in frames]
     ))
@@ -203,7 +205,8 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
     weight_kb = n_params / 1024.0 if quantized else n_params * 4 / 1024.0
     fit = compute_fitness(final_psnr, latency_ms, quant_drop,
                           weight_kb=weight_kb, act_kb=result.est_sram_kb,
-                          sram_budget_kb=result.sram_budget_kb)
+                          sram_budget_kb=result.sram_budget_kb,
+                          psnr_in=psnr_in)
 
     # Cross-chip suitability for this exact trained model (RPi5/Hailo-8/DeepX).
     chips: dict = {}
@@ -229,6 +232,7 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         conv_type=cfg.model.conv_type,
         activation=cfg.model.activation,
         psnr_out=final_psnr,
+        psnr_in=psnr_in,
         latency_ms=latency_ms,
         quant_drop=quant_drop,
         fitness=fit.score,
@@ -241,11 +245,17 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
 
 
 def _pareto_front(results: list[SearchResult]) -> list[SearchResult]:
-    """Non-dominated set maximizing PSNR while minimizing latency & params."""
+    """Non-dominated set maximizing PSNR while minimizing latency & params.
+
+    Models that fail to meaningfully denoise (< 2 dB gain) are excluded from the
+    front so fast no-op configs do not pollute the trade-off curve.
+    """
+    viable = [r for r in results if (r.psnr_out - r.psnr_in) >= 2.0]
+    pool = viable if viable else results
     front = []
-    for r in results:
+    for r in pool:
         dominated = False
-        for o in results:
+        for o in pool:
             if o is r:
                 continue
             better_eq = (o.psnr_out >= r.psnr_out and o.latency_ms <= r.latency_ms
@@ -267,12 +277,16 @@ def _save_pareto(results: list[SearchResult], front: list[SearchResult],
     out.mkdir(parents=True, exist_ok=True)
 
     def _row(r: SearchResult) -> dict:
+        gain = round(r.psnr_out - r.psnr_in, 2)
         return {
             "family": r.model_family, "sensor": r.sensor,
             "base_channels": r.base_channels,
             "block_depth": r.block_depth, "conv_type": r.conv_type,
             "activation": r.activation, "params": r.n_params,
-            "psnr": round(r.psnr_out, 2), "latency_ms": round(r.latency_ms, 1),
+            "psnr": round(r.psnr_out, 2),
+            "psnr_in": round(r.psnr_in, 2),
+            "psnr_gain": gain,
+            "latency_ms": round(r.latency_ms, 1),
             "fitness": r.fitness, "grade": r.grade,
             "pareto": r in front,
             "chips": r.chips or {},
@@ -317,6 +331,7 @@ def _results_table(results: list[SearchResult], title: str = "Search Results",
     tbl.add_column("Act",     style=_MUTED,   width=6)
     tbl.add_column("Params",  style=_MUTED,   width=8,  justify="right")
     tbl.add_column("PSNR",    style="bold",   width=8,  justify="right")
+    tbl.add_column("Gain",    style=_MUTED,   width=8,  justify="right")
     tbl.add_column("Latency", style=_MUTED,   width=10, justify="right")
     tbl.add_column("Fitness", style="bold",   width=9,  justify="right")
     tbl.add_column("Grade",   width=11)
@@ -333,6 +348,7 @@ def _results_table(results: list[SearchResult], title: str = "Search Results",
             r.activation,
             f"{r.n_params/1000:.1f}K",
             f"{r.psnr_out:.1f} dB",
+            f"+{r.psnr_out - r.psnr_in:.1f} dB",
             f"{r.latency_ms:.1f} ms",
             Text(f"{r.fitness:.1f}", style=f"bold {gc}"),
             Text(f"{r.grade}{warn_marker}", style=gc),
@@ -603,6 +619,7 @@ def main() -> int:
         + (f"  ·  sensor [bold]{winner.sensor}[/]" if args.all_sensors else "")
         + "\n\n"
         f"  PSNR  [bold]{winner.psnr_out:.1f} dB[/]   "
+        f"Gain  [bold]+{winner.psnr_out - winner.psnr_in:.1f} dB[/]   "
         f"Latency  [bold]{winner.latency_ms:.1f} ms[/]   "
         f"Fitness  [bold {_grade_colour(winner.grade)}]{winner.fitness:.1f} / 100  [{winner.grade}][/]\n"
         + (f"\n  [{_AMBER}]Compiler notes: {'; '.join(winner.warnings)}[/]" if winner.warnings else ""),

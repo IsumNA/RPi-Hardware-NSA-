@@ -78,12 +78,23 @@ def _headroom_score(act_kb: float, weight_kb: float, sram_budget_kb: float) -> f
 def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
                     weight_kb: float | None = None, act_kb: float | None = None,
                     sram_budget_kb: float | None = None,
-                    target_fps: float = 30.0) -> Fitness:
+                    target_fps: float = 30.0,
+                    psnr_in: float | None = None) -> Fitness:
     fps = 1000.0 / max(latency_ms, 1e-6)
 
-    # Quality band for extreme-gain RAW denoising: 20 dB -> 0, 31 dB -> 1.
-    # (Recovering a usable ~28-31 dB frame from a ~14 dB capture is excellent.)
-    quality = _clamp01((psnr - 20.0) / (31.0 - 20.0))
+    # Quality: reward measurable denoising (gain over the noisy input), not speed alone.
+    if psnr_in is not None:
+        gain = psnr - psnr_in
+        gain_score = _clamp01(gain / 12.0)          # +12 dB recovery ≈ excellent
+        abs_score = _clamp01((psnr - 16.0) / 10.0)  # usable output ≈ 16–26 dB
+        quality = 0.75 * gain_score + 0.25 * abs_score
+        if gain < 1.0:
+            # Barely changes the frame (or makes it worse) — do not let latency inflate score.
+            quality *= _clamp01(max(gain, 0.0))
+    else:
+        # Legacy path when input PSNR is unknown (absolute band only).
+        quality = _clamp01((psnr - 16.0) / 10.0)
+
     # Latency: at/above target fps -> full marks, degrades below.
     latency_s = _clamp01(fps / target_fps)
     latency_s = latency_s ** 0.5  # diminishing returns past real-time
@@ -91,18 +102,21 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
     robust = _clamp01(1.0 - (abs(quant_drop_db) / 1.5))
 
     if weight_kb is None or act_kb is None:
-        # Backward-compatible path: no memory data -> original three-way blend.
         wk = ak = total = 0.0
         mem = 1.0
-        score = 100.0 * (0.50 * quality + 0.30 * latency_s + 0.20 * robust)
+        eff = (0.30 * latency_s + 0.20 * robust) / 0.50
+        quality_weight = 0.50
     else:
         wk, ak = max(weight_kb, 0.0), max(act_kb, 0.0)
         total = wk + ak
         mem = (_headroom_score(ak, wk, sram_budget_kb) if sram_budget_kb
                else _mem_score(total))
-        # Fitness = a*PSNR + b*FPS + c*robust + gamma*leanness  (gamma small).
-        score = 100.0 * (_W_QUALITY * quality + _W_LATENCY * latency_s
-                         + _W_ROBUST * robust + _W_MEMORY * mem)
+        eff = ((_W_LATENCY * latency_s + _W_ROBUST * robust + _W_MEMORY * mem)
+               / (_W_LATENCY + _W_ROBUST + _W_MEMORY))
+        quality_weight = _W_QUALITY
+
+    # Speed / robustness / memory only amplify a model that actually denoises.
+    score = 100.0 * quality * (quality_weight + (1.0 - quality_weight) * eff)
 
     score = round(score, 1)
     grade = ("OPTIMAL" if score >= 85 else
