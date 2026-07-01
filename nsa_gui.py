@@ -34,10 +34,10 @@ except Exception:  # pragma: no cover
 # AND "Segoe UI" is absent on Linux). Override anytime with NSA_UI_SCALE=1.5.
 USE_TK_SCALING = False  # set True only on the Windows DPI path
 
-# Default text/UI size. "Large" in App Options == 1.6×; we ship that as the
-# out-of-the-box default so the interface is comfortably readable everywhere.
+# Default text/UI size. "Extra Large" in App Options == 1.9×; we ship that as
+# the out-of-the-box default so the interface is comfortably readable everywhere.
 # Override anytime with NSA_UI_SCALE, or pick another size in App Options.
-BASE_SCALE = 1.6
+BASE_SCALE = 1.9
 
 
 def _detect_scale() -> float:
@@ -60,11 +60,11 @@ def _detect_scale() -> float:
             except Exception:
                 dpi = 96
             USE_TK_SCALING = True
-            # Never smaller than "Large"; go bigger still on hi-DPI displays.
+            # Never smaller than "Extra Large"; go bigger still on hi-DPI displays.
             return max(BASE_SCALE, dpi / 96.0)
         except Exception:
             return BASE_SCALE
-    # Linux / macOS: ship the "Large" default so the UI is readable out of the box.
+    # Linux / macOS: ship the "Extra Large" default so the UI is readable out of the box.
     return BASE_SCALE
 
 
@@ -487,12 +487,17 @@ class LiveView(tk.Toplevel):
 
     PANEL_W = 372  # logical px per video panel (scaled by S)
 
-    def __init__(self, master, source="auto"):
+    def __init__(self, master, source="auto", camera_index=0):
         super().__init__(master, bg=WHITE)
         self.title("NSA  ·  Live Testing")
         self.configure(bg=WHITE)
+        # On Windows/macOS skip picamera2 and go straight to OpenCV webcams.
+        if source == "auto" and not sys.platform.startswith("linux"):
+            source = "opencv"
         self.source = source
         self._stop = threading.Event()
+        self._reconnect = threading.Event()
+        self._cam_index_var = tk.StringVar(value=str(camera_index))
         self._lock = threading.Lock()
         self._latest = None            # (raw_rgb, out_rgb, stats)
         self._status = "Loading compiled model…"
@@ -507,13 +512,13 @@ class LiveView(tk.Toplevel):
         self.bind("<Escape>", lambda _e: self._on_close())
 
         self.update_idletasks()
-        w, h = S(840), S(660)
+        w, h = S(840), S(700)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w, h = min(w, sw - 40), min(h, sh - 80)
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 3)
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(S(620), S(520))
+        self.minsize(S(620), S(540))
         try:
             self.transient(master)
         except Exception:  # noqa: BLE001
@@ -522,6 +527,7 @@ class LiveView(tk.Toplevel):
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
         self.after(80, self._paint)
+        self.after(200, self._probe_cameras_bg)
 
     # -- layout --------------------------------------------------------------
     def _build_ui(self):
@@ -545,6 +551,24 @@ class LiveView(tk.Toplevel):
                                 font=font(10))
         self.src_lbl.pack(anchor="w", pady=(S(1), 0))
         tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
+
+        # -- Webcam picker (USB / built-in — no picamera2/apt needed) --------
+        camrow = tk.Frame(self, bg=WHITE)
+        camrow.pack(fill="x", padx=pad, pady=(S(8), 0))
+        tk.Label(camrow, text="Webcam index", bg=WHITE, fg=INK,
+                 font=font(10, "bold")).pack(side="left")
+        self._cam_combo = ttk.Combobox(
+            camrow, textvariable=self._cam_index_var,
+            values=[str(i) for i in range(10)], state="readonly",
+            width=4, style="Rpi.TCombobox")
+        self._cam_combo.pack(side="left", padx=(S(8), 0))
+        RoundButton(camrow, "CONNECT", self._reconnect_camera, kind="primary",
+                    width=130, height=34).pack(side="left", padx=(S(10), 0))
+        self._cam_hint = tk.Label(
+            camrow,
+            text="Probing for webcams…  (USB / built-in — no apt install needed)",
+            bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(420), justify="left")
+        self._cam_hint.pack(side="left", padx=(S(10), 0))
 
         # -- Footer (pinned) -------------------------------------------------
         footer = tk.Frame(self, bg=WHITE)
@@ -605,6 +629,47 @@ class LiveView(tk.Toplevel):
         with self._lock:
             self._status = text
 
+    def _probe_cameras_bg(self):
+        def work():
+            try:
+                import live as _live
+                found = _live.probe_cameras()
+                self.after(0, lambda: self._on_probe_done(found))
+            except Exception:  # noqa: BLE001
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_probe_done(self, found: list[int]):
+        if not self.winfo_exists():
+            return
+        if found:
+            vals = [str(i) for i in found]
+            self._cam_combo.config(values=vals)
+            if self._cam_index_var.get() not in vals:
+                self._cam_index_var.set(vals[0])
+            self._cam_hint.config(
+                text=f"Found webcam(s) at index: {', '.join(vals)} — pick one, CONNECT",
+                fg=GREEN)
+            # Auto-reconnect to the first detected camera if we're on sim.
+            with self._lock:
+                on_sim = "simulated" in self._status.lower()
+            if on_sim:
+                self._reconnect_camera()
+        else:
+            self._cam_hint.config(
+                text="No webcam yet — try index 0–9, close other camera apps, "
+                     "check Windows Privacy → Camera, then CONNECT",
+                fg=AMBER)
+
+    def _reconnect_camera(self):
+        """Ask the worker to reopen the webcam at the selected index."""
+        self._reconnect.set()
+        try:
+            idx = self._cam_index_var.get()
+            self._set_status(f"Reconnecting to webcam index {idx}…")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _run(self):
         try:
             import live as _live
@@ -616,73 +681,87 @@ class LiveView(tk.Toplevel):
         _live.OUT = ROOT / "outputs"
         _live.CKPT = _live.OUT / "model.pt"
 
-        args = _live.make_args(source=self.source)
         try:
             self._set_status("Loading compiled model…")
-            model, ck = _live.load_model(args)
+            model, ck = _live.load_model(_live.make_args(source=self.source))
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Could not load model: {exc}")
             return
         model_name = str(ck.get("model", {}).get("family", "model")).upper()
         self._model_name = model_name
-        sensor_key = ck.get("sensor", args.sensor)
-        gain = int(ck.get("gain", args.gain))
-
-        self._set_status("Connecting to camera…")
-        try:
-            cam = _live.open_camera(args, sensor_key, gain)
-        except SystemExit as exc:
-            self._set_status(str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001
-            self._set_status(f"Camera error: {exc}")
-            return
+        sensor_key = ck.get("sensor", "imx662")
+        gain = int(ck.get("gain", 512))
 
         import time as _t
-        is_sim = cam.__class__.__name__ == "SimCam"
-        src_desc = ("Simulated low-light stream (no camera found)  ·  "
-                    f"{sensor_key.upper()}") if is_sim else f"Live: {cam.name}"
-        self._set_status(src_desc)
-
         fps = 0.0
-        t_prev = _t.perf_counter()
-        try:
-            while not self._stop.is_set():
-                raw = cam.read()
-                if raw is None:
-                    self._set_status("Camera returned no frame — stopped.")
-                    break
-                if raw.ndim == 2:
-                    raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
-                elif raw.shape[2] == 4:
-                    raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
-                h, w = raw.shape[:2]
-                tw = 432
-                if w > tw:
-                    raw = cv2.resize(raw, (tw, int(round(h * tw / w))))
 
-                out, dt_ms = _live.denoise_bgr(model, raw)
-                n_in, n_out = _live.noise_level(raw), _live.noise_level(out)
-
-                now = _t.perf_counter()
-                inst = 1.0 / max(now - t_prev, 1e-6)
-                fps = inst if fps == 0 else 0.9 * fps + 0.1 * inst
-                t_prev = now
-                drop = max(0.0, (1.0 - n_out / n_in) * 100.0) if n_in > 1e-6 else 0.0
-
-                raw_rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
-                out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-                with self._lock:
-                    self._latest = (raw_rgb, out_rgb,
-                                    {"fps": fps, "ms": dt_ms, "drop": drop,
-                                     "model": model_name})
-        except Exception as exc:  # noqa: BLE001
-            self._set_status(f"Live testing error: {exc}")
-        finally:
+        while not self._stop.is_set():
             try:
-                cam.close()
-            except Exception:  # noqa: BLE001
-                pass
+                idx = int(self._cam_index_var.get())
+            except ValueError:
+                idx = 0
+            args = _live.make_args(source=self.source, camera_index=idx)
+            self._set_status(f"Connecting to webcam index {idx}…")
+            try:
+                cam = _live.open_camera(args, sensor_key, gain)
+            except SystemExit as exc:
+                self._set_status(str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._set_status(f"Camera error: {exc}")
+                return
+
+            is_sim = cam.__class__.__name__ == "SimCam"
+            if is_sim:
+                self._set_status(
+                    f"No camera at index {idx} — simulated stream. "
+                    "Try another index + CONNECT, or close apps using the camera.")
+            else:
+                self._set_status(f"Live: {cam.name}")
+
+            self._reconnect.clear()
+            t_prev = _t.perf_counter()
+            try:
+                while not self._stop.is_set() and not self._reconnect.is_set():
+                    raw = cam.read()
+                    if raw is None:
+                        self._set_status("Camera returned no frame — try CONNECT again.")
+                        break
+                    if raw.ndim == 2:
+                        raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+                    elif raw.shape[2] == 4:
+                        raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+                    h, w = raw.shape[:2]
+                    tw = 432
+                    if w > tw:
+                        raw = cv2.resize(raw, (tw, int(round(h * tw / w))))
+
+                    out, dt_ms = _live.denoise_bgr(model, raw)
+                    n_in, n_out = _live.noise_level(raw), _live.noise_level(out)
+
+                    now = _t.perf_counter()
+                    inst = 1.0 / max(now - t_prev, 1e-6)
+                    fps = inst if fps == 0 else 0.9 * fps + 0.1 * inst
+                    t_prev = now
+                    drop = max(0.0, (1.0 - n_out / n_in) * 100.0) if n_in > 1e-6 else 0.0
+
+                    raw_rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+                    out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                    with self._lock:
+                        self._latest = (raw_rgb, out_rgb,
+                                        {"fps": fps, "ms": dt_ms, "drop": drop,
+                                         "model": model_name})
+            except Exception as exc:  # noqa: BLE001
+                self._set_status(f"Live testing error: {exc}")
+            finally:
+                try:
+                    cam.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if self._stop.is_set():
+                break
+            # _reconnect set — loop opens the camera again at the new index.
 
     # -- painting (Tk thread) -----------------------------------------------
     def _paint(self):
@@ -1949,20 +2028,12 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _hf_open_lock(self):
-        p = ROOT / "outputs" / "hf_lock.json"
-        if not p.exists():
-            messagebox.showinfo("Lock file", "No models frozen yet. Search, then "
-                                "click FREEZE on a model to lock its commit hash.")
-            return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(p))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(p)])
-            else:
-                subprocess.Popen(["xdg-open", str(p)])
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Lock file", str(exc))
+        """Show the frozen-model manifest in-app (avoids xdg-open / X11 over SSH)."""
+        self._view_text_file(
+            ROOT / "outputs" / "hf_lock.json",
+            "Hugging Face lock file",
+            missing_msg=("No models frozen yet. Search the Hub, then click "
+                         "FREEZE on a model to lock its commit hash."))
 
     def _live_test(self):
         """Open in-app live camera testing (raw vs denoised), styled like the UI."""
@@ -1974,7 +2045,8 @@ class App(tk.Tk):
                 "(a few seconds). Continue?"):
                 return
         try:
-            LiveView(self, source="auto")
+            src = "opencv" if sys.platform.startswith("win") else "auto"
+            LiveView(self, source=src)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Live testing", str(exc))
 
@@ -2003,21 +2075,12 @@ class App(tk.Tk):
     def _reveal(self, target):
         """Open the folder containing ``target`` (a file or dir path)."""
         path = Path(target)
-        path = path.parent if path.suffix else path
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(path))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
-            return
-        except Exception:
-            pass
-        try:
-            messagebox.showinfo("Package", f"Transferable package:\n{target}")
-        except Exception:
-            pass
+        folder = path.parent if path.suffix else path
+        if not self._try_open_os_path(folder, "Package"):
+            try:
+                messagebox.showinfo("Package", f"Transferable package:\n{target}")
+            except Exception:
+                pass
 
     def _start_process(self):
         env = dict(os.environ)
@@ -2698,6 +2761,51 @@ class App(tk.Tk):
         RoundButton(btns, "RUN THIS", _run_now, kind="primary",
                     width=130, height=40).pack(side="right")
 
+    def _view_text_file(self, path, title, missing_msg=None):
+        """Open a read-only in-app viewer for a text/JSON file."""
+        p = Path(path)
+        if not p.exists():
+            messagebox.showinfo(title, missing_msg or f"File not found:\n{p}")
+            return
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(title, f"Could not read {p}:\n{exc}")
+            return
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=WHITE)
+        win.transient(self)
+        try:
+            win.geometry(f"{S(720)}x{S(520)}+{self.winfo_rootx()+S(40)}"
+                         f"+{self.winfo_rooty()+S(40)}")
+        except Exception:
+            pass
+        pad = tk.Frame(win, bg=WHITE)
+        pad.pack(fill="both", expand=True, padx=S(16), pady=S(14))
+        tk.Label(pad, text=title, bg=WHITE, fg=INK,
+                 font=font(15, "bold")).pack(anchor="w")
+        tk.Label(pad, text=str(p.resolve()), bg=WHITE, fg=SUBTLE,
+                 font=font(9), wraplength=S(640), justify="left").pack(
+                     anchor="w", pady=(S(2), S(8)))
+        con = tk.Frame(pad, bg=FIELD)
+        con.pack(fill="both", expand=True)
+        mono = ("Cascadia Mono" if "Cascadia Mono" in tkfont.families()
+                else ("DejaVu Sans Mono" if "DejaVu Sans Mono" in tkfont.families()
+                      else "Courier"))
+        txt = tk.Text(con, bg=FIELD, fg=INK, bd=0, relief="flat",
+                      font=(mono, FT(9)), wrap="none", padx=S(12), pady=S(10))
+        sb = ttk.Scrollbar(con, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        foot = tk.Frame(pad, bg=WHITE)
+        foot.pack(fill="x", pady=(S(10), 0))
+        RoundButton(foot, "CLOSE", win.destroy, kind="secondary",
+                    width=110, height=38).pack(side="right")
+
     def _show_log(self):
         win = tk.Toplevel(self)
         win.title("NSA — Full compilation log")
@@ -2731,34 +2839,43 @@ class App(tk.Tk):
             path.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(path))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
+        if self._try_open_os_path(path, "Outputs folder"):
             return
-        except Exception:
-            pass
-        # No file manager (e.g. headless / SSH): at least tell the user where it is.
         try:
-            messagebox.showinfo("Outputs folder", f"Results are saved in:\n{path}")
+            messagebox.showinfo("Outputs folder", f"Results are saved in:\n{path.resolve()}")
         except Exception:
             pass
 
     def _open_path(self, target):
-        """Open a file or folder directly in the OS."""
+        """Open a file or folder in the OS, or show its path if that fails."""
         p = Path(target)
+        if not self._try_open_os_path(p, "Open"):
+            try:
+                messagebox.showinfo("Open", str(p.resolve()))
+            except Exception:
+                pass
+
+    def _try_open_os_path(self, path, fallback_title="Path") -> bool:
+        """Try the OS file manager / default app. False if unavailable (e.g. SSH)."""
+        path = Path(path)
+        target = path if path.exists() else path.parent
         try:
             if sys.platform.startswith("win"):
-                os.startfile(str(p))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(p)])
-            else:
-                subprocess.Popen(["xdg-open", str(p)])
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showinfo("Open", f"{target}\n\n({exc})")
+                os.startfile(str(target))  # type: ignore[attr-defined]
+                return True
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+                return True
+            # Linux: xdg-open needs X11; over SSH it often fails with
+            # "connection rejected due to wrong authentication".
+            if not _has_display():
+                return False
+            subprocess.Popen(
+                ["xdg-open", str(target)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
 
     # -- Run history ---------------------------------------------------------
     def _show_history(self):

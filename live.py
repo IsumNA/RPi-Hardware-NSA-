@@ -33,6 +33,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -109,6 +110,30 @@ def load_model(args) -> tuple[torch.nn.Module, dict]:
 # ---------------------------------------------------------------------------
 # Camera backends — each exposes .read() -> BGR uint8 frame, and .close()
 # ---------------------------------------------------------------------------
+def _on_raspberry_pi() -> bool:
+    """True only on real Pi hardware (not every Linux box)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        model = Path("/proc/device-tree/model")
+        if model.exists():
+            return b"raspberry" in model.read_bytes().lower()
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _picamera2_available() -> bool:
+    """picamera2 is a system apt package on the Pi — skip elsewhere."""
+    if not _on_raspberry_pi():
+        return False
+    try:
+        import picamera2  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class PiCam:
     name = "Raspberry Pi CSI camera (picamera2)"
 
@@ -180,12 +205,23 @@ def _cv_backends() -> list:
     return [cv2.CAP_V4L2, cv2.CAP_ANY]
 
 
+def _warm_read(cap, attempts: int = 20, delay: float = 0.08):
+    """Read until a real frame arrives (webcams often need a warm-up)."""
+    for _ in range(attempts):
+        ok, frame = cap.read()
+        if ok and frame is not None and getattr(frame, "size", 0) > 0:
+            return frame
+        time.sleep(delay)
+    return None
+
+
 def _open_cv_capture(index: int, args):
     """Open a webcam at ``index``, trying each backend and verifying it streams.
 
     Returns an opened, frame-delivering ``cv2.VideoCapture`` or ``None``.
     """
     for be in _cv_backends():
+        cap = None
         try:
             cap = cv2.VideoCapture(index, be)
         except Exception:  # noqa: BLE001
@@ -194,16 +230,55 @@ def _open_cv_capture(index: int, args):
             if cap is not None:
                 cap.release()
             continue
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:  # noqa: BLE001
+            pass
+        # Pass 1: honour requested resolution.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        # Warm up: cameras (esp. on Windows) need a few reads before frames flow.
-        for _ in range(8):
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                return cap
-            time.sleep(0.06)
+        if _warm_read(cap) is not None:
+            return cap
+        # Pass 2: some drivers only stream at the native default resolution.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if _warm_read(cap) is not None:
+            return cap
+        # Pass 3: don't touch resolution at all.
+        cap.release()
+        try:
+            cap = cv2.VideoCapture(index, be)
+        except Exception:  # noqa: BLE001
+            continue
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            continue
+        if _warm_read(cap) is not None:
+            return cap
         cap.release()
     return None
+
+
+def probe_cameras(max_index: int = 9, width: int = 640, height: int = 480) -> list[int]:
+    """Return webcam indices that deliver at least one frame (OpenCV only)."""
+    args = make_args(width=width, height=height)
+    found: list[int] = []
+    for idx in range(max_index + 1):
+        cap = _open_cv_capture(idx, args)
+        if cap is not None:
+            found.append(idx)
+            cap.release()
+    return found
+
+
+# Human-readable hint when no camera is found (shown in the GUI).
+_CAMERA_HELP = (
+    "No webcam found. Close Zoom/Teams/browser tabs using the camera, check "
+    "Windows Settings → Privacy → Camera (allow desktop apps), then pick another "
+    "index below and click CONNECT. On a Pi CSI module you need picamera2 "
+    "(sudo apt install python3-picamera2) — USB webcams work without that."
+)
 
 
 class SimCam:
@@ -237,7 +312,7 @@ class SimCam:
 
 def open_camera(args, sensor_key, gain):
     src = args.source
-    if src in ("auto", "picamera"):
+    if src in ("auto", "picamera") and _picamera2_available():
         try:
             cam = PiCam(args)
             log(f"Camera: {cam.name}", "ok")
@@ -246,10 +321,17 @@ def open_camera(args, sensor_key, gain):
             if src == "picamera":
                 raise SystemExit(f"picamera2 backend failed: {exc}")
             log(f"picamera2 unavailable ({exc}); trying a USB/V4L2 camera…", "warn")
+    elif src == "picamera":
+        raise SystemExit(
+            "picamera2 is not installed. On the Pi: "
+            "sudo apt install -y python3-picamera2  "
+            "(then recreate the venv with --system-site-packages). "
+            "For a USB webcam use --source opencv instead.")
 
     if src in ("auto", "opencv"):
-        # Probe the requested index first, then the usual fallbacks (0-2).
-        indices = [args.camera_index] + [i for i in (0, 1, 2)
+        # Probe the requested index first, then 0..max (many laptops use index 1).
+        max_idx = max(9, int(getattr(args, "camera_index", 0)))
+        indices = [args.camera_index] + [i for i in range(max_idx + 1)
                                          if i != args.camera_index]
         for idx in indices:
             cap = _open_cv_capture(idx, args)
@@ -265,6 +347,7 @@ def open_camera(args, sensor_key, gain):
                 f"(tried backends: DSHOW/MSMF/V4L2). Is another app using it?")
         log("No physical camera detected — using the simulated low-light stream.",
             "warn")
+        log(_CAMERA_HELP, "warn")
 
     cam = SimCam(args, sensor_key, gain)
     log(f"Camera: {cam.name}  [{sensor_key} @ {gain}×]", "ok")
@@ -274,6 +357,12 @@ def open_camera(args, sensor_key, gain):
 def make_args(**overrides):
     """Build a default argument namespace (for embedding live testing in the GUI)."""
     args = build_parser().parse_args([])
+    env_idx = os.environ.get("NSA_CAMERA_INDEX")
+    if env_idx and "camera_index" not in overrides:
+        try:
+            setattr(args, "camera_index", int(env_idx))
+        except ValueError:
+            pass
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
