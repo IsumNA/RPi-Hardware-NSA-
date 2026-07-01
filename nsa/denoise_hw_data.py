@@ -93,9 +93,33 @@ def dataset_summary(root: Path | None) -> dict:
     }
 
 
+SYSTEM_PI_RAW = Path("/opt/datasets/PI_RAW")
+
+
+def _has_dng_pairs(root: Path) -> bool:
+    return any(root.rglob("noisy.dng")) and any(root.rglob("gt.dng"))
+
+
+def prefer_system_pi_raw() -> Path | None:
+    """Real PI_RAW on the AI machine (/opt/datasets/PI_RAW) wins over bundled samples."""
+    if SYSTEM_PI_RAW.exists() and find_paired_folders(str(SYSTEM_PI_RAW)):
+        return SYSTEM_PI_RAW.resolve()
+    return None
+
+
 def apply_auto_dataset(cfg, project_root: Path | None = None) -> bool:
     """Enable PI_RAW real captures when a dataset is available (bundled or linked)."""
     root_dir = project_root or Path(__file__).resolve().parents[1]
+    system = prefer_system_pi_raw()
+    if system is not None:
+        cfg.sensor.dataset_path = str(system)
+        cfg.sensor.real_capture = True
+        if not cfg.sensor.filter:
+            test_dir = system / DEFAULT_TEST_REL
+            if test_dir.is_dir():
+                cfg.sensor.filter = list(DEFAULT_FILTER)
+        return True
+
     explicit = cfg.sensor.dataset_path or DEFAULT_DATASET_PATH
     root = resolve_pi_raw(explicit)
     if root is None and cfg.sensor.real_capture:
@@ -103,6 +127,11 @@ def apply_auto_dataset(cfg, project_root: Path | None = None) -> bool:
         root = resolve_pi_raw(explicit) or resolve_pi_raw(root_dir / DEFAULT_DATASET_PATH)
     if root is None:
         return False
+    # Bundled PNG samples — if /opt exists with real DNGs, never use synthetics.
+    local = (root_dir / DEFAULT_DATASET_PATH).resolve()
+    if (root.resolve() == local and not _has_dng_pairs(local)
+            and prefer_system_pi_raw() is not None):
+        root = prefer_system_pi_raw()
     cfg.sensor.dataset_path = str(root)
     cfg.sensor.real_capture = True
     if not cfg.sensor.filter:
