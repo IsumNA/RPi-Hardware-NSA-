@@ -50,7 +50,7 @@ sensor:
   # selected sensor's physics on top of loaded frames (clean -> noisy).
   simulate_noise: false
   filter: [imx219, ag12]    # denoise-hw test scene filter (cabinet_D50_100/imx219_ag12_test)
-  gain: 512                 # analog gain multiplier (challenge frame): 256 | 512
+  gain: 256                 # analog gain multiplier (256 = moderate; 512 = stress test)
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
 data:
@@ -60,7 +60,7 @@ data:
 optimization:
   quantize: true            # enable INT8 post-training / QAT path
   qat: false                # true => fake-quant-in-the-loop training (STE)
-  calibration_steps: 220    # live calibration iterations on the test frame
+  calibration_steps: 400    # live calibration iterations on the test frame
   patch_size: 192           # working resolution for the live demo (square crop)
 
 # ---- Run mode ----------------------------------------------------------------

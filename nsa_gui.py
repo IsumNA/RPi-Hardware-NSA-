@@ -1178,7 +1178,7 @@ class App(tk.Tk):
             wraplength=S(560), justify="left")
         self.sensor_echo.pack(anchor="w", pady=(0, S(4)))
         self._add_rows(body, [
-            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 512),
+            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 256),
         ])
 
     def _step_data(self, body):
@@ -1202,6 +1202,10 @@ class App(tk.Tk):
             ds_left, text="using config.yaml dataset_path", bg=WHITE,
             fg=SUBTLE, font=font(9))
         self.dataset_label.pack(anchor="w")
+        self.dataset_hint = tk.Label(
+            ds_left, text="", bg=WHITE, fg=AMBER, font=font(9),
+            wraplength=S(520), justify="left")
+        self.dataset_hint.pack(anchor="w")
         btns = tk.Frame(ds_row, bg=WHITE); btns.grid(row=0, column=1, sticky="e")
         self.dataset_btn = RoundButton(btns, "CHOOSE FOLDER", self._choose_dataset,
                                        kind="secondary", width=160, height=36)
@@ -1324,7 +1328,7 @@ class App(tk.Tk):
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
         self._add_rows(body, [
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
-             [70, 160, 220], 160),
+             [160, 400, 600, 800], 400),
         ])
         self._check(body, "INT8 quantization (PTQ)",
                     "Quantize weights + activations for the accelerator target.",
@@ -1406,15 +1410,19 @@ class App(tk.Tk):
         sweep = self.eval_var.get() == "sweep"
         run_type = ("Architecture sweep (all 9 families)"
                     if sweep else "Single model compile")
-        return [
+        rows = [
             ("Run type", run_type, AMBER if sweep else RASPBERRY),
-            ("Image sensor", f"{sensor_name}  @{self._row_get('gain','512')}×", RASPBERRY),
+            ("Image sensor", f"{sensor_name}  @{self._row_get('gain','256')}×", RASPBERRY),
             ("Capture source", src, INK),
             ("Run mode", mode, INK),
             ("Model", model_txt, INK),
             ("Target chip", hw_name, INK),
-            ("Calibration", f"{self._row_get('steps','160')} steps · quant {q}", INK),
+            ("Calibration", f"{self._row_get('steps','400')} steps · quant {q}", INK),
         ]
+        hint = self._dataset_quality_hint()
+        if hint:
+            rows.append(("Dataset", hint[0], hint[1]))
+        return rows
 
     def _goto_step(self, i):
         i = max(0, min(i, len(self._steps) - 1))
@@ -1597,6 +1605,44 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _dataset_root_path(self) -> Path | None:
+        path = self.dataset_path
+        if path:
+            return Path(path)
+        default = ROOT / "datasets" / "PI_RAW"
+        if default.exists():
+            return default
+        return None
+
+    def _dataset_quality_hint(self) -> tuple[str, str] | None:
+        """(label, color) for home/review when captures are not real DNG PI_RAW."""
+        if self.source_var.get() != "real":
+            return None
+        try:
+            from nsa.denoise_hw_data import dataset_summary, is_synthetic_sample_dataset
+            root = self._dataset_root_path()
+            if root is None:
+                return None
+            if is_synthetic_sample_dataset(root):
+                return ("Synthetic demo PNGs — fetch real PI_RAW for quality", AMBER)
+            info = dataset_summary(root)
+            if info.get("kind") == "real_png":
+                return ("PNG only (no DNG) — real RAW recommended", AMBER)
+            if info.get("kind") == "real_dng":
+                return (f"Real PI_RAW ({info.get('paired_folders', 0)} scenes)", INK)
+        except Exception:
+            pass
+        return None
+
+    def _refresh_dataset_hint(self):
+        if not hasattr(self, "dataset_hint"):
+            return
+        hint = self._dataset_quality_hint()
+        if hint:
+            self.dataset_hint.config(text=f"     {hint[0]}", fg=hint[1])
+        else:
+            self.dataset_hint.config(text="")
+
     def _on_source_change(self):
         real = self.source_var.get() == "real"
         for attr in ("dataset_btn", "upload_btn"):
@@ -1604,6 +1650,7 @@ class App(tk.Tk):
                 getattr(self, attr).set_enabled(real)
         if hasattr(self, "dataset_label"):
             self.dataset_label.config(fg=(SUBTLE if real else "#C4C4C4"))
+        self._refresh_dataset_hint()
 
     def _on_mode_change(self):
         # Batch size only matters in batch mode (kept editable, just a hint).
@@ -1797,6 +1844,7 @@ class App(tk.Tk):
             self.dataset_path = path
             self.upload_files = []
             self.dataset_label.config(text=Path(path).name)
+            self._refresh_dataset_hint()
 
     def _upload_images(self):
         if self.source_var.get() != "real":
@@ -1812,6 +1860,7 @@ class App(tk.Tk):
             self.dataset_label.config(
                 text=(Path(self.upload_files[0]).name if n == 1
                       else f"{n} images uploaded"))
+            self._refresh_dataset_hint()
 
     def _choose_raw(self):
         path = filedialog.askopenfilename(
@@ -2041,8 +2090,8 @@ class App(tk.Tk):
                "--base-channels", self._row_get("base_channels", "32"),
                "--conv-type", self._row_get("conv_type", "depthwise"),
                "--activation", self._row_get("activation", "relu"),
-               "--search-steps", "45",
-               "--patch-size", "128",
+               "--search-steps", "120",
+               "--patch-size", "192",
                "--top", "10",
                "--no-final-run"]
         if self.all_sensors_var.get():

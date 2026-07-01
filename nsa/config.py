@@ -57,7 +57,7 @@ class SensorConfig:
     dataset_path: str | None = "datasets/PI_RAW"
     simulate_noise: bool = False    # inject sensor noise on top of loaded frames
     filter: list = field(default_factory=lambda: ["imx219", "ag12"])
-    gain: int = 512
+    gain: int = 256
 
 
 @dataclass
@@ -69,7 +69,7 @@ class DataConfig:
 class OptimizationConfig:
     quantize: bool = True
     qat: bool = False               # true fake-quant-in-the-loop training
-    calibration_steps: int = 220
+    calibration_steps: int = 400
     patch_size: int = 256
 
 

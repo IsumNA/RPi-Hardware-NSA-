@@ -56,7 +56,7 @@ from nsa.models import build_model, count_params
 from nsa.raw_io import build_frame, build_frame_from_source, list_frames
 from nsa.report import compute_fitness, print_report
 from nsa.sensors import SENSOR_KEYS, get_sensor
-from nsa.theme import RPI_GREEN, RPI_RASPBERRY, banner, console as nsa_console
+from nsa.theme import RPI_GREEN, RPI_RASPBERRY, banner, console as nsa_console, log
 from nsa.visualize import render_panel
 
 console = Console()
@@ -374,8 +374,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Data source
     p.add_argument("--sensor", choices=["imx219", "imx662", "imxng"],
                    default="imx219", help="sensor noise profile (default: imx219)")
-    p.add_argument("--gain", type=int, choices=[256, 512], default=512,
-                   help="analog gain of the test frame (default: 512)")
+    p.add_argument("--gain", type=int, choices=[256, 512], default=256,
+                   help="analog gain of the test frame (default: 256)")
     p.add_argument("--real", dest="real_capture", action="store_true",
                    help="use real captures from --dataset as the noisy input")
     p.add_argument("--simulated", dest="simulated", action="store_true",
@@ -403,8 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--activation", choices=["relu", "gelu", "silu"], default=None,
                    help="restrict to a specific activation")
     # Search tuning
-    p.add_argument("--search-steps", dest="search_steps", type=int, default=60,
-                   help="calibration steps per candidate during search (default: 60)")
+    p.add_argument("--search-steps", dest="search_steps", type=int, default=120,
+                   help="calibration steps per candidate during search (default: 120)")
     p.add_argument("--final-steps", dest="final_steps", type=int, default=220,
                    help="calibration steps for the full final run (default: 220)")
     p.add_argument("--patch-size", dest="patch_size", type=int, default=192,
@@ -442,6 +442,10 @@ def main() -> int:
         args.dataset_path = args.dataset_path or _cfg.sensor.dataset_path
         if not args.filter:
             args.filter = list(_cfg.sensor.filter or [])
+        from nsa.denoise_hw_data import dataset_quality_notice
+        notice = dataset_quality_notice(args.dataset_path)
+        if notice:
+            log(notice, "warn")
 
     banner("NSA Architecture Search")
 

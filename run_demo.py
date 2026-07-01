@@ -61,6 +61,10 @@ def main() -> int:
     args = build_parser().parse_args()
     cfg = apply_overrides(load_config(resolve_config_path(args.config, ROOT)), args)
     finalize_dataset_config(cfg, ROOT)
+    ds_quality_notice = None
+    if cfg.sensor.real_capture and cfg.sensor.dataset_path:
+        from nsa.denoise_hw_data import dataset_quality_notice
+        ds_quality_notice = dataset_quality_notice(cfg.sensor.dataset_path)
 
     # Headless box (e.g. Pi over SSH with no X): never try to open a window.
     headless = cfg.output.show_window and not _has_display()
@@ -112,6 +116,8 @@ def main() -> int:
     # LEVEL 1 - SENSOR / INPUT
     # ===========================================================================
     level_rule(1, f"SENSOR  ·  {sensor.label} Bayer RAW ingestion")
+    if ds_quality_notice:
+        log(ds_quality_notice, "warn")
     log(f"Sensor profile: {sensor.label} — {sensor.family}  ·  "
         f"QE {sensor.qe:.0%}, read {sensor.read_noise:.1f}e-, "
         f"well {sensor.full_well:,.0f}e-", "step")

@@ -1,9 +1,12 @@
 # Copy real PI_RAW from the AI machine to Desktop and point config.yaml at it.
 #
 # Usage (edit REMOTE if needed):
+#   $env:PI_RAW_REMOTE = "you@ai-machine:/opt/datasets/PI_RAW"
 #   .\fetch_pi_raw.ps1
 #   .\fetch_pi_raw.ps1 -Remote "you@ai-machine:/opt/datasets/PI_RAW"
 #   .\fetch_pi_raw.ps1 -Full   # entire dataset (large)
+#
+# If Desktop\PI_RAW already exists (from a prior fetch), NSA auto-uses it.
 
 param(
     [string]$Remote = $env:PI_RAW_REMOTE,

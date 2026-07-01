@@ -94,7 +94,7 @@ def main() -> int:
             return 1
     elif args.rebuild_samples:
         from nsa.denoise_hw_data import build_sample_pi_raw
-        build_sample_pi_raw(local)
+        build_sample_pi_raw(local, force=True)
         root = local.resolve()
         log(f"Rebuilt sample pairs under {root}", "ok")
     else:

@@ -22,6 +22,7 @@ DEFAULT_TEST_REL = "Data/cabinet_D50_100/imx219_ag12_test"
 DEFAULT_FILTER = ["imx219", "ag12"]
 DEFAULT_DATASET_PATH = "datasets/PI_RAW"
 DEFAULT_REMOTE_PI_RAW = "/opt/datasets/PI_RAW"
+SYNTHETIC_MARKER = ".nsa_synthetic_sample"
 
 
 def desktop_pi_raw_path() -> Path:
@@ -91,6 +92,40 @@ def prefer_system_pi_raw() -> Path | None:
     return None
 
 
+def prefer_desktop_pi_raw() -> Path | None:
+    """``~/Desktop/PI_RAW`` from ``fetch_pi_raw.ps1`` wins over bundled samples."""
+    desktop = desktop_pi_raw_path()
+    if desktop.exists() and find_paired_folders(str(desktop)):
+        if not is_synthetic_sample_dataset(desktop):
+            return desktop.resolve()
+    return None
+
+
+def has_real_dng(root: Path | str) -> bool:
+    return any(Path(root).rglob("*.dng"))
+
+
+def is_synthetic_sample_dataset(root: Path | str | None) -> bool:
+    """True for repo-bundled PNG placeholders (not real camera PI_RAW)."""
+    if not root:
+        return False
+    p = Path(root)
+    if not p.exists():
+        return False
+    if (p / SYNTHETIC_MARKER).exists():
+        return True
+    if has_real_dng(p):
+        return False
+    pairs = find_paired_folders(str(p))
+    if not pairs:
+        return False
+    png_only = all(
+        any(Path(folder).glob("noisy.png")) and not any(Path(folder).glob("noisy.dng"))
+        for folder in pairs
+    )
+    return png_only and len(pairs) <= 8
+
+
 def _apply_default_filter(cfg, root: Path) -> None:
     if not cfg.sensor.filter:
         test_dir = root / DEFAULT_TEST_REL
@@ -119,15 +154,15 @@ def finalize_dataset_config(cfg, project_root: Path | None = None) -> bool:
             _apply_default_filter(cfg, Path(resolved))
             return True
 
-    # Default / bundled path — prefer system PI_RAW on the AI machine.
-    system = prefer_system_pi_raw()
+    # Default / bundled path — prefer real PI_RAW (system, then Desktop fetch).
     default_local = (root_dir / DEFAULT_DATASET_PATH).resolve()
-    if system is not None and (
-        explicit is None or _is_default_dataset_path(explicit, root_dir)
-    ):
-        cfg.sensor.dataset_path = str(system)
-        _apply_default_filter(cfg, system)
-        return True
+    if explicit is None or _is_default_dataset_path(explicit, root_dir):
+        for prefer in (prefer_system_pi_raw, prefer_desktop_pi_raw):
+            real_root = prefer()
+            if real_root is not None:
+                cfg.sensor.dataset_path = str(real_root)
+                _apply_default_filter(cfg, real_root)
+                return True
 
     if not find_paired_folders(str(default_local)):
         ensure_project_dataset(root_dir)
@@ -169,14 +204,35 @@ def normalize_dataset_root(path: str | Path) -> Path:
 def dataset_summary(root: Path | None) -> dict:
     """Quick manifest for CLI / GUI."""
     if root is None or not root.exists():
-        return {"root": None, "paired_folders": 0, "samples": []}
+        return {"root": None, "paired_folders": 0, "samples": [], "kind": "missing"}
     pairs = find_paired_folders(str(root))
     frames = list_frames(str(root), limit=8)
+    if is_synthetic_sample_dataset(root):
+        kind = "synthetic_sample"
+    elif has_real_dng(root):
+        kind = "real_dng"
+    else:
+        kind = "real_png"
     return {
         "root": str(root),
         "paired_folders": len(pairs),
         "samples": [f["name"] for f in frames],
+        "kind": kind,
     }
+
+
+def dataset_quality_notice(root: Path | str | None) -> str | None:
+    """Short user-facing warning when captures are not real camera RAW."""
+    if not root:
+        return None
+    p = Path(root)
+    if is_synthetic_sample_dataset(p):
+        return ("Bundled synthetic PNG samples (demo only). Fetch real PI_RAW: "
+                "fetch_pi_raw.ps1 or setup_denoise_hw_data.py --fetch user@host:/opt/datasets/PI_RAW")
+    if not has_real_dng(p):
+        return ("No DNG files in dataset — PNG previews only. "
+                "Real PI_RAW DNGs give much better denoising.")
+    return None
 
 
 def apply_auto_dataset(cfg, project_root: Path | None = None) -> bool:
@@ -275,7 +331,7 @@ def clone_denoise_hw(dest: Path) -> Path:
     return dest
 
 
-def build_sample_pi_raw(out_root: Path, seed: int = 219) -> int:
+def build_sample_pi_raw(out_root: Path, seed: int = 219, force: bool = False) -> int:
     """Write denoise-hw-style paired PNG folders when no real PI_RAW is available."""
     import cv2
     import numpy as np
@@ -284,27 +340,32 @@ def build_sample_pi_raw(out_root: Path, seed: int = 219) -> int:
     from nsa.sensors import get_sensor
 
     scenes = (
-        ("Data/cabinet_D50_100/imx219_ag12_test", "imx219", 512),
-        ("Data/cabinet_D50_100/imx662_ag12_test", "imx662", 512),
+        ("Data/cabinet_D50_100/imx219_ag12_test", "imx219", 256),
+        ("Data/cabinet_D50_100/imx662_ag12_test", "imx662", 256),
         ("Data/cabinet_H_2/imx219_ag1_test", "imx219", 256),
     )
-    patch = 512
+    patch = 1024
     n = 0
     for rel, sensor_key, gain in scenes:
         folder = out_root / rel
         folder.mkdir(parents=True, exist_ok=True)
         noisy_p, gt_p = folder / "noisy.png", folder / "gt.png"
-        if noisy_p.exists() and gt_p.exists():
+        if not force and noisy_p.exists() and gt_p.exists():
             n += 1
             continue
         sensor = get_sensor(sensor_key)
-        clean = _synthetic_scene(patch * 2, patch * 2, seed + n)
-        noisy, gt = _synth_noisy_gt(clean, gain, sensor, temporal_frames=64,
+        clean = _synthetic_scene(patch, patch, seed + n)
+        noisy, gt = _synth_noisy_gt(clean, gain, sensor, temporal_frames=128,
                                     seed=seed + n + 100)
         for arr, path in ((noisy, noisy_p), (gt, gt_p)):
             img8 = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
             cv2.imwrite(str(path), cv2.cvtColor(img8, cv2.COLOR_RGB2BGR))
         n += 1
+    (out_root / SYNTHETIC_MARKER).write_text(
+        "Bundled synthetic PNG pairs for offline demo.\n"
+        "Replace with real PI_RAW: setup_denoise_hw_data.py --fetch …\n",
+        encoding="utf-8",
+    )
     return n
 
 
@@ -314,11 +375,13 @@ def ensure_project_dataset(project_root: Path | None = None) -> Path:
     local = root / "datasets" / "PI_RAW"
     for candidate in (Path("/opt/datasets/PI_RAW"), desktop_pi_raw_path()):
         if candidate.exists() and find_paired_folders(str(candidate)):
+            if is_synthetic_sample_dataset(candidate):
+                continue
             try:
                 return link_or_point_dataset(local, candidate)
             except (FileExistsError, OSError):
                 return candidate.resolve()
-    if find_paired_folders(str(local)):
+    if find_paired_folders(str(local)) and not is_synthetic_sample_dataset(local):
         return local.resolve()
-    build_sample_pi_raw(local)
+    build_sample_pi_raw(local, force=not find_paired_folders(str(local)))
     return local.resolve()
