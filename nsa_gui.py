@@ -208,8 +208,9 @@ class RoundButton(tk.Canvas):
 
     def __init__(self, parent, text, command, kind="primary", width=170, height=44):
         self._is_hero = kind == "hero"
+        # Hero is slightly larger than primary, but must not blow past the content area.
         if self._is_hero:
-            w, h = S(width if width != 170 else 300), S(height if height != 44 else 58)
+            w, h = S(min(width, 210)), S(min(height, 48))
         else:
             w, h = S(width), S(height)
         super().__init__(parent, width=w, height=h, bg=parent["bg"],
@@ -244,9 +245,15 @@ class RoundButton(tk.Canvas):
         outline = 2.5 if self._is_hero else 1.5
         self.create_polygon(_round_points(2, 2, self.w - 2, self.h - 2, r),
                             smooth=True, fill=fill, outline=border, width=outline)
-        fsize = 13 if self._is_hero else 11
+        fsize = 12 if self._is_hero else 11
+        # Shrink label if the canvas is tight so text is not clipped at the edges.
+        ft = font(fsize, "bold")
+        tw = tkfont.Font(font=ft).measure(self.text)
+        if tw > self.w - S(20):
+            fsize = max(9, fsize - 1)
+            ft = font(fsize, "bold")
         self.create_text(self.w / 2, self.h / 2, text=self.text, fill=fg,
-                        font=font(fsize, "bold"))
+                        font=ft)
 
     def _click(self, _e):
         if self._enabled and self.command:
@@ -1455,17 +1462,17 @@ class App(tk.Tk):
             w.destroy()
         if getattr(self, "_wizard_mode", "home") == "home":
             RoundButton(self._nav, "APP OPTIONS", self._app_options, kind="secondary",
-                        width=140, height=44).pack(side="left")
+                        width=120, height=40).pack(side="left")
             RoundButton(self._nav, "HISTORY", self._show_history, kind="secondary",
-                        width=120, height=44).pack(side="left", padx=(S(8), 0))
-            RoundButton(self._nav, "EDIT CONFIG", self._enter_config_wizard,
-                        kind="secondary", width=150, height=44).pack(side="right",
-                                                                     padx=(S(8), 0))
-            run_lbl = ("▶  RUN SWEEP" if self.eval_var.get() == "sweep"
-                       else "▶  RUN COMPILE")
+                        width=100, height=40).pack(side="left", padx=(S(6), 0))
+            run_lbl = ("▶ SWEEP" if self.eval_var.get() == "sweep"
+                       else "▶ COMPILE")
             self.run_btn = RoundButton(self._nav, run_lbl, self._run,
-                                       kind="hero", width=300, height=58)
+                                       kind="primary", width=168, height=44)
             self.run_btn.pack(side="right")
+            RoundButton(self._nav, "EDIT CONFIG", self._enter_config_wizard,
+                        kind="secondary", width=130, height=40).pack(side="right",
+                                                                     padx=(0, S(8)))
             return
         RoundButton(self._nav, "APP OPTIONS", self._app_options, kind="secondary",
                     width=140, height=44).pack(side="left")
@@ -2591,25 +2598,29 @@ class App(tk.Tk):
 
         # -- Footer (pinned) -------------------------------------------------
         footer = tk.Frame(self.main, bg=WHITE)
-        footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(12))
         tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
-        RoundButton(footer, "RUN AGAIN", self._back, kind="secondary",
-                    width=140, height=44).pack(side="left")
-        RoundButton(footer, "LIVE TESTING", self._live_test, kind="primary",
-                    width=170, height=44).pack(side="left", padx=(S(8), 0))
-        RoundButton(footer, "HISTORY", self._show_history, kind="secondary",
-                    width=120, height=44).pack(side="left", padx=(S(8), 0))
-        RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
-                    width=160, height=44).pack(side="left", padx=(S(8), 0))
-        RoundButton(footer, "FULL LOG", self._show_log, kind="primary",
-                    width=130, height=44).pack(side="right")
+        foot_top = tk.Frame(footer, bg=WHITE)
+        foot_top.pack(fill="x")
+        foot_bot = tk.Frame(footer, bg=WHITE)
+        foot_bot.pack(fill="x", pady=(S(6), 0))
+        RoundButton(foot_top, "RUN AGAIN", self._back, kind="secondary",
+                    width=120, height=40).pack(side="left")
+        RoundButton(foot_top, "LIVE TEST", self._live_test, kind="primary",
+                    width=120, height=40).pack(side="left", padx=(S(6), 0))
+        RoundButton(foot_top, "FULL LOG", self._show_log, kind="secondary",
+                    width=110, height=40).pack(side="right")
         if s and s.get("package_zip"):
-            RoundButton(footer, "OPEN PACKAGE",
+            RoundButton(foot_top, "OPEN PKG",
                         lambda: self._reveal(s.get("package_zip")), kind="primary",
-                        width=170, height=44).pack(side="right", padx=(0, S(8)))
+                        width=120, height=40).pack(side="right", padx=(0, S(6)))
         else:
-            RoundButton(footer, "EXPORT PACKAGE", self._export_package, kind="primary",
-                        width=180, height=44).pack(side="right", padx=(0, S(8)))
+            RoundButton(foot_top, "EXPORT", self._export_package, kind="primary",
+                        width=110, height=40).pack(side="right", padx=(0, S(6)))
+        RoundButton(foot_bot, "HISTORY", self._show_history, kind="secondary",
+                    width=100, height=40).pack(side="left")
+        RoundButton(foot_bot, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
+                    width=130, height=40).pack(side="left", padx=(S(6), 0))
 
         outer = tk.Frame(self.main, bg=WHITE)
         outer.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
@@ -2826,17 +2837,20 @@ class App(tk.Tk):
 
         # Footer (pinned).
         footer = tk.Frame(self.main, bg=WHITE)
-        footer.pack(side="bottom", fill="x", padx=pad, pady=S(14))
+        footer.pack(side="bottom", fill="x", padx=pad, pady=S(12))
         tk.Frame(self.main, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
-        RoundButton(footer, "BACK", self._back, kind="secondary",
-                    width=120, height=44).pack(side="left")
-        RoundButton(footer, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
-                    width=170, height=44).pack(side="left", padx=(S(8), 0))
-        RoundButton(footer, "FULL LOG", self._show_log, kind="secondary",
-                    width=130, height=44).pack(side="left", padx=(S(8), 0))
+        foot_row = tk.Frame(footer, bg=WHITE)
+        foot_row.pack(fill="x")
+        RoundButton(foot_row, "BACK", self._back, kind="secondary",
+                    width=100, height=40).pack(side="left")
+        RoundButton(foot_row, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
+                    width=130, height=40).pack(side="left", padx=(S(6), 0))
+        RoundButton(foot_row, "FULL LOG", self._show_log, kind="secondary",
+                    width=110, height=40).pack(side="right")
         if winner:
-            RoundButton(footer, "USE WINNER", lambda: self._use_winner(winner),
-                        kind="primary", width=170, height=44).pack(side="right")
+            RoundButton(foot_row, "USE WINNER", lambda: self._use_winner(winner),
+                        kind="primary", width=130, height=40).pack(side="right",
+                                                                   padx=(0, S(6)))
 
         outer = tk.Frame(self.main, bg=WHITE)
         outer.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
