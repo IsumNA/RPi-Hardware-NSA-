@@ -77,7 +77,7 @@ _LOGO = r"""
 """
 
 
-def banner(subtitle: str = "Neural Sensor Architecture") -> None:
+def banner(subtitle: str = "Neural Architecture Search") -> None:
     """Render the top-of-screen Raspberry Pi branded banner."""
     title = Text()
     title.append("NSA", style=f"bold {RPI_RASPBERRY}")

@@ -303,7 +303,11 @@ def list_frames(path: str | None, filter_tokens: list[str] | None = None,
     """
     if not path:
         return []
-    p = Path(path).expanduser()
+    try:
+        from nsa.denoise_hw_data import normalize_dataset_root
+        p = normalize_dataset_root(path)
+    except Exception:
+        p = Path(path).expanduser()
     frames: list[dict] = []
 
     if p.is_file():

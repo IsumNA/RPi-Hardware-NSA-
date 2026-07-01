@@ -159,6 +159,15 @@ def load_config(path: str | Path) -> Config:
     _merge(cfg.optimization, raw.get("optimization", {}))
     _merge(cfg.output, raw.get("output", {}))
     _merge(cfg.run, raw.get("run", {}))
+    try:
+        from nsa.denoise_hw_data import apply_auto_dataset, ensure_project_dataset
+        if not cfg.sensor.real_capture or not cfg.sensor.dataset_path:
+            apply_auto_dataset(cfg)
+        elif not Path(cfg.sensor.dataset_path).exists():
+            ensure_project_dataset(Path(__file__).resolve().parents[1])
+            apply_auto_dataset(cfg)
+    except Exception:
+        pass
     return cfg
 
 

@@ -1,5 +1,5 @@
 # =============================================================================
-#  NSA  -  Neural Sensor Architecture
+#  NSA  -  Neural Architecture Search
 #  6-Level Optimization Stack  ::  Compilation Profile
 # =============================================================================
 #  This is the single source of truth your manager edits for the demo.
@@ -33,7 +33,7 @@ sensor:
   #   imx219  -> legacy Camera Module v2 (noisy, messy chroma)
   #   imx662  -> current Starvis 2 (low read noise)
   #   imxng   -> unreleased next-gen low-light Starvis 2 (shot-noise limited)
-  sensor: imx662
+  sensor: imx219
   # Path to a real Bayer RAW frame. If null or missing, the stack synthesises a
   # physically-plausible RAW for the chosen sensor so the demo runs out-of-the-box.
   input_raw: null
@@ -43,13 +43,13 @@ sensor:
   #   dataset_path        -> a folder (or single file) of real RAW/image captures,
   #                          e.g. a cloned repo of IMX219 frames. A frame is picked
   #                          per-seed so re-runs can show different captures.
-  real_capture: false
-  dataset_path: null        # e.g. ./datasets/imx219_raws  (folder or file)
+  real_capture: true
+  dataset_path: datasets/PI_RAW   # denoise-hw PI_RAW layout (run setup_denoise_hw_data.py)
   # Paired folders (a noisy.* + gt.* per folder, the denoise-hw convention) are
   # auto-detected and used as real ground truth. simulate_noise injects the
   # selected sensor's physics on top of loaded frames (clean -> noisy).
   simulate_noise: false
-  filter: []                # keyword filter for dataset folders, e.g. [imx219, ag12]
+  filter: [imx219, ag12]    # denoise-hw test scene filter (cabinet_D50_100/imx219_ag12_test)
   gain: 512                 # analog gain multiplier (challenge frame): 256 | 512
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------

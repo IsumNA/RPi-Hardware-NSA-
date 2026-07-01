@@ -59,7 +59,7 @@ def main() -> int:
     if headless:
         cfg.output.show_window = False
 
-    banner(f"Neural Sensor Architecture  ·  v{__version__}")
+    banner(f"Neural Architecture Search  ·  v{__version__}")
 
     try:
         cfg.validate()

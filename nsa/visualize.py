@@ -73,7 +73,7 @@ def render_panel(
 
     fig.text(tx, 0.94, "NSA", fontsize=21, fontweight="bold", color=RASPBERRY,
              ha="left", va="center")
-    fig.text(tx + 0.052, 0.94, "Neural Sensor Architecture",
+    fig.text(tx + 0.052, 0.94, "Neural Architecture Search",
              fontsize=15, fontweight="bold", color=INK, ha="left", va="center")
     fig.text(tx, 0.895, "Visual Validation Matrix  ·  6-Level Optimization Stack",
              fontsize=10.5, color=SUBTLE, ha="left", va="center")

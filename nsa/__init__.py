@@ -1,4 +1,4 @@
-"""NSA - Neural Sensor Architecture.
+"""NSA - Neural Architecture Search.
 
 A 6-Level Optimization Stack that turns a noisy IMX662 Bayer RAW frame and a
 target-hardware configuration into a hardware-ready, quantized denoising model.

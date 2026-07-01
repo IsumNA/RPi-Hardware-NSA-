@@ -856,7 +856,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         _resolve_font_family()
-        self.title("NSA — Neural Sensor Architecture")
+        self.title("NSA — Neural Architecture Search")
         self.configure(bg=WHITE)
         self._apply_geometry()
         # On Windows we already scale fonts via FT(); applying Tk's own scaling on
@@ -1165,7 +1165,7 @@ class App(tk.Tk):
 
         self.filter_var = self._entry_row(
             body, "filter", "Dataset Filter",
-            "Keyword filter for folders (e.g. imx219 ag12)", "")
+            "Keyword filter for folders (e.g. imx219 ag12)", "imx219 ag12")
         self._check(body, "Simulate sensor noise on loaded frames",
                     "Inject the selected sensor's physics on top of the real frames.",
                     self.sim_noise_var)
@@ -1195,6 +1195,8 @@ class App(tk.Tk):
             body, "batch", "Batch Size", "Frames to load in batch mode", "6")
         self.burst_var = self._entry_row(
             body, "burst", "Temporal Burst", "Frames in a temporal-denoise burst", "8")
+
+        self._apply_denoise_hw_defaults()
 
         cache_row = tk.Frame(body, bg=WHITE)
         cache_row.pack(fill="x", pady=S(6))
@@ -1402,6 +1404,33 @@ class App(tk.Tk):
         self._nav = tk.Frame(self.main, bg=WHITE)
         self._nav.pack(side="bottom", fill="x", padx=pad, pady=S(16))
         # Buttons are (re)created per step by _render_nav().
+
+    def _apply_denoise_hw_defaults(self):
+        """Use denoise-hw PI_RAW when config.yaml or datasets/PI_RAW is present."""
+        try:
+            from nsa.config import load_config
+            from nsa.denoise_hw_data import ensure_project_dataset
+            ensure_project_dataset(ROOT)
+            cfg = load_config(ROOT / "config.yaml")
+            if cfg.sensor.real_capture:
+                self.source_var.set("real")
+            if cfg.sensor.dataset_path:
+                self.dataset_path = str(
+                    (ROOT / cfg.sensor.dataset_path).resolve()
+                    if not Path(cfg.sensor.dataset_path).is_absolute()
+                    else Path(cfg.sensor.dataset_path))
+            if cfg.sensor.filter and hasattr(self, "filter_var"):
+                self.filter_var.set(" ".join(cfg.sensor.filter))
+            if cfg.sensor.sensor and "sensor" in self.rows:
+                self.rows["sensor"].set(cfg.sensor.sensor)
+            if hasattr(self, "dataset_label"):
+                label = (self.dataset_path or cfg.sensor.dataset_path
+                         or "datasets/PI_RAW (denoise-hw)")
+                self.dataset_label.config(text=str(label), fg=SUBTLE)
+            self._on_source_change()
+            self._on_sensor_change()
+        except Exception:
+            pass
 
     def _on_source_change(self):
         real = self.source_var.get() == "real"

@@ -8,8 +8,11 @@ venv/
 # Demo outputs (regenerated on every run)
 outputs/
 
-# Real-capture datasets (cloned/local RAW frames, not part of the repo)
-datasets/
+# Real-capture datasets — large DNG trees stay local; sample PNGs may be committed
+datasets/**/*.dng
+datasets/**/*.raw
+third_party/
+.tmp/
 
 # Frozen Hugging Face snapshots (pinned model weights, can be large)
 models/frozen/

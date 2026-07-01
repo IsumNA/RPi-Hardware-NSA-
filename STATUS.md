@@ -1,6 +1,6 @@
 # NSA — Project Status
 
-**Component:** Neural Sensor Architecture — 6-Level Optimization Stack
+**Component:** Neural Architecture Search — 6-Level Optimization Stack
 **Stage:** Working prototype / demo
 **Last updated:** 2026-06-30
 
@@ -61,6 +61,7 @@ Running `python run_demo.py` (or the GUI) executes all six levels live:
 | Sensor gain | ✅ | 256× / 512× challenge frames |
 | Real RAW / image input | ✅ | `.npy`, standard images, and `.dng` (via `rawpy` if installed) |
 | Real **paired** datasets | ✅ | `noisy.*`/`gt.*` folders auto-detected → real ground truth (denoise-hw convention) |
+| denoise-hw PI_RAW testing | ✅ | `setup_denoise_hw_data.py` + `datasets/PI_RAW` (denoise-hw `Data/…` layout); `config.yaml` defaults to `--real` on `imx219 ag12` test scene; link `/opt/datasets/PI_RAW` on Pi for real DNGs |
 | Dataset keyword filter | ✅ | `--filter imx219 ag12` (denoise-hw semantics) |
 | Detail-scored patch crop | ✅ | Laplacian-variance scoring picks the sharpest crop |
 | Simulate noise on real frames | ✅ | `--simulate-noise`: inject a sensor's physics on top of loaded frames |

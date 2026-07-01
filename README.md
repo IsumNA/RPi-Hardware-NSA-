@@ -1,5 +1,5 @@
-# NSA — Neural Sensor Architecture
-### A working 6-Level Optimization Stack for hardware-aware RAW image denoising
+# NSA — Neural Architecture Search
+### A working 6-Level neural architecture search stack for hardware-aware RAW image denoising
 
 This prototype turns a **theoretical 6-level optimization stack** into a real,
 runnable software toolchain. You give it a target accelerator and a model
@@ -86,6 +86,20 @@ The real-dataset ingestion reuses the conventions of
 > convention, and detail-scored patch selection are adapted from
 > [denoise-hw](https://github.com/davidplowman/denoise-hw).
 
+**Testing on denoise-hw images** — the denoise-hw repo is training code only;
+captures live in a `PI_RAW/Data/…` tree (on a Pi, usually `/opt/datasets/PI_RAW`).
+NSA ships the same folder layout under `datasets/PI_RAW` and defaults
+`config.yaml` to real captures:
+
+```bash
+python setup_denoise_hw_data.py                    # sample PNG pairs + instructions
+python setup_denoise_hw_data.py --link /opt/datasets/PI_RAW   # Pi: use real DNGs
+python run_demo.py --real --dataset datasets/PI_RAW --filter imx219 ag12 --sensor imx219
+```
+
+This uses the same test scene as denoise-hw's `test.py`
+(`cabinet_D50_100/imx219_ag12_test`).
+
 ---
 
 ## Inputs
@@ -127,6 +141,7 @@ Edit `config.yaml`, or override any value on the command line.
 | `python live.py` | **Live testing** — runs the last-compiled model (`outputs/model.pt`) on a live camera feed and shows the **raw sensor frame next to the denoised output** in real time, with live latency / FPS and a noise-reduction readout. Auto-detects the Raspberry Pi CSI camera (picamera2, e.g. the IMX662 low-light module) → a USB webcam (`--source opencv`) → a simulated low-light stream (`--source sim`) so it works even with no camera. |
 | `python hf_search.py --query qwen --size small` | **Hugging Face model sourcing** — searches the Hub filtered strictly to Apache-2.0 / MIT, tiered by size (small 1-8B → mid 8-20B → large 20-80B). `--freeze MODEL` locks the exact commit SHA into `outputs/hf_lock.json` (add `--download` to pull a pinned snapshot into `models/frozen/`); `--list-locked` shows what's frozen. |
 | `python cache.py --dataset DIR --per-image 6` | **Patch-cache builder** — detail-scored crops → `outputs/patch_cache/` for full training runs (denoise-hw `dataset.py` idea). |
+| `python setup_denoise_hw_data.py` | **denoise-hw test images** — prepare `datasets/PI_RAW` (sample PNG pairs or `--link /opt/datasets/PI_RAW` on Pi); patches `config.yaml` with `--write-config`. |
 | `python deploy.py` | **Deployment package** — bundles the compiled artifacts + `FLASH_INSTRUCTIONS.md` + `manifest.json` into `outputs/deployment/…zip` (flashing still needs the vendor SDK + device). Run automatically when you pass `--export` (or tick *Compile & export* in the GUI). |
 
 All of the above are also available as controls in the desktop GUI. The GUI is a
