@@ -337,6 +337,8 @@ def main() -> int:
         "frames": cfg.data.temporal_frames,
         "real_capture": real_loaded,
         "gt_kind": gt_kind,
+        "frame_source": str(frame.source) if real_loaded else "synthetic",
+        "dataset_path": str(real_source) if real_loaded else None,
         "batch": len(frames) if batch else 0,
         "family": cfg.model.model_family,
         "precision": "INT8" if quantized else result.precision.upper(),
@@ -404,6 +406,8 @@ def main() -> int:
         "gain": cfg.sensor.gain,
         "capture_mode": ("real" if real_loaded else "simulated")
                         + (" + simulated noise" if cfg.sensor.simulate_noise else ""),
+        "frame_source": str(frame.source) if real_loaded else "synthetic",
+        "dataset_path": str(real_source) if real_loaded else None,
         "gt_kind": gt_kind,
         "run_mode": cfg.run.mode,
         "frames": len(frames),

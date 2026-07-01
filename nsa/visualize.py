@@ -94,8 +94,13 @@ def render_panel(
                           wspace=0.05)
     real = meta.get("real_capture", False)
     kind = meta.get("gt_kind", "temporal")
-    raw_sub = (f"{meta.get('sensor', 'sensor')}  ·  real capture" if real
-               else f"{meta.get('sensor', 'sensor')}  ·  {meta['gain']}× gain")
+    src = meta.get("frame_source", "")
+    if real and kind in ("paired", "paired+sim") and src:
+        raw_sub = f"{meta.get('sensor', 'sensor')}  ·  {src}  (denoise-hw paired)"
+    elif real:
+        raw_sub = f"{meta.get('sensor', 'sensor')}  ·  real capture"
+    else:
+        raw_sub = f"{meta.get('sensor', 'sensor')}  ·  {meta['gain']}× gain  ·  synthetic"
     if kind in ("paired", "paired+sim"):
         gt_title, gt_sub = "GROUND TRUTH", "paired gt frame"
     elif kind == "reference":

@@ -1084,6 +1084,7 @@ class App(tk.Tk):
                                 "subtitle": subtitle, "holder": holder})
 
         # Initialise dependent UI state, then show the first step.
+        self._apply_denoise_hw_defaults()
         self._step = 0
         self._on_sensor_change()
         self._on_mode_change()
@@ -1195,8 +1196,6 @@ class App(tk.Tk):
             body, "batch", "Batch Size", "Frames to load in batch mode", "6")
         self.burst_var = self._entry_row(
             body, "burst", "Temporal Burst", "Frames in a temporal-denoise burst", "8")
-
-        self._apply_denoise_hw_defaults()
 
         cache_row = tk.Frame(body, bg=WHITE)
         cache_row.pack(fill="x", pady=S(6))
@@ -1794,6 +1793,8 @@ class App(tk.Tk):
             dataset = self.dataset_path or self._materialise_uploads()
             if dataset:
                 cmd += ["--dataset", dataset]
+            elif (ROOT / "datasets" / "PI_RAW").exists():
+                cmd += ["--dataset", str(ROOT / "datasets" / "PI_RAW")]
             if self.sim_noise_var.get():
                 cmd += ["--simulate-noise"]
             tokens = (self.filter_var.get() or "").split()
@@ -2395,6 +2396,12 @@ class App(tk.Tk):
             details = [
                 ("Sensor", f"{s.get('sensor','')}  ({s.get('sensor_key','')})  ·  {s.get('gain','')}× gain"),
                 ("Capture", s.get("capture_mode", "")),
+            ]
+            if s.get("frame_source") and s.get("frame_source") != "synthetic":
+                details.append(("Frame", s.get("frame_source", "")))
+            if s.get("dataset_path"):
+                details.append(("Dataset", s.get("dataset_path", "")))
+            details += [
                 ("Ground truth", s.get("gt_kind", "")),
                 ("Run mode", run_txt),
                 ("Quantization", quant_txt or "—"),
