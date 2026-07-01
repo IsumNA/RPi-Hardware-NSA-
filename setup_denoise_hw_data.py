@@ -5,14 +5,19 @@ The denoise-hw repo (https://github.com/davidplowman/denoise-hw) does not ship
 RAW captures — it expects PI_RAW at /opt/datasets/PI_RAW on a Pi. This script:
 
   1. Clones denoise-hw into third_party/ (reference + tunings)
-  2. Links or builds datasets/PI_RAW (sample paired PNGs, or symlink to Pi data)
+  2. Links, fetches, or builds datasets/PI_RAW (real DNGs or sample PNGs)
   3. Prints how to run NSA on the same test folders denoise-hw uses
 
 Examples
 --------
-  python setup_denoise_hw_data.py
-  python setup_denoise_hw_data.py --link /opt/datasets/PI_RAW
-  python setup_denoise_hw_data.py --list
+  # On the AI machine (data already at /opt/datasets/PI_RAW):
+  python setup_denoise_hw_data.py --use /opt/datasets/PI_RAW --write-config
+
+  # On Windows — copy the denoise-hw test scene to Desktop, point config there:
+  python setup_denoise_hw_data.py --fetch you@ai-machine:/opt/datasets/PI_RAW --desktop --write-config
+
+  # Symlink project datasets/PI_RAW to a local folder:
+  python setup_denoise_hw_data.py --link /opt/datasets/PI_RAW --write-config
 """
 
 from __future__ import annotations
@@ -24,10 +29,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from nsa.denoise_hw_data import (DEFAULT_FILTER, DEFAULT_TEST_REL, apply_auto_dataset,
-                                 clone_denoise_hw, dataset_summary, ensure_project_dataset,
-                                 normalize_dataset_root, resolve_pi_raw)
-from nsa.config import load_config
+from nsa.denoise_hw_data import (DEFAULT_FILTER, DEFAULT_REMOTE_PI_RAW, DEFAULT_TEST_REL,
+                                 clone_denoise_hw, dataset_summary, desktop_pi_raw_path,
+                                 ensure_project_dataset, fetch_pi_raw, link_or_point_dataset,
+                                 normalize_dataset_root, patch_config_dataset, resolve_pi_raw)
 from nsa.theme import banner, console, kv_table, log
 
 
@@ -36,6 +41,14 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--link", metavar="PI_RAW",
                    help="symlink datasets/PI_RAW to this folder (e.g. /opt/datasets/PI_RAW)")
+    p.add_argument("--use", metavar="PI_RAW",
+                   help="use this PI_RAW root directly (no copy); best on the AI machine")
+    p.add_argument("--fetch", metavar="REMOTE",
+                   help=f"scp from REMOTE (e.g. user@host:{DEFAULT_REMOTE_PI_RAW})")
+    p.add_argument("--desktop", action="store_true",
+                   help="with --fetch: copy to ~/Desktop/PI_RAW instead of datasets/PI_RAW")
+    p.add_argument("--full", action="store_true",
+                   help="with --fetch: copy the entire remote tree (default: test scene only)")
     p.add_argument("--no-clone", action="store_true",
                    help="skip cloning denoise-hw into third_party/")
     p.add_argument("--rebuild-samples", action="store_true",
@@ -52,31 +65,43 @@ def main() -> int:
         log(f"denoise-hw reference -> {dest}", "ok")
 
     local = ROOT / "datasets" / "PI_RAW"
-    if args.link:
-        link_src = Path(args.link).expanduser().resolve()
-        if not link_src.is_dir():
-            log(f"Not a directory: {link_src}", "err")
+    root: Path | None = None
+
+    if args.fetch:
+        dest = desktop_pi_raw_path() if args.desktop else local
+        try:
+            root = fetch_pi_raw(args.fetch, dest, full=args.full)
+            label = "Desktop" if args.desktop else "project"
+            log(f"Fetched PI_RAW -> {root} ({label})", "ok")
+        except Exception as exc:
+            log(f"Fetch failed: {exc}", "err")
             return 1
-        if local.exists() or local.is_symlink():
-            if local.is_symlink():
-                local.unlink()
-            elif local.is_dir() and not any(local.iterdir()):
-                local.rmdir()
-            else:
-                log(f"Remove or rename {local} first", "err")
-                return 1
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.symlink_to(link_src, target_is_directory=True)
-        log(f"Linked {local} -> {link_src}", "ok")
+    elif args.use:
+        use_src = Path(args.use).expanduser().resolve()
+        try:
+            root = link_or_point_dataset(local, use_src, prefer_symlink=False)
+            log(f"Using PI_RAW at {root}", "ok")
+        except Exception as exc:
+            log(f"Cannot use {use_src}: {exc}", "err")
+            return 1
+    elif args.link:
+        link_src = Path(args.link).expanduser().resolve()
+        try:
+            root = link_or_point_dataset(local, link_src)
+            log(f"Linked {local} -> {link_src}", "ok")
+        except Exception as exc:
+            log(f"Link failed: {exc}", "err")
+            return 1
     elif args.rebuild_samples:
         from nsa.denoise_hw_data import build_sample_pi_raw
         build_sample_pi_raw(local)
-        log(f"Rebuilt sample pairs under {local}", "ok")
+        root = local.resolve()
+        log(f"Rebuilt sample pairs under {root}", "ok")
     else:
-        path = ensure_project_dataset(ROOT)
-        log(f"Dataset root: {path}", "ok")
+        root = ensure_project_dataset(ROOT)
+        log(f"Dataset root: {root}", "ok")
 
-    root = resolve_pi_raw(local) or normalize_dataset_root(local)
+    root = resolve_pi_raw(root) or normalize_dataset_root(root or local)
     info = dataset_summary(root)
     console.print()
     console.print(kv_table([
@@ -103,27 +128,16 @@ def main() -> int:
 
     console.print()
     console.print("[bold]Run NSA on denoise-hw images:[/]")
-    console.print("  python run_demo.py --real --dataset datasets/PI_RAW "
+    ds = info["root"] or "datasets/PI_RAW"
+    console.print(f"  python run_demo.py --real --dataset {ds} "
                   f"--filter {' '.join(DEFAULT_FILTER)} --sensor imx219")
-    console.print("  python cache.py --dataset datasets/PI_RAW --filter imx219")
-    console.print("  python search.py --real --dataset datasets/PI_RAW --hardware hailo8")
+    console.print(f"  python cache.py --dataset {ds} --filter imx219")
+    console.print(f"  python search.py --real --dataset {ds} --hardware hailo8")
 
-    if args.write_config:
-        _patch_config(root)
+    if args.write_config and root:
+        patch_config_dataset(ROOT / "config.yaml", root)
+        log(f"Updated {ROOT / 'config.yaml'} -> dataset_path: {root}", "ok")
     return 0
-
-
-def _patch_config(root: Path | None) -> None:
-    import re
-    cfg_path = ROOT / "config.yaml"
-    text = cfg_path.read_text(encoding="utf-8")
-    ds = str(root or ROOT / "datasets" / "PI_RAW").replace("\\", "/")
-    text = re.sub(r"real_capture:\s*\w+", "real_capture: true", text)
-    text = re.sub(r"dataset_path:\s*\S+", f"dataset_path: {ds}", text)
-    if "filter:" in text and "imx219" not in text:
-        text = re.sub(r"filter:\s*\[\]", "filter: [imx219, ag12]", text)
-    cfg_path.write_text(text, encoding="utf-8")
-    log(f"Updated {cfg_path} for real PI_RAW captures", "ok")
 
 
 if __name__ == "__main__":

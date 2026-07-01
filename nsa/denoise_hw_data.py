@@ -9,6 +9,8 @@ layout and falls back to ``datasets/PI_RAW`` in this project.
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,13 +21,26 @@ from nsa.raw_io import find_paired_folders, list_frames
 DEFAULT_TEST_REL = "Data/cabinet_D50_100/imx219_ag12_test"
 DEFAULT_FILTER = ["imx219", "ag12"]
 DEFAULT_DATASET_PATH = "datasets/PI_RAW"
+DEFAULT_REMOTE_PI_RAW = "/opt/datasets/PI_RAW"
 
-PI_RAW_SEARCH = (
-    Path("datasets/PI_RAW"),
-    Path("../datasets/PI_RAW"),
-    Path("/opt/datasets/PI_RAW"),
-    Path(os.environ.get("PI_RAW", "")) if os.environ.get("PI_RAW") else None,
-)
+
+def desktop_pi_raw_path() -> Path:
+    """``~/Desktop/PI_RAW`` (Windows or macOS/Linux)."""
+    base = os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home())
+    return Path(base).expanduser() / "Desktop" / "PI_RAW"
+
+
+def _pi_raw_search_paths() -> tuple[Path | None, ...]:
+    return (
+        Path("datasets/PI_RAW"),
+        Path("../datasets/PI_RAW"),
+        desktop_pi_raw_path(),
+        Path("/opt/datasets/PI_RAW"),
+        Path(os.environ.get("PI_RAW", "")) if os.environ.get("PI_RAW") else None,
+    )
+
+
+PI_RAW_SEARCH = _pi_raw_search_paths()
 
 
 def resolve_pi_raw(explicit: str | Path | None = None) -> Path | None:
@@ -97,6 +112,83 @@ def apply_auto_dataset(cfg, project_root: Path | None = None) -> bool:
     return True
 
 
+def parse_remote_spec(spec: str) -> tuple[str, str]:
+    """``user@host:/opt/datasets/PI_RAW`` -> (``user@host``, ``/opt/datasets/PI_RAW``)."""
+    spec = spec.strip()
+    if ":" not in spec:
+        raise ValueError(
+            f"Remote spec must look like user@host:/opt/datasets/PI_RAW (got {spec!r})"
+        )
+    host, path = spec.rsplit(":", 1)
+    if not host or not path:
+        raise ValueError(f"Invalid remote spec: {spec!r}")
+    return host, path
+
+
+def fetch_pi_raw(remote_spec: str, dest: Path, *, full: bool = False) -> Path:
+    """Copy PI_RAW from a remote machine with ``scp -r``.
+
+    By default only the canonical denoise-hw test folder is copied (small).
+    Pass ``full=True`` to mirror the entire remote tree (can be very large).
+    """
+    host, remote_root = parse_remote_spec(remote_spec)
+    remote_root = remote_root.rstrip("/")
+    dest = dest.expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("scp") is None:
+        raise RuntimeError("scp not found — install OpenSSH client")
+
+    if full:
+        log_cmd = ["scp", "-r", f"{host}:{remote_root}/.", str(dest)]
+    else:
+        remote_folder = f"{remote_root}/{DEFAULT_TEST_REL}"
+        local_parent = dest / Path(DEFAULT_TEST_REL).parent
+        local_parent.mkdir(parents=True, exist_ok=True)
+        log_cmd = ["scp", "-r", f"{host}:{remote_folder}",
+                   str(local_parent / Path(DEFAULT_TEST_REL).name)]
+
+    subprocess.run(log_cmd, check=True)
+    if not find_paired_folders(str(dest)):
+        raise RuntimeError(f"Fetch finished but no paired folders under {dest}")
+    return dest
+
+
+def patch_config_dataset(cfg_path: Path, dataset_root: Path) -> None:
+    """Point ``config.yaml`` at a PI_RAW root."""
+    text = cfg_path.read_text(encoding="utf-8")
+    ds = str(dataset_root).replace("\\", "/")
+    text = re.sub(r"real_capture:\s*\w+", "real_capture: true", text)
+    text = re.sub(r"dataset_path:\s*\S+", f"dataset_path: {ds}", text)
+    if "filter:" in text and "imx219" not in text:
+        text = re.sub(r"filter:\s*\[\]", "filter: [imx219, ag12]", text)
+    cfg_path.write_text(text, encoding="utf-8")
+
+
+def link_or_point_dataset(local: Path, src: Path, *, prefer_symlink: bool = True) -> Path:
+    """Symlink ``local`` -> ``src`` when possible; otherwise just return ``src``."""
+    src = src.expanduser().resolve()
+    if not src.is_dir():
+        raise FileNotFoundError(f"Not a directory: {src}")
+    if not find_paired_folders(str(src)):
+        raise ValueError(f"No paired noisy/gt folders under {src}")
+    if prefer_symlink and local.resolve() != src:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if local.exists() or local.is_symlink():
+            if local.is_symlink():
+                local.unlink()
+            elif local.is_dir() and not any(local.iterdir()):
+                local.rmdir()
+            else:
+                raise FileExistsError(f"Remove or rename {local} first")
+        try:
+            local.symlink_to(src, target_is_directory=True)
+            return local.resolve()
+        except OSError:
+            pass
+    return src
+
+
 def clone_denoise_hw(dest: Path) -> Path:
     """Shallow-clone davidplowman/denoise-hw (reference code + tunings)."""
     dest = dest.resolve()
@@ -145,18 +237,16 @@ def build_sample_pi_raw(out_root: Path, seed: int = 219) -> int:
 
 
 def ensure_project_dataset(project_root: Path | None = None) -> Path:
-    """Guarantee datasets/PI_RAW exists (sample PNGs or symlink to system PI_RAW)."""
+    """Pick the best local PI_RAW root (system, desktop, or synthetic samples)."""
     root = project_root or Path(__file__).resolve().parents[1]
     local = root / "datasets" / "PI_RAW"
-    system = resolve_pi_raw("/opt/datasets/PI_RAW")
-    if system and system != local.resolve():
-        if not local.exists():
+    for candidate in (Path("/opt/datasets/PI_RAW"), desktop_pi_raw_path()):
+        if candidate.exists() and find_paired_folders(str(candidate)):
             try:
-                local.parent.mkdir(parents=True, exist_ok=True)
-                local.symlink_to(system, target_is_directory=True)
-                return local
-            except OSError:
-                pass
-    if not find_paired_folders(str(local)):
-        build_sample_pi_raw(local)
+                return link_or_point_dataset(local, candidate)
+            except (FileExistsError, OSError):
+                return candidate.resolve()
+    if find_paired_folders(str(local)):
+        return local.resolve()
+    build_sample_pi_raw(local)
     return local.resolve()
