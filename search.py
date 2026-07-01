@@ -355,13 +355,15 @@ def build_parser() -> argparse.ArgumentParser:
                    default="hailo8", help="target accelerator (default: hailo8)")
     # Data source
     p.add_argument("--sensor", choices=["imx219", "imx662", "imxng"],
-                   default="imx662", help="sensor noise profile (default: imx662)")
+                   default="imx219", help="sensor noise profile (default: imx219)")
     p.add_argument("--gain", type=int, choices=[256, 512], default=512,
                    help="analog gain of the test frame (default: 512)")
     p.add_argument("--real", dest="real_capture", action="store_true",
                    help="use real captures from --dataset as the noisy input")
+    p.add_argument("--simulated", dest="simulated", action="store_true",
+                   help="synthesise sensor physics instead of real captures")
     p.add_argument("--dataset", dest="dataset_path", default=None,
-                   help="folder or file of real captures (required with --real)")
+                   help="folder or file of real captures (default: datasets/PI_RAW)")
     p.add_argument("--all-sensors", dest="all_sensors", action="store_true",
                    help="sweep across every sensor profile (imx219, imx662, imxng) too")
     p.add_argument("--simulate-noise", dest="simulate_noise", action="store_true",
@@ -408,6 +410,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    if not args.simulated:
+        from nsa.config import Config
+        from nsa.denoise_hw_data import apply_auto_dataset
+        _cfg = Config()
+        if apply_auto_dataset(_cfg, Path(__file__).resolve().parent):
+            args.real_capture = True
+            args.dataset_path = args.dataset_path or _cfg.sensor.dataset_path
+            if not args.filter:
+                args.filter = list(_cfg.sensor.filter or [])
 
     banner("NSA Architecture Search")
 

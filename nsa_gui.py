@@ -1036,7 +1036,7 @@ class App(tk.Tk):
         self.rows = {}
         self.entries = {}
         self.mode_var = tk.StringVar(value="single")
-        self.source_var = tk.StringVar(value="sim")
+        self.source_var = tk.StringVar(value="real")
         self.sim_noise_var = tk.BooleanVar(value=False)
         self.quantize_var = tk.BooleanVar(value=True)
         self.qat_var = tk.BooleanVar(value=False)
@@ -1113,7 +1113,7 @@ class App(tk.Tk):
                  "Everything after this (noise model, data, network) adapts to it.",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(8)))
-        sensor_sel = SensorSelector(body, SENSOR_CARDS, "imx662",
+        sensor_sel = SensorSelector(body, SENSOR_CARDS, "imx219",
                                     command=self._on_sensor_change)
         sensor_sel.pack(fill="x", pady=(0, S(4)))
         self.rows["sensor"] = sensor_sel
@@ -1800,6 +1800,8 @@ class App(tk.Tk):
             tokens = (self.filter_var.get() or "").split()
             if tokens:
                 cmd += ["--filter", *tokens]
+        else:
+            cmd += ["--simulated"]
 
         if self.input_raw:
             cmd += ["--input-raw", self.input_raw]
@@ -1826,6 +1828,8 @@ class App(tk.Tk):
             cmd += ["--all-sensors"]
         if self.source_var.get() == "real":
             dataset = self.dataset_path or self._materialise_uploads()
+            if not dataset and (ROOT / "datasets" / "PI_RAW").exists():
+                dataset = str(ROOT / "datasets" / "PI_RAW")
             if dataset:
                 cmd += ["--real", "--dataset", dataset]
             if self.sim_noise_var.get():
@@ -1833,6 +1837,8 @@ class App(tk.Tk):
             tokens = (self.filter_var.get() or "").split()
             if tokens:
                 cmd += ["--filter", *tokens]
+        else:
+            cmd += ["--simulated"]
         return cmd
 
     def _build_cache(self):

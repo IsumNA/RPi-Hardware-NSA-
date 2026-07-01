@@ -18,6 +18,7 @@ from nsa.raw_io import find_paired_folders, list_frames
 # Same test folder denoise-hw's run.sh uses (test.py cabinet_D50_100/imx219_ag12_test).
 DEFAULT_TEST_REL = "Data/cabinet_D50_100/imx219_ag12_test"
 DEFAULT_FILTER = ["imx219", "ag12"]
+DEFAULT_DATASET_PATH = "datasets/PI_RAW"
 
 PI_RAW_SEARCH = (
     Path("datasets/PI_RAW"),
@@ -77,17 +78,19 @@ def dataset_summary(root: Path | None) -> dict:
     }
 
 
-def apply_auto_dataset(cfg) -> bool:
-    """If config has no real dataset, enable PI_RAW when found. Returns True if set."""
-    root = resolve_pi_raw(cfg.sensor.dataset_path)
+def apply_auto_dataset(cfg, project_root: Path | None = None) -> bool:
+    """Enable PI_RAW real captures when a dataset is available (bundled or linked)."""
+    root_dir = project_root or Path(__file__).resolve().parents[1]
+    explicit = cfg.sensor.dataset_path or DEFAULT_DATASET_PATH
+    root = resolve_pi_raw(explicit)
+    if root is None and cfg.sensor.real_capture:
+        ensure_project_dataset(root_dir)
+        root = resolve_pi_raw(explicit) or resolve_pi_raw(root_dir / DEFAULT_DATASET_PATH)
     if root is None:
         return False
-    if not cfg.sensor.dataset_path:
-        cfg.sensor.dataset_path = str(root)
-    if not cfg.sensor.real_capture:
-        cfg.sensor.real_capture = True
+    cfg.sensor.dataset_path = str(root)
+    cfg.sensor.real_capture = True
     if not cfg.sensor.filter:
-        # Prefer the canonical denoise-hw test scene when present.
         test_dir = root / DEFAULT_TEST_REL
         if test_dir.is_dir():
             cfg.sensor.filter = list(DEFAULT_FILTER)

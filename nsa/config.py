@@ -48,12 +48,12 @@ class ModelConfig:
 
 @dataclass
 class SensorConfig:
-    sensor: str = "imx662"          # profile key from nsa.sensors
+    sensor: str = "imx219"          # profile key from nsa.sensors (matches PI_RAW samples)
     input_raw: str | None = None
-    real_capture: bool = False      # load real frames instead of synthesising
-    dataset_path: str | None = None # folder/file of real captures (e.g. IMX219 repo)
+    real_capture: bool = True       # load real frames from dataset_path by default
+    dataset_path: str | None = "datasets/PI_RAW"
     simulate_noise: bool = False    # inject sensor noise on top of loaded frames
-    filter: list = field(default_factory=list)  # keyword filter (denoise-hw style)
+    filter: list = field(default_factory=lambda: ["imx219", "ag12"])
     gain: int = 512
 
 
@@ -160,12 +160,10 @@ def load_config(path: str | Path) -> Config:
     _merge(cfg.output, raw.get("output", {}))
     _merge(cfg.run, raw.get("run", {}))
     try:
-        from nsa.denoise_hw_data import apply_auto_dataset, ensure_project_dataset
-        if not cfg.sensor.real_capture or not cfg.sensor.dataset_path:
-            apply_auto_dataset(cfg)
-        elif not Path(cfg.sensor.dataset_path).exists():
-            ensure_project_dataset(Path(__file__).resolve().parents[1])
-            apply_auto_dataset(cfg)
+        from nsa.denoise_hw_data import apply_auto_dataset
+        project = Path(__file__).resolve().parents[1]
+        if cfg.sensor.real_capture:
+            apply_auto_dataset(cfg, project)
     except Exception:
         pass
     return cfg
@@ -196,6 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="folder/file of real captures (real-capture mode)")
     p.add_argument("--real", dest="real_capture", action="store_true",
                    help="use real captures from --dataset/dataset_path as the noisy input")
+    p.add_argument("--simulated", dest="simulated", action="store_true",
+                   help="synthesise sensor physics instead of loading real captures")
     p.add_argument("--simulate-noise", dest="simulate_noise", action="store_true",
                    help="inject the selected sensor's noise on top of loaded frames")
     p.add_argument("--filter", dest="filter", nargs="*",
@@ -248,6 +248,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.sensor.dataset_path = args.dataset_path
     if getattr(args, "real_capture", False):
         cfg.sensor.real_capture = True
+    if getattr(args, "simulated", False):
+        cfg.sensor.real_capture = False
     if getattr(args, "simulate_noise", False):
         cfg.sensor.simulate_noise = True
     if getattr(args, "filter", None):
