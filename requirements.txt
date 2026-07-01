@@ -31,6 +31,16 @@ onnx>=1.15
 # huggingface_hub>=0.23
 
 # Optional: live testing against the Raspberry Pi CSI camera (live.py / the GUI
-# LIVE TESTING button). Install ON THE PI (it ships with Raspberry Pi OS). On a
-# dev machine live.py falls back to a USB webcam (OpenCV) or a simulated stream.
-# picamera2>=0.3   # Raspberry Pi only
+# LIVE TESTING button). picamera2 is a SYSTEM package on the Pi (it binds to
+# libcamera), so it is installed with apt, NOT pip -- `pip install -r` cannot do
+# this for you. On the Raspberry Pi run:
+#
+#     sudo apt install -y python3-picamera2
+#     # recreate the venv so it can see the system picamera2:
+#     python3 -m venv --system-site-packages .venv
+#     source .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# (On a dev machine / no CSI camera, skip this -- live.py falls back to a USB
+# webcam via OpenCV, or a simulated low-light stream.)
+# picamera2>=0.3   # Raspberry Pi only -- prefer the apt package above

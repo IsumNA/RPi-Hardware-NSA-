@@ -200,6 +200,16 @@ Camera backends are auto-detected (override with `--source`):
    (`--source sim --sensor imx662`), so the feature is demonstrable on a dev
    machine with no camera attached.
 
+`picamera2` is a **system** package (it binds to libcamera), so on the Pi install
+it with apt and make the virtualenv able to see it — pip can't do this:
+
+```bash
+sudo apt install -y python3-picamera2
+python3 -m venv --system-site-packages .venv   # so the venv sees system picamera2
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
 In the GUI view, click **CLOSE** (or press `ESC`) to stop. With the standalone
 `python live.py`, press `q` or `ESC` in the window; on a headless box it saves a
 side-by-side sample to `outputs/live_preview.png` instead of opening a window.
