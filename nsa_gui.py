@@ -1174,8 +1174,13 @@ class App(tk.Tk):
         self._section(body, "LEVEL 2 · GROUND TRUTH / DATA")
         self._add_rows(body, [
             ("frames", "Temporal Frames",
-             "Reads averaged for synthetic ground truth", [64, 128, 256], 256),
+             "Synthetic GT only — averaged reads for simulated capture", [64, 128, 256], 256),
         ])
+        tk.Label(body, text="     With real paired noisy/gt folders, ground truth comes "
+                 "from disk — temporal frames and gain apply only to synthetic capture "
+                 "(or when “Simulate sensor noise” is on).",
+                 bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(4)))
         tk.Label(body, text="     Paired noisy/gt folders auto-detected · "
                  "detail-scored patch selection (denoise-hw logic).",
                  bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(0, S(4)))
@@ -1503,8 +1508,22 @@ class App(tk.Tk):
 
         cfgrow("base_channels", "Base Channels", "Network width",
                [16, 32, 64], prev.get("base_channels", 32))
-        cfgrow("block_depth", "Block Depth", "Network depth",
-               [2, 4, 8], prev.get("block_depth", 4))
+        depth_vals = [2, 4, 8]
+        if fam == "rednet":
+            depth_desc = "RED blocks per encoder stage (minimum 2)"
+            depth_vals = [2, 4, 8]
+        elif fam in ("unet", "drunet"):
+            depth_desc = ("Blocks per U-Net stage — internally halved "
+                          "(depth 4 → 2 blocks per stage)")
+        elif fam == "nafnet":
+            depth_desc = ("NAFBlocks in flat mode — ignored when a custom "
+                          "topology is set below")
+        elif fam == "restormer":
+            depth_desc = "Transformer blocks at each scale"
+        else:
+            depth_desc = "Stack depth (conv blocks or residual groups)"
+        cfgrow("block_depth", "Block Depth", depth_desc,
+               depth_vals, max(prev.get("block_depth", 4), 2 if fam == "rednet" else 0))
 
         if fam == "nafnet":
             tk.Label(self.model_box,
@@ -1754,14 +1773,19 @@ class App(tk.Tk):
     def _build_command(self):
         cmd = [sys.executable, str(ROOT / "run_demo.py"), "--no-window"]
         for key in ("sensor", "hardware", "model_family", "base_channels",
-                    "block_depth", "conv_type", "activation", "gain", "steps",
-                    "frames"):
-            # conv_type / activation are hidden (and irrelevant) for NAFNet.
+                    "block_depth", "gain", "steps", "frames"):
             row = self.rows.get(key)
             if row is None:
                 continue
             flag = "--" + key.replace("_", "-")
             cmd += [flag, row.get()]
+        fam = self.rows["model_family"].get()
+        if fam not in ("nafnet", "restormer"):
+            for key in ("conv_type", "activation"):
+                row = self.rows.get(key)
+                if row is None:
+                    continue
+                cmd += ["--" + key.replace("_", "-"), row.get()]
 
         if not self.quantize_var.get():
             cmd += ["--no-quantize"]
@@ -2300,9 +2324,7 @@ class App(tk.Tk):
         if s:
             m = s.get("model", {})
             subtitle = (f"{s.get('hardware_name','')}   ·   "
-                        f"{m.get('family','').upper()} "
-                        f"{m.get('base_channels','')}ch × {m.get('block_depth','')} · "
-                        f"{m.get('conv_type','')} · {m.get('activation','')} · "
+                        f"{m.get('display') or ''}   ·   "
                         f"{s.get('precision','')}")
         else:
             subtitle = "Results written to outputs/"

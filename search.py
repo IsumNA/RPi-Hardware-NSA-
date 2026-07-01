@@ -48,6 +48,7 @@ from nsa.config import (
     OutputConfig, RunConfig, SensorConfig,
 )
 from nsa.compiler import CAPS, assess_targets, compile_stack
+from nsa.model_opts import search_combo_valid
 from nsa.inference import (
     calibrate_multi, estimate_device_latency_ms, fake_quantize_int8, psnr, run,
 )
@@ -436,6 +437,9 @@ def main() -> int:
     feasible = []
     skipped  = []
     for (fam, ch, dep, ct, act) in candidates:
+        if not search_combo_valid(fam, ct, act):
+            skipped.append(((fam, ch, dep, ct, act), "irrelevant conv/activation for family"))
+            continue
         ok, reason = _is_feasible(args.hardware, act, ch, dep, args.patch_size)
         if ok:
             feasible.append((fam, ch, dep, ct, act))

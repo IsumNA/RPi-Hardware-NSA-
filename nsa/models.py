@@ -67,7 +67,7 @@ class CNNDenoiser(nn.Module):
 class _NAFBlock(nn.Module):
     """Simplified NAFNet block: depthwise conv + SimpleGate + channel attention."""
 
-    def __init__(self, c: int, conv_type: str):
+    def __init__(self, c: int):
         super().__init__()
         self.conv1 = nn.Conv2d(c, c * 2, 1)
         self.dw = nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2)
@@ -91,7 +91,7 @@ class NAFNetDenoiser(nn.Module):
         super().__init__()
         c = cfg.base_channels
         self.head = nn.Conv2d(3, c, 3, padding=1)
-        self.body = nn.Sequential(*[_NAFBlock(c, cfg.conv_type) for _ in range(cfg.block_depth)])
+        self.body = nn.Sequential(*[_NAFBlock(c) for _ in range(cfg.block_depth)])
         self.tail = nn.Conv2d(c, 3, 3, padding=1)
 
     def forward(self, x):
@@ -129,15 +129,15 @@ class NAFNetUNetDenoiser(nn.Module):
 
         ch = c
         for n in enc:
-            self.encoders.append(nn.Sequential(*[_NAFBlock(ch, cfg.conv_type) for _ in range(n)]))
+            self.encoders.append(nn.Sequential(*[_NAFBlock(ch) for _ in range(n)]))
             self.downs.append(nn.Conv2d(ch, ch * 2, 2, stride=2))
             ch *= 2
-        self.middle = nn.Sequential(*[_NAFBlock(ch, cfg.conv_type) for _ in range(mid)])
+        self.middle = nn.Sequential(*[_NAFBlock(ch) for _ in range(mid)])
         for n in dec:
             self.ups.append(nn.Sequential(nn.Conv2d(ch, ch * 2, 1, bias=False),
                                           nn.PixelShuffle(2)))
             ch //= 2
-            self.decoders.append(nn.Sequential(*[_NAFBlock(ch, cfg.conv_type) for _ in range(n)]))
+            self.decoders.append(nn.Sequential(*[_NAFBlock(ch) for _ in range(n)]))
 
     def forward(self, x):
         # Pad so the input is divisible by 2**levels, then crop back.
@@ -475,6 +475,8 @@ class UNetDenoiser(nn.Module):
 
 
 def build_model(cfg: ModelConfig) -> nn.Module:
+    from .model_opts import normalize_model_config
+    normalize_model_config(cfg)
     if cfg.model_family == "nafnet" and list(getattr(cfg, "nafnet_enc_blocks", []) or []):
         return NAFNetUNetDenoiser(cfg)
     families = {

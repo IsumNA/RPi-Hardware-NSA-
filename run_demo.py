@@ -38,6 +38,8 @@ from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
 from nsa.sensors import get_sensor
 from nsa.report import compute_fitness, print_report, print_target_suitability
 from nsa.scaling import render_scaling_chart, scaling_curves
+from nsa.model_opts import (instantiate_summary, model_display_line, profile_rows,
+                            uses_activation)
 from nsa.theme import (RPI_GREEN, banner, console, kv_table, level_rule, log,
                        pause)
 from nsa.visualize import render_panel
@@ -74,13 +76,8 @@ def main() -> int:
 
     # -- Configuration summary --------------------------------------------------
     console.print(kv_table(
-        [
-            ("hardware", f"{cfg.hardware}  ({cfg.hardware_name})"),
-            ("model_family", cfg.model.model_family),
-            ("base_channels", str(cfg.model.base_channels)),
-            ("block_depth", str(cfg.model.block_depth)),
-            ("conv_type", cfg.model.conv_type),
-            ("activation", cfg.model.activation),
+        [("hardware", f"{cfg.hardware}  ({cfg.hardware_name})")]
+        + profile_rows(cfg.model) + [
             ("sensor", f"{sensor.label} — {sensor.family}  ·  "
                        f"{sensor.bayer}  {sensor.bit_depth}-bit"),
             ("gain", f"{cfg.sensor.gain}×"),
@@ -182,16 +179,7 @@ def main() -> int:
     model = build_model(cfg.model)
     n_params = count_params(model)
     custom_naf = bool(cfg.model.model_family == "nafnet" and cfg.model.nafnet_enc_blocks)
-    if custom_naf:
-        dec = cfg.model.nafnet_dec_blocks or cfg.model.nafnet_enc_blocks[::-1]
-        log(f"Instantiated multi-scale NAFNet (custom topology) "
-            f"({cfg.model.conv_type} conv, {cfg.model.base_channels}ch, "
-            f"encoders {cfg.model.nafnet_enc_blocks} · "
-            f"middle {cfg.model.nafnet_middle_blocks} · decoders {dec})", "step")
-    else:
-        log(f"Instantiated {cfg.model.model_family.upper()} "
-            f"({cfg.model.conv_type} conv, {cfg.model.base_channels}ch × "
-            f"{cfg.model.block_depth} blocks, {cfg.model.activation})", "step")
+    log(instantiate_summary(cfg.model), "step")
     log(f"Trainable parameters: {n_params:,}", "ok")
 
     # ===========================================================================
@@ -386,6 +374,7 @@ def main() -> int:
         scaling_path = None
 
     # Machine-readable summary so the GUI can render a rich results screen.
+    prof = dict(profile_rows(cfg.model))
     summary = {
         "hardware": cfg.hardware,
         "hardware_name": cfg.hardware_name,
@@ -393,8 +382,11 @@ def main() -> int:
             "family": cfg.model.model_family,
             "base_channels": cfg.model.base_channels,
             "block_depth": cfg.model.block_depth,
-            "conv_type": cfg.model.conv_type,
-            "activation": cfg.model.activation,
+            "conv_type": prof.get("conv_type", cfg.model.conv_type),
+            "activation": (cfg.model.activation
+                             if uses_activation(cfg.model.model_family) else None),
+            "nonlinearity": prof.get("nonlinearity"),
+            "display": model_display_line(cfg.model),
             "params": n_params,
             "custom_nafnet": custom_naf,
             "nafnet_enc": list(cfg.model.nafnet_enc_blocks),

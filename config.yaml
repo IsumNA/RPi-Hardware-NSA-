@@ -18,9 +18,9 @@ hardware: hailo8
 model:
   model_family: nafnet      # cnn|dncnn|unet|rednet|ridnet|nafnet|ffdnet|drunet|restormer
   base_channels: 32         # 16 | 32 | 64
-  block_depth: 4            # 2  | 4  | 8
-  conv_type: depthwise      # standard | depthwise
-  activation: relu          # relu | gelu | silu   (gelu triggers DeepX QAT path)
+  block_depth: 4            # 2  | 4  | 8  (REDNet min 2; UNet/DRUNet halved per stage)
+  conv_type: depthwise      # standard | depthwise  (ignored for nafnet / restormer)
+  activation: relu          # relu | gelu | silu  (ignored for nafnet / restormer)
   # Custom multi-scale NAFNet topology (nafnet family only). Leave empty for a
   # flat NAFNet of block_depth blocks. e.g. encoders [1,2,2] / middle 4 / decoders [2,2,1]
   nafnet_enc_blocks: []     # per-level encoder NAFBlock counts (U-shaped NAFNet)

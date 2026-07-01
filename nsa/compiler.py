@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .config import Config
+from .model_opts import (CONVT_FAMILIES, TRANSFORMER_FAMILIES, effective_activation,
+                         effective_conv_type, uses_activation, uses_conv_type)
 from .theme import log, pause
 
 # -- Per-target capability table ----------------------------------------------
@@ -46,11 +48,11 @@ CAPS = {
 
 
 # Families whose graph contains ConvTranspose (needs resize+conv on NPUs).
-_CONVT_FAMILIES = {"unet", "rednet", "drunet"}
+_CONVT_FAMILIES = CONVT_FAMILIES
 
 # Families with NPU-awkward ops (LayerNorm / softmax attention) that really want
 # floating-point execution — used to add caveats in the suitability matrix.
-_TRANSFORMER_FAMILIES = {"restormer"}
+_TRANSFORMER_FAMILIES = TRANSFORMER_FAMILIES
 
 
 @dataclass
@@ -99,38 +101,51 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
         export_format=caps["format"],
     )
 
-    act = cfg.model.activation
+    act = effective_activation(cfg.model)
     fam = cfg.model.model_family
+    conv = effective_conv_type(cfg.model)
 
     # -- Pass 1: operator legalization ----------------------------------------
-    log(f"Parsing graph: {fam.upper()} | {n_params/1e3:.1f}K params | act={act}", "step")
+    log(f"Parsing graph: {fam.upper()} | {n_params/1e3:.1f}K params", "step")
+    if uses_activation(fam):
+        log(f"  activation={act}", "info")
+    else:
+        log(f"  nonlinearity={act} (fixed in graph)", "info")
     pause(0.25)
     log(f"Target backend resolved -> {caps['label']} [{caps['precision'].upper()}]", "info")
     pause(0.2)
 
-    if act in caps["native_acts"]:
+    if fam == "nafnet":
+        log("Operator legalization: SimpleGate (×) maps to native multiply", "ok")
+        res.passes.append("legalize:simplegate->mul")
+    elif act in caps["native_acts"]:
         log(f"Operator legalization: '{act}' supported natively", "ok")
         res.passes.append(f"legalize:{act}->native")
-    else:
-        if cfg.hardware == "deepx" and act == "gelu":
-            log("GELU activation detected for DeepX target. "
-                "Forcing QAT layer injection to prevent compilation failure...", "warn")
-            res.warnings.append("DeepX cannot fuse FP GELU -> QAT injection forced.")
-            res.quant_scheme = "QAT"
-            res.passes.append("inject:QAT(gelu)")
-        elif cfg.hardware == "hailo8":
-            log(f"'{act}' not in Hailo-8 native set -> substituting "
-                f"piecewise-linear approximation + QAT", "warn")
-            res.warnings.append(f"Hailo-8: '{act}' approximated (PWL) under QAT.")
-            res.quant_scheme = "QAT"
-            res.passes.append(f"approx:{act}->pwl")
-        else:
-            log(f"'{act}' lowered to supported primitive set", "info")
-            res.passes.append(f"lower:{act}")
+    elif cfg.hardware == "deepx" and act == "gelu" and uses_activation(fam):
+        log("GELU activation detected for DeepX target. "
+            "Forcing QAT layer injection to prevent compilation failure...", "warn")
+        res.warnings.append("DeepX cannot fuse FP GELU -> QAT injection forced.")
+        res.quant_scheme = "QAT"
+        res.passes.append("inject:QAT(gelu)")
+    elif cfg.hardware == "hailo8" and uses_activation(fam):
+        log(f"'{act}' not in Hailo-8 native set -> substituting "
+            f"piecewise-linear approximation + QAT", "warn")
+        res.warnings.append(f"Hailo-8: '{act}' approximated (PWL) under QAT.")
+        res.quant_scheme = "QAT"
+        res.passes.append(f"approx:{act}->pwl")
+    elif uses_activation(fam):
+        log(f"'{act}' lowered to supported primitive set", "info")
+        res.passes.append(f"lower:{act}")
+    elif fam == "restormer":
+        log("Restormer GELU FFN + attention scheduled (FP fallback on NPUs)", "info")
+        res.passes.append("legalize:restormer-attn")
     pause(0.25)
 
     # -- Pass 2: conv / structure legalization --------------------------------
-    if cfg.model.conv_type == "depthwise":
+    if fam == "nafnet":
+        log("NAFNet depthwise + pointwise convs mapped to grouped-conv engine", "ok")
+        res.passes.append("map:nafnet-dw->grouped")
+    elif conv == "depthwise":
         log("Depthwise-separable convs mapped to grouped-conv engine", "ok")
         res.passes.append("map:depthwise->grouped")
     else:
@@ -249,10 +264,18 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
         elif not fits:
             notes.append("working set exceeds memory budget")
 
-        act_native = cfg.model.activation in caps["native_acts"]
-        if not act_native:
-            notes.append(f"'{cfg.model.activation}' not native → "
+        fam = cfg.model.model_family
+        if uses_activation(fam):
+            act_native = effective_activation(cfg.model) in caps["native_acts"]
+        elif fam == "nafnet":
+            act_native = True
+        else:
+            act_native = False
+        if not act_native and uses_activation(fam):
+            notes.append(f"'{effective_activation(cfg.model)}' not native → "
                          f"PWL/QAT approximation")
+        elif fam == "restormer" and accel:
+            notes.append("GELU FFN + attention use FP fallback on NPUs")
 
         quantized = accel and quantize_enabled
         if accel and not quantize_enabled:

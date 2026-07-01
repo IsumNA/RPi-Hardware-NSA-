@@ -110,17 +110,27 @@ class Config:
         return {"hailo8": ".hef", "deepx": ".bin", "rpi5_cpu": ".ort"}[self.hardware]
 
     def validate(self) -> None:
+        from .model_opts import MIN_BLOCK_DEPTH, normalize_model_config, uses_activation, uses_conv_type
+
         m, s = self.model, self.sensor
+        normalize_model_config(m)
         checks = [
             (self.hardware in HARDWARE, "hardware", self.hardware, list(HARDWARE)),
             (m.model_family in MODEL_FAMILIES, "model_family", m.model_family, MODEL_FAMILIES),
             (m.base_channels in BASE_CHANNELS, "base_channels", m.base_channels, BASE_CHANNELS),
             (m.block_depth in BLOCK_DEPTHS, "block_depth", m.block_depth, BLOCK_DEPTHS),
-            (m.conv_type in CONV_TYPES, "conv_type", m.conv_type, CONV_TYPES),
-            (m.activation in ACTIVATIONS, "activation", m.activation, ACTIVATIONS),
             (s.gain in GAINS, "gain", s.gain, GAINS),
             (s.sensor in SENSOR_KEYS, "sensor", s.sensor, SENSOR_KEYS),
         ]
+        if uses_conv_type(m.model_family):
+            checks.append((m.conv_type in CONV_TYPES, "conv_type", m.conv_type, CONV_TYPES))
+        if uses_activation(m.model_family):
+            checks.append((m.activation in ACTIVATIONS, "activation", m.activation, ACTIVATIONS))
+        min_d = MIN_BLOCK_DEPTH.get(m.model_family)
+        if min_d and m.block_depth < min_d:
+            raise ConfigError(
+                f"block_depth for {m.model_family!r} must be >= {min_d} (got {m.block_depth})."
+            )
         for ok, name, got, allowed in checks:
             if not ok:
                 raise ConfigError(
