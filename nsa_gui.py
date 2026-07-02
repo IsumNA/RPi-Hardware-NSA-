@@ -529,6 +529,8 @@ class LiveView(tk.Toplevel):
         self._stop = threading.Event()
         self._reconnect = threading.Event()
         self._cam_index_var = tk.StringVar(value=str(camera_index))
+        self._noise_on = tk.BooleanVar(value=False)
+        self._noise_sigma_var = tk.StringVar(value="20")
         self._lock = threading.Lock()
         self._latest = None            # (raw_rgb, out_rgb, stats)
         self._status = "Loading compiled model…"
@@ -601,6 +603,24 @@ class LiveView(tk.Toplevel):
                   "if CSI camera is not detected (usually no sudo needed)"),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(420), justify="left")
         self._cam_hint.pack(side="left", padx=(S(10), 0))
+
+        # -- Inject synthetic noise into the original (stress-test denoiser) --
+        noiserow = tk.Frame(self, bg=WHITE)
+        noiserow.pack(fill="x", padx=pad, pady=(S(6), 0))
+        tk.Checkbutton(
+            noiserow, text="Add noise to original", variable=self._noise_on,
+            bg=WHITE, fg=INK, activebackground=WHITE, selectcolor=WHITE,
+            font=font(10, "bold")).pack(side="left")
+        tk.Label(noiserow, text="sigma (8-bit)", bg=WHITE, fg=INK,
+                 font=font(10)).pack(side="left", padx=(S(12), S(6)))
+        ttk.Spinbox(
+            noiserow, from_=0, to=100, increment=5, width=5,
+            textvariable=self._noise_sigma_var, style="Rpi.TCombobox").pack(side="left")
+        tk.Label(noiserow,
+                 text="Injects Gaussian noise on the raw feed before denoising "
+                      "— watch the model clean a noisier input.",
+                 bg=WHITE, fg=SUBTLE, font=font(8),
+                 wraplength=S(420), justify="left").pack(side="left", padx=(S(10), 0))
 
         # -- Footer (pinned) -------------------------------------------------
         footer = tk.Frame(self, bg=WHITE)
@@ -786,6 +806,14 @@ class LiveView(tk.Toplevel):
                     tw = 432
                     if w > tw:
                         raw = cv2.resize(raw, (tw, int(round(h * tw / w))))
+
+                    if self._noise_on.get():
+                        try:
+                            sigma = float(self._noise_sigma_var.get())
+                        except (ValueError, tk.TclError):
+                            sigma = 0.0
+                        if sigma > 0:
+                            raw = _live.add_noise_bgr(raw, sigma)
 
                     out, dt_ms = _live.denoise_bgr(model, raw)
                     n_in, n_out = _live.noise_level(raw), _live.noise_level(out)

@@ -592,6 +592,22 @@ def denoise_bgr(model, bgr: np.ndarray, max_side: int = 0) -> tuple[np.ndarray, 
     return out_bgr, dt_ms
 
 
+def add_noise_bgr(bgr: np.ndarray, sigma: float,
+                  rng: np.random.Generator | None = None) -> np.ndarray:
+    """Add synthetic Gaussian noise to a BGR frame.
+
+    ``sigma`` is the noise standard deviation in 8-bit levels (0-255): 0 = off,
+    ~10 = mild, ~25 = heavy, ~40+ = extreme. Lets you stress-test the denoiser on
+    a deliberately noisier "original" than the camera actually produces.
+    """
+    if sigma <= 0:
+        return bgr
+    rng = rng or np.random.default_rng()
+    noise = rng.normal(0.0, float(sigma), size=bgr.shape).astype(np.float32)
+    noisy = bgr.astype(np.float32) + noise
+    return np.clip(noisy, 0, 255).astype(np.uint8)
+
+
 def noise_level(bgr: np.ndarray) -> float:
     """High-frequency noise estimate: std of the luminance Laplacian."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -614,13 +630,19 @@ def _stat_line(img: np.ndarray, lines: list[str]) -> None:
                     _WHITE, 1, cv2.LINE_AA)
 
 
-def compose(raw_bgr, out_bgr, fps, dt_ms, noise_in, noise_out, model_name) -> np.ndarray:
+def compose(raw_bgr, out_bgr, fps, dt_ms, noise_in, noise_out, model_name,
+            add_noise: float = 0.0) -> np.ndarray:
     left = raw_bgr.copy()
     right = out_bgr.copy()
-    _label(left, "RAW SENSOR (noisy)", _WHITE)
-    _label(right, "NSA DENOISED", _GREEN_BGR)
+    raw_title = ("RAW SENSOR (noisy)" if add_noise <= 0
+                 else f"RAW + NOISE (sigma {add_noise:.0f})")
+    _label(left, raw_title, _WHITE if add_noise <= 0 else _RASP_BGR)
+    _label(right, "NAS DENOISED", _GREEN_BGR)
     drop = (1.0 - noise_out / noise_in) * 100.0 if noise_in > 1e-6 else 0.0
-    _stat_line(left, [f"noise {noise_in:5.1f}"])
+    left_stats = [f"noise {noise_in:5.1f}"]
+    if add_noise > 0:
+        left_stats.append("n: toggle   +/-: adjust")
+    _stat_line(left, left_stats)
     _stat_line(right, [
         f"{model_name}   {dt_ms:4.1f} ms/frame   {fps:4.1f} FPS",
         f"noise {noise_out:5.1f}   (-{max(drop,0):4.1f}% vs raw)",
@@ -754,6 +776,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "display/VNC needed) — ideal for a headless Pi")
     p.add_argument("--stream-port", dest="stream_port", type=int, default=8080,
                    help="port for --stream (default: 8080)")
+    p.add_argument("--add-noise", dest="add_noise", type=float, default=0.0,
+                   help="add synthetic Gaussian noise (std in 8-bit levels, e.g. 20) "
+                        "to the original frame before denoising; 0 = off. In the "
+                        "window use 'n' to toggle and '+'/'-' to adjust live")
     p.add_argument("--seconds", type=float, default=0.0,
                    help="auto-stop after N seconds (0 = run until 'q'/ESC)")
     p.add_argument("--seed", type=int, default=662)
@@ -823,6 +849,13 @@ def main() -> int:
             headless = True
             log("No display available — will save a sample composite instead.", "warn")
 
+    add_noise = max(0.0, float(args.add_noise))
+    last_noise = add_noise if add_noise > 0 else 20.0   # toggle-back default
+    noise_rng = np.random.default_rng(args.seed)
+    if add_noise > 0:
+        log(f"Injecting synthetic noise on the original (sigma {add_noise:.0f}). "
+            f"Use 'n' to toggle, '+'/'-' to adjust.", "step")
+
     if not args.stream:
         log("Streaming… press 'q' or ESC in the window to stop.", "step")
     fps = 0.0
@@ -840,6 +873,9 @@ def main() -> int:
             if raw.shape[2] == 4:
                 raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
 
+            if add_noise > 0:
+                raw = add_noise_bgr(raw, add_noise, noise_rng)
+
             out, dt_ms = denoise_bgr(model, raw, max_side=max_side)
             n_in, n_out = noise_level(raw), noise_level(out)
 
@@ -848,8 +884,12 @@ def main() -> int:
             fps = inst if fps == 0 else 0.9 * fps + 0.1 * inst
             t_prev = now
 
-            canvas = compose(raw, out, fps, dt_ms, n_in, n_out, model_name)
+            canvas = compose(raw, out, fps, dt_ms, n_in, n_out, model_name,
+                             add_noise=add_noise)
             saved = canvas
+            # Remember the last non-zero level so 'n' can toggle back on.
+            if add_noise > 0:
+                last_noise = add_noise
 
             if stream_state is not None:
                 ok, buf = cv2.imencode(".jpg", canvas,
@@ -864,6 +904,16 @@ def main() -> int:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
+                if key == ord("n"):                      # toggle noise injection
+                    if add_noise > 0:
+                        last_noise = add_noise
+                        add_noise = 0.0
+                    else:
+                        add_noise = last_noise
+                elif key in (ord("+"), ord("=")):        # more noise
+                    add_noise = min(100.0, (add_noise or last_noise) + 5.0)
+                elif key in (ord("-"), ord("_")):        # less noise
+                    add_noise = max(0.0, add_noise - 5.0)
                 try:
                     if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                         break
