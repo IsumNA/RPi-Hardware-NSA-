@@ -67,6 +67,18 @@ optimization:
   qat: false                # true => fake-quant-in-the-loop training (STE)
   calibration_steps: 300    # live calibration iterations (batch of augmented crops)
   patch_size: 192           # working resolution for the live demo (square crop)
+  # Training objective. name: charbonnier | l1 | l2 | huber | ssim | charbonnier_ssim
+  #   charbonnier      -> sharp, robust pixel loss (default); tune charbonnier_eps
+  #   l1 / l2 (mse)    -> plain MAE / MSE (no parameters)
+  #   huber            -> smooth-L1; tune huber_delta (L2->L1 crossover)
+  #   ssim             -> structural similarity (1 - SSIM); tune ssim_window
+  #   charbonnier_ssim -> (1-w)*charbonnier + w*(1-SSIM); tune ssim_weight (w)
+  loss:
+    name: charbonnier
+    charbonnier_eps: 0.001  # smaller = closer to L1 (sharper), larger = smoother
+    huber_delta: 1.0
+    ssim_window: 11         # odd Gaussian window for the SSIM term
+    ssim_weight: 0.2        # charbonnier_ssim blend weight (0..1)
 
 # ---- Run mode ----------------------------------------------------------------
 run:

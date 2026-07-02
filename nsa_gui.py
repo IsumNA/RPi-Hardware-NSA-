@@ -1343,6 +1343,18 @@ class App(tk.Tk):
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
              [150, 300, 500, 800], 300),
         ])
+
+        loss_row = ConfigRow(
+            body, "Loss Function",
+            "Training objective — parameters below adapt to it",
+            ["charbonnier", "l1", "l2", "huber", "ssim", "charbonnier_ssim"],
+            "charbonnier", command=self._on_loss_change)
+        loss_row.pack(fill="x", pady=S(6))
+        self.rows["loss"] = loss_row
+        self.loss_box = tk.Frame(body, bg=WHITE)
+        self.loss_box.pack(fill="x")
+        self._render_loss_options()
+
         self._check(body, "INT8 quantization (PTQ)",
                     "Quantize weights + activations for the accelerator target.",
                     self.quantize_var)
@@ -1431,6 +1443,7 @@ class App(tk.Tk):
             ("Model", model_txt, INK),
             ("Target chip", hw_name, INK),
             ("Calibration", f"{self._row_get('steps','300')} steps · quant {q}", INK),
+            ("Loss", self._row_get("loss", "charbonnier"), INK),
         ]
         hint = self._dataset_quality_hint()
         if hint:
@@ -1608,6 +1621,17 @@ class App(tk.Tk):
             if hasattr(self, "noise_std_var"):
                 self.noise_std_var.set(
                     "" if cfg.sensor.noise_std is None else str(cfg.sensor.noise_std))
+            lc = getattr(cfg.optimization, "loss", None)
+            if lc is not None and "loss" in self.rows:
+                self.rows["loss"].set(lc.name)
+                self._render_loss_options()
+                for key, val in (("charbonnier_eps", lc.charbonnier_eps),
+                                 ("huber_delta", lc.huber_delta),
+                                 ("ssim_window", lc.ssim_window),
+                                 ("ssim_weight", lc.ssim_weight)):
+                    var = self.entries.get(key)
+                    if var is not None:
+                        var.set(str(val))
             if cfg.sensor.sensor and "sensor" in self.rows:
                 self.rows["sensor"].set(cfg.sensor.sensor)
             if hasattr(self, "dataset_label"):
@@ -1767,6 +1791,49 @@ class App(tk.Tk):
 
     def _on_family_change(self):
         self._render_model_options()
+
+    def _on_loss_change(self):
+        self._render_loss_options()
+
+    def _render_loss_options(self):
+        """Show only the parameter fields that the selected loss actually uses."""
+        # Preserve any values the user already typed.
+        prev = {}
+        for k in ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight"):
+            var = self.entries.get(k)
+            if var is not None:
+                prev[k] = var.get()
+        for w in self.loss_box.winfo_children():
+            w.destroy()
+        for k in ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight"):
+            self.entries.pop(k, None)
+            self.entry_widgets.pop(k, None)
+
+        name = self.rows["loss"].get() if "loss" in self.rows else "charbonnier"
+        defaults = {"charbonnier_eps": "0.001", "huber_delta": "1.0",
+                    "ssim_window": "11", "ssim_weight": "0.2"}
+
+        def field(key, title, desc):
+            self._entry_row(self.loss_box, key, title, desc,
+                            prev.get(key, defaults[key]))
+
+        if name == "charbonnier":
+            field("charbonnier_eps", "Charbonnier eps",
+                  "L2→L1 transition — smaller = sharper, larger = smoother")
+        elif name in ("l1", "l2"):
+            tk.Label(self.loss_box,
+                     text=f"     {name.upper()} has no tunable parameters.",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(2), 0))
+        elif name == "huber":
+            field("huber_delta", "Huber delta", "L2→L1 crossover threshold")
+        elif name == "ssim":
+            field("ssim_window", "SSIM window", "Gaussian window size (odd, e.g. 11)")
+        elif name == "charbonnier_ssim":
+            field("charbonnier_eps", "Charbonnier eps",
+                  "Pixel-term L2→L1 transition")
+            field("ssim_weight", "SSIM weight",
+                  "Blend: (1-w)·charbonnier + w·(1-SSIM), 0..1")
+            field("ssim_window", "SSIM window", "Gaussian window size (odd, e.g. 11)")
 
     def _render_model_options(self):
         """Render only the Level-3 options that apply to the chosen model family.
@@ -2118,6 +2185,7 @@ class App(tk.Tk):
             cmd += ["--simulated"]
 
         self._append_noise_std_cli_args(cmd)
+        self._append_loss_cli_args(cmd)
 
         if self.input_raw:
             cmd += ["--input-raw", self.input_raw]
@@ -2160,7 +2228,34 @@ class App(tk.Tk):
         else:
             cmd += ["--simulated"]
         self._append_noise_std_cli_args(cmd)
+        self._append_loss_cli_args(cmd)
         return cmd
+
+    def _append_loss_cli_args(self, cmd):
+        """Append --loss and only the parameter flags the chosen loss uses."""
+        row = self.rows.get("loss")
+        if row is None:
+            return
+        name = row.get()
+        cmd += ["--loss", name]
+        param_flags = {
+            "charbonnier_eps": "--charbonnier-eps",
+            "huber_delta": "--huber-delta",
+            "ssim_window": "--ssim-window",
+            "ssim_weight": "--ssim-weight",
+        }
+        for key, flag in param_flags.items():
+            var = self.entries.get(key)
+            if var is None:
+                continue
+            raw = (var.get() or "").strip()
+            if not raw:
+                continue
+            try:
+                float(raw)
+            except ValueError:
+                continue
+            cmd += [flag, raw]
 
     def _append_noise_std_cli_args(self, cmd):
         """Append --noise-std when the user typed a valid read-noise override."""

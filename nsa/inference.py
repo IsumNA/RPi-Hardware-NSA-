@@ -116,10 +116,103 @@ def _charbonnier(pred: torch.Tensor, target: torch.Tensor,
     """Charbonnier (smooth-L1) loss — the denoising-standard objective.
 
     Robust to outliers and much less blurry than plain MSE, so it recovers
-    sharper edges/texture and typically a higher PSNR at the same budget.
+    sharper edges/texture and typically a higher PSNR at the same budget. ``eps``
+    controls the L2->L1 transition: smaller is closer to pure L1 (sharper, more
+    robust), larger is smoother near zero.
     """
     diff = pred - target
     return torch.sqrt(diff * diff + eps * eps).mean()
+
+
+def _l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean absolute error — sharp, robust to outliers, no parameters."""
+    return (pred - target).abs().mean()
+
+
+def _l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean squared error — maximises PSNR directly but tends to blur texture."""
+    return ((pred - target) ** 2).mean()
+
+
+def _huber(pred: torch.Tensor, target: torch.Tensor,
+           delta: float = 1.0) -> torch.Tensor:
+    """Huber / smooth-L1 loss. ``delta`` is the L2->L1 crossover threshold."""
+    return F.smooth_l1_loss(pred, target, beta=max(1e-6, float(delta)))
+
+
+def _gaussian_window(window: int, sigma: float, channels: int,
+                     device, dtype) -> torch.Tensor:
+    coords = torch.arange(window, dtype=dtype, device=device) - (window - 1) / 2.0
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    g = g / g.sum()
+    w2d = g[:, None] * g[None, :]
+    return w2d.expand(channels, 1, window, window).contiguous()
+
+
+def _ssim_index(pred: torch.Tensor, target: torch.Tensor,
+                window: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    """Mean structural-similarity (SSIM) index over the image (higher is better)."""
+    channels = pred.shape[1]
+    window = max(3, int(window) | 1)                 # force odd, >=3
+    w = _gaussian_window(window, sigma, channels, pred.device, pred.dtype)
+    pad = window // 2
+    mu1 = F.conv2d(pred, w, padding=pad, groups=channels)
+    mu2 = F.conv2d(target, w, padding=pad, groups=channels)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1 * mu1, mu2 * mu2, mu1 * mu2
+    sigma1_sq = F.conv2d(pred * pred, w, padding=pad, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(target * target, w, padding=pad, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(pred * target, w, padding=pad, groups=channels) - mu1_mu2
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = (((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) /
+                ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)))
+    return ssim_map.mean()
+
+
+def _ssim_loss(pred: torch.Tensor, target: torch.Tensor,
+               window: int = 11) -> torch.Tensor:
+    """Structural-dissimilarity loss (1 - SSIM); preserves perceived structure."""
+    return 1.0 - _ssim_index(pred, target, window)
+
+
+# Registry of the loss functions the compiler can train against. Each entry maps
+# a name to (callable, accepted-parameter-names) so config/CLI/GUI stay in sync.
+LOSSES: dict[str, tuple] = {
+    "charbonnier": (_charbonnier, ("charbonnier_eps",)),
+    "l1": (_l1, ()),
+    "l2": (_l2, ()),
+    "mse": (_l2, ()),
+    "huber": (_huber, ("huber_delta",)),
+    "ssim": (_ssim_loss, ("ssim_window",)),
+    "charbonnier_ssim": (None, ("charbonnier_eps", "ssim_window", "ssim_weight")),
+}
+
+
+def build_loss(name: str = "charbonnier", *,
+               charbonnier_eps: float = 1e-3,
+               huber_delta: float = 1.0,
+               ssim_window: int = 11,
+               ssim_weight: float = 0.2):
+    """Return a ``loss(pred, target) -> scalar`` callable for the named objective.
+
+    Supported names: ``charbonnier`` (eps), ``l1``, ``l2``/``mse``, ``huber``
+    (delta), ``ssim`` (window), and ``charbonnier_ssim`` — a weighted blend
+    ``(1-w)·charbonnier + w·(1-SSIM)`` that pairs pixel accuracy with perceived
+    structure. Unknown names fall back to Charbonnier.
+    """
+    key = (name or "charbonnier").lower()
+    if key == "l1":
+        return _l1
+    if key in ("l2", "mse"):
+        return _l2
+    if key == "huber":
+        return lambda p, t: _huber(p, t, huber_delta)
+    if key == "ssim":
+        return lambda p, t: _ssim_loss(p, t, ssim_window)
+    if key == "charbonnier_ssim":
+        w = float(min(max(ssim_weight, 0.0), 1.0))
+        return lambda p, t: ((1.0 - w) * _charbonnier(p, t, charbonnier_eps)
+                             + w * _ssim_loss(p, t, ssim_window))
+    return lambda p, t: _charbonnier(p, t, charbonnier_eps)
 
 
 def _augment_pair(x: torch.Tensor, y: torch.Tensor,
@@ -158,13 +251,16 @@ def _sample_batch(tensors, crop: int, batch: int,
 
 
 def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
-           crop: int, batch: int, qat: bool, lr: float) -> nn.Module:
-    """Shared training loop: Charbonnier + 8× aug + warmup-cosine LR + grad clip.
+           crop: int, batch: int, qat: bool, lr: float, loss_fn=None) -> nn.Module:
+    """Shared training loop: configurable loss + 8× aug + warmup-cosine LR + grad clip.
 
     Gradient clipping and a short warmup keep even deep transpose-conv nets
     (DRUNet / RED-Net) from diverging at an aggressive learning rate, while the
-    minibatch of augmented crops gives stable, low-variance gradients.
+    minibatch of augmented crops gives stable, low-variance gradients. ``loss_fn``
+    defaults to Charbonnier (see ``build_loss``).
     """
+    if loss_fn is None:
+        loss_fn = _charbonnier
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
     steps = max(1, steps)
@@ -185,7 +281,7 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
     for i in range(steps):
         xb, yb = _sample_batch(tensors, crop, batch, g)
         opt.zero_grad()
-        loss = _charbonnier(model(xb), yb)
+        loss = loss_fn(model(xb), yb)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -200,25 +296,27 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
 
 def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
               steps: int, seed: int, progress=None, crop: int = 160,
-              qat: bool = False, batch: int = 4, lr: float = 3e-3) -> nn.Module:
-    """Short supervised fit on one frame pair (Charbonnier + augmentation)."""
+              qat: bool = False, batch: int = 4, lr: float = 3e-3,
+              loss_fn=None) -> nn.Module:
+    """Short supervised fit on one frame pair (configurable loss + augmentation)."""
     tensors = [(to_tensor(noisy), to_tensor(clean))]
-    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr)
+    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr, loss_fn)
 
 
 def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
                     progress=None, crop: int = 160, qat: bool = False,
-                    batch: int = 4, lr: float = 3e-3) -> nn.Module:
+                    batch: int = 4, lr: float = 3e-3, loss_fn=None) -> nn.Module:
     """Calibrate across a set of (noisy, clean) frames (batch / multi-image fit).
 
     Draws an augmented minibatch of crops across all frames each step — the
     "patches across many images" strategy from denoise-hw, with 8× dihedral
-    augmentation, a Charbonnier objective and gradient clipping for stability.
+    augmentation, a configurable loss (see ``build_loss``) and gradient clipping
+    for stability.
     """
     if not pairs:
         raise ValueError("calibrate_multi needs at least one (noisy, clean) pair")
     tensors = [(to_tensor(n), to_tensor(c)) for n, c in pairs]
-    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr)
+    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr, loss_fn)
 
 
 def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):

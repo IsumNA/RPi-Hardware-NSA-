@@ -35,8 +35,9 @@ ROOT = Path(__file__).resolve().parent
 from nsa.export import export_onnx, write_device_artifact
 from nsa.hf_runner import (calibration_steps_for_hf, copy_hf_onnx,
                            is_hf_pretrained, load_hf_model)
-from nsa.inference import (calibrate, calibrate_multi, estimate_device_latency_ms,
-                           fake_quantize_int8, psnr, run, temporal_denoise)
+from nsa.inference import (build_loss, calibrate, calibrate_multi,
+                           estimate_device_latency_ms, fake_quantize_int8, psnr,
+                           run, temporal_denoise)
 from nsa.models import build_model, count_params
 from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
                         list_frames)
@@ -55,6 +56,25 @@ def _has_display() -> bool:
     if sys.platform.startswith("win") or sys.platform == "darwin":
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _loss_summary(lc) -> str:
+    """Human-readable one-liner for the active loss + its relevant parameter(s)."""
+    name = lc.name.lower()
+    if name == "charbonnier":
+        return f"Charbonnier (eps={lc.charbonnier_eps:g})"
+    if name == "l1":
+        return "L1 (mean absolute error)"
+    if name in ("l2", "mse"):
+        return "L2 (mean squared error)"
+    if name == "huber":
+        return f"Huber (delta={lc.huber_delta:g})"
+    if name == "ssim":
+        return f"SSIM (window={lc.ssim_window})"
+    if name == "charbonnier_ssim":
+        return (f"Charbonnier+SSIM (eps={lc.charbonnier_eps:g}, "
+                f"ssim_weight={lc.ssim_weight:g}, window={lc.ssim_window})")
+    return name
 
 
 def main() -> int:
@@ -250,6 +270,12 @@ def main() -> int:
     if use_qat:
         log("QAT enabled -> training with INT8 fake-quant in the loop "
             "(straight-through estimator)", "step")
+    lc = cfg.optimization.loss
+    loss_fn = build_loss(
+        lc.name, charbonnier_eps=lc.charbonnier_eps, huber_delta=lc.huber_delta,
+        ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight)
+    if cal_steps > 0:
+        log(f"Loss: {_loss_summary(lc)}", "step")
     if cal_steps > 0:
         with Progress(
             TextColumn("[muted]{task.description}"),
@@ -267,7 +293,8 @@ def main() -> int:
 
             pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
             calibrate_multi(model, pairs, cal_steps,
-                            cfg.output.seed, on_step, qat=use_qat)
+                            cfg.output.seed, on_step, qat=use_qat,
+                            loss_fn=loss_fn)
 
     fp32_out, fwd_ms = run(model, frame.noisy_rgb)
     psnr_fp32 = float(np.mean([psnr(run(model, f.noisy_rgb)[0], f.clean_rgb)

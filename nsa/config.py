@@ -27,6 +27,7 @@ BLOCK_DEPTHS = (2, 4, 8)
 CONV_TYPES = ("standard", "depthwise")
 ACTIVATIONS = ("relu", "gelu", "silu")
 GAINS = (256, 512)
+LOSSES = ("charbonnier", "l1", "l2", "mse", "huber", "ssim", "charbonnier_ssim")
 
 
 class ConfigError(ValueError):
@@ -67,11 +68,21 @@ class DataConfig:
 
 
 @dataclass
+class LossConfig:
+    name: str = "charbonnier"       # charbonnier | l1 | l2 | huber | ssim | charbonnier_ssim
+    charbonnier_eps: float = 1e-3   # Charbonnier L2->L1 transition (smaller = sharper)
+    huber_delta: float = 1.0        # Huber/smooth-L1 crossover threshold
+    ssim_window: int = 11           # Gaussian window for the SSIM term (odd)
+    ssim_weight: float = 0.2        # blend weight for charbonnier_ssim (0..1)
+
+
+@dataclass
 class OptimizationConfig:
     quantize: bool = True
     qat: bool = False               # true fake-quant-in-the-loop training
     calibration_steps: int = 300
     patch_size: int = 256
+    loss: LossConfig = field(default_factory=LossConfig)
 
 
 @dataclass
@@ -125,6 +136,7 @@ class Config:
             (m.block_depth in BLOCK_DEPTHS, "block_depth", m.block_depth, BLOCK_DEPTHS),
             (s.gain in GAINS, "gain", s.gain, GAINS),
             (s.sensor in SENSOR_KEYS, "sensor", s.sensor, SENSOR_KEYS),
+            (self.optimization.loss.name in LOSSES, "loss", self.optimization.loss.name, LOSSES),
         ]
         if uses_conv_type(m.model_family):
             checks.append((m.conv_type in CONV_TYPES, "conv_type", m.conv_type, CONV_TYPES))
@@ -202,7 +214,11 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     _merge(cfg.model, raw.get("model", {}))
     _merge(cfg.sensor, raw.get("sensor", {}))
     _merge(cfg.data, raw.get("data", {}))
-    _merge(cfg.optimization, raw.get("optimization", {}))
+    raw_opt = dict(raw.get("optimization", {}) or {})
+    raw_loss = raw_opt.pop("loss", None)
+    _merge(cfg.optimization, raw_opt)
+    if isinstance(raw_loss, dict):
+        _merge(cfg.optimization.loss, raw_loss)
     _merge(cfg.output, raw.get("output", {}))
     _merge(cfg.run, raw.get("run", {}))
 
@@ -268,6 +284,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "negative restores the sensor default")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
+    p.add_argument("--loss", dest="loss", choices=list(LOSSES),
+                   help="training loss function (default: charbonnier)")
+    p.add_argument("--charbonnier-eps", dest="charbonnier_eps", type=float,
+                   help="Charbonnier epsilon (L2->L1 transition; smaller = sharper)")
+    p.add_argument("--huber-delta", dest="huber_delta", type=float,
+                   help="Huber/smooth-L1 crossover threshold")
+    p.add_argument("--ssim-window", dest="ssim_window", type=int,
+                   help="Gaussian window size for the SSIM loss term (odd)")
+    p.add_argument("--ssim-weight", dest="ssim_weight", type=float,
+                   help="blend weight for charbonnier_ssim (0..1)")
     p.add_argument("--frames", dest="frames", type=int,
                    help="temporal frames averaged for the synthetic ground truth")
     p.add_argument("--no-quantize", action="store_true", help="disable the INT8 path")
@@ -334,6 +360,16 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.sensor.noise_std = float(args.noise_std)
     if args.steps:
         cfg.optimization.calibration_steps = args.steps
+    if getattr(args, "loss", None):
+        cfg.optimization.loss.name = args.loss
+    if getattr(args, "charbonnier_eps", None) is not None:
+        cfg.optimization.loss.charbonnier_eps = float(args.charbonnier_eps)
+    if getattr(args, "huber_delta", None) is not None:
+        cfg.optimization.loss.huber_delta = float(args.huber_delta)
+    if getattr(args, "ssim_window", None) is not None:
+        cfg.optimization.loss.ssim_window = int(args.ssim_window)
+    if getattr(args, "ssim_weight", None) is not None:
+        cfg.optimization.loss.ssim_weight = float(args.ssim_weight)
     if getattr(args, "frames", None):
         cfg.data.temporal_frames = args.frames
     if args.no_quantize:

@@ -43,14 +43,15 @@ from rich.table import Table
 from rich.text import Text
 
 from nsa.config import (
-    ACTIVATIONS, BASE_CHANNELS, BLOCK_DEPTHS, CONV_TYPES,
-    MODEL_FAMILIES, Config, DataConfig, ModelConfig, OptimizationConfig,
-    OutputConfig, RunConfig, SensorConfig,
+    ACTIVATIONS, BASE_CHANNELS, BLOCK_DEPTHS, CONV_TYPES, LOSSES,
+    MODEL_FAMILIES, Config, DataConfig, LossConfig, ModelConfig,
+    OptimizationConfig, OutputConfig, RunConfig, SensorConfig,
 )
 from nsa.compiler import CAPS, assess_targets, compile_stack
 from nsa.model_opts import search_combo_valid
 from nsa.inference import (
-    calibrate_multi, estimate_device_latency_ms, fake_quantize_int8, psnr, run,
+    build_loss, calibrate_multi, estimate_device_latency_ms, fake_quantize_int8,
+    psnr, run,
 )
 from nsa.models import build_model, count_params
 from nsa.raw_io import build_frame, build_frame_from_source, list_frames
@@ -112,6 +113,7 @@ def _build_search_cfg(
     block_depth: int,
     conv_type: str,
     activation: str,
+    loss: "LossConfig | None" = None,
 ) -> Config:
     cfg = Config(
         hardware=hardware,
@@ -135,6 +137,7 @@ def _build_search_cfg(
             quantize=True,
             calibration_steps=calibration_steps,
             patch_size=patch_size,
+            loss=loss or LossConfig(),
         ),
         output=OutputConfig(dir="outputs", show_window=False, seed=seed),
         run=RunConfig(mode="single"),
@@ -177,10 +180,14 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         result = compile_stack(cfg, n_params)
 
     pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
+    lc = cfg.optimization.loss
+    loss_fn = build_loss(
+        lc.name, charbonnier_eps=lc.charbonnier_eps, huber_delta=lc.huber_delta,
+        ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight)
     # Ranking pass: lighter minibatch keeps big sweeps tractable; the winner is
     # re-fit at full batch by run_demo afterwards.
     calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
-                    cfg.output.seed, progress=None, batch=2)
+                    cfg.output.seed, progress=None, batch=2, loss_fn=loss_fn)
 
     psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
     psnr_fp32 = float(np.mean(
@@ -380,6 +387,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="analog gain of the test frame (default: 256)")
     p.add_argument("--noise-std", dest="noise_std", type=float, default=None,
                    help="override injected Gaussian read-noise std (electrons RMS, denoise-hw style)")
+    p.add_argument("--loss", dest="loss", choices=list(LOSSES), default="charbonnier",
+                   help="training loss function (default: charbonnier)")
+    p.add_argument("--charbonnier-eps", dest="charbonnier_eps", type=float, default=1e-3,
+                   help="Charbonnier epsilon (default: 1e-3)")
+    p.add_argument("--huber-delta", dest="huber_delta", type=float, default=1.0,
+                   help="Huber/smooth-L1 crossover threshold (default: 1.0)")
+    p.add_argument("--ssim-window", dest="ssim_window", type=int, default=11,
+                   help="Gaussian window size for the SSIM loss term (default: 11)")
+    p.add_argument("--ssim-weight", dest="ssim_weight", type=float, default=0.2,
+                   help="blend weight for charbonnier_ssim (default: 0.2)")
     p.add_argument("--real", dest="real_capture", action="store_true",
                    help="use real captures from --dataset as the noisy input")
     p.add_argument("--simulated", dest="simulated", action="store_true",
@@ -539,6 +556,10 @@ def main() -> int:
             filter_tokens=args.filter or [], seed=args.seed,
             model_family=fam, base_channels=ch, block_depth=dep,
             conv_type=ct, activation=act,
+            loss=LossConfig(
+                name=args.loss, charbonnier_eps=args.charbonnier_eps,
+                huber_delta=args.huber_delta, ssim_window=args.ssim_window,
+                ssim_weight=args.ssim_weight),
         )
         spref = f"{sensor_key:<7} " if multi_sensor else ""
         label = f"{spref}{fam.upper()} {ch}ch×{dep} {ct[:3]} {act}"
