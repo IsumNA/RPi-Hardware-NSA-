@@ -2442,9 +2442,12 @@ class App(tk.Tk):
                 if err is None:
                     messagebox.showinfo(
                         "Live testing",
-                        "Opened a Pi SSH session running live.py on the CSI camera.\n\n"
-                        "Press q or ESC in that window to stop.\n"
-                        "(Copied outputs/model.pt to the Pi first.)")
+                        "Started live.py on the Pi's CSI camera over SSH.\n\n"
+                        "The RAW | DENOISED window opens on the MONITOR ATTACHED "
+                        "TO THE PI (display :0). Press q or ESC there to stop.\n\n"
+                        "No Pi monitor? Set pi_live.display: \"\" in config.yaml — "
+                        "a preview saves to outputs/live_preview.png on the Pi.\n"
+                        "AI-server SSH log: outputs/pi_live.log")
                     return
                 messagebox.showerror("Pi live testing", err)
                 return
