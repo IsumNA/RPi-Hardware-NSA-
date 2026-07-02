@@ -177,8 +177,10 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         result = compile_stack(cfg, n_params)
 
     pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
+    # Ranking pass: lighter minibatch keeps big sweeps tractable; the winner is
+    # re-fit at full batch by run_demo afterwards.
     calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
-                    cfg.output.seed, progress=None)
+                    cfg.output.seed, progress=None, batch=2)
 
     psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
     psnr_fp32 = float(np.mean(

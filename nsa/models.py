@@ -36,7 +36,31 @@ def _conv(in_c: int, out_c: int, conv_type: str, k: int = 3) -> nn.Module:
     return nn.Conv2d(in_c, out_c, k, padding=pad)
 
 
+def _norm(c: int) -> nn.Module:
+    """Batch-size-agnostic normalization (GroupNorm).
+
+    Calibration trains on tiny minibatches of one frame's crops, where
+    BatchNorm's running statistics are unstable and hurt quality. GroupNorm is
+    independent of batch size and quantizes cleanly (no running buffers to fold).
+    """
+    groups = 8 if c % 8 == 0 else (4 if c % 4 == 0 else 1)
+    return nn.GroupNorm(groups, c)
+
+
 class _ConvBlock(nn.Module):
+    def __init__(self, c: int, conv_type: str, act: str):
+        super().__init__()
+        self.conv = _conv(c, c, conv_type)
+        self.norm = _norm(c)
+        self.act = _act(act)
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+class _BNConvBlock(nn.Module):
+    """conv → BatchNorm → act (the classic DnCNN-with-BatchNorm unit)."""
+
     def __init__(self, c: int, conv_type: str, act: str):
         super().__init__()
         self.conv = _conv(c, c, conv_type)
@@ -48,14 +72,21 @@ class _ConvBlock(nn.Module):
 
 
 class CNNDenoiser(nn.Module):
-    """DnCNN-style residual denoiser (predicts the noise, subtracts it)."""
+    """Classic BatchNorm residual denoiser (predicts the noise, subtracts it).
+
+    Uses BatchNorm — its defining trait vs the GroupNorm ``DnCNNDenoiser``. BN
+    depends on batch statistics (noisy for the small on-frame calibration batch)
+    and its scale/shift folds into the INT8 graph, so this classic baseline
+    trades quality for simplicity and is usually dominated by the GroupNorm /
+    modern families — the tool's built-in "why architecture choice matters" foil.
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         c = cfg.base_channels
         self.head = nn.Sequential(_conv(3, c, cfg.conv_type), _act(cfg.activation))
         self.body = nn.Sequential(
-            *[_ConvBlock(c, cfg.conv_type, cfg.activation) for _ in range(cfg.block_depth)]
+            *[_BNConvBlock(c, cfg.conv_type, cfg.activation) for _ in range(cfg.block_depth)]
         )
         self.tail = nn.Conv2d(c, 3, 3, padding=1)
 
@@ -65,25 +96,39 @@ class CNNDenoiser(nn.Module):
 
 
 class _NAFBlock(nn.Module):
-    """Simplified NAFNet block: depthwise conv + SimpleGate + channel attention."""
+    """Full NAFNet block: LN → conv/dwconv → SimpleGate → SCA → conv (+shortcut),
+    then LN → conv → SimpleGate → conv (+shortcut).
 
-    def __init__(self, c: int):
+    The earlier version only had the first half and no LayerNorm; adding the
+    normalization and the gated feed-forward half is what unlocks NAFNet's
+    quality-per-parameter (it is otherwise the leanest, fastest zoo member).
+    """
+
+    def __init__(self, c: int, expand: int = 2):
         super().__init__()
-        self.conv1 = nn.Conv2d(c, c * 2, 1)
-        self.dw = nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2)
-        self.conv2 = nn.Conv2d(c, c, 1)
-        self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Conv2d(c, c, 1)
-        )
+        dw = c * expand
+        self.norm1 = _LayerNorm2d(c)
+        self.conv1 = nn.Conv2d(c, dw, 1)
+        self.dw = nn.Conv2d(dw, dw, 3, padding=1, groups=dw)
+        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1),
+                                 nn.Conv2d(dw // 2, dw // 2, 1))
+        self.conv2 = nn.Conv2d(dw // 2, c, 1)
+        self.norm2 = _LayerNorm2d(c)
+        self.conv3 = nn.Conv2d(c, dw, 1)
+        self.conv4 = nn.Conv2d(dw // 2, c, 1)
         self.beta = nn.Parameter(torch.zeros(1, c, 1, 1))
+        self.gamma = nn.Parameter(torch.zeros(1, c, 1, 1))
 
     def forward(self, x):
-        y = self.dw(self.conv1(x))
+        y = self.dw(self.conv1(self.norm1(x)))
         a, b = y.chunk(2, dim=1)         # SimpleGate
         y = a * b
         y = y * self.sca(y)              # simplified channel attention
-        y = self.conv2(y)
-        return x + y * self.beta
+        x = x + self.conv2(y) * self.beta
+        z = self.conv3(self.norm2(x))
+        a, b = z.chunk(2, dim=1)         # SimpleGate (feed-forward)
+        z = a * b
+        return x + self.conv4(z) * self.gamma
 
 
 class NAFNetDenoiser(nn.Module):
@@ -163,11 +208,11 @@ class NAFNetUNetDenoiser(nn.Module):
 
 
 class DnCNNDenoiser(nn.Module):
-    """Classic DnCNN — a BatchNorm-free residual conv stack.
+    """Classic DnCNN — conv-norm-act stack that predicts the noise residual.
 
-    Distinct from ``CNNDenoiser`` (which uses BatchNorm): dropping BN makes the
-    graph friendlier to INT8 post-training quantization (no scale/shift folding),
-    so it tends to keep more PSNR after the INT8 step. Predicts the noise residual.
+    Uses GroupNorm (the original paper's BatchNorm, but batch-size-agnostic and
+    quantization-friendly): normalization between conv layers is precisely what
+    makes DnCNN trainable — without it the plain stack barely denoises.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -175,7 +220,7 @@ class DnCNNDenoiser(nn.Module):
         c = cfg.base_channels
         layers = [_conv(3, c, cfg.conv_type), _act(cfg.activation)]
         for _ in range(cfg.block_depth):
-            layers += [_conv(c, c, cfg.conv_type), _act(cfg.activation)]
+            layers += [_conv(c, c, cfg.conv_type), _norm(c), _act(cfg.activation)]
         self.body = nn.Sequential(*layers)
         self.tail = nn.Conv2d(c, 3, 3, padding=1)
 

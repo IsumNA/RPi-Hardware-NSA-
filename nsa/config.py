@@ -69,7 +69,7 @@ class DataConfig:
 class OptimizationConfig:
     quantize: bool = True
     qat: bool = False               # true fake-quant-in-the-loop training
-    calibration_steps: int = 400
+    calibration_steps: int = 300
     patch_size: int = 256
 
 

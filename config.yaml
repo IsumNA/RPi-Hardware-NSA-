@@ -60,7 +60,7 @@ data:
 optimization:
   quantize: true            # enable INT8 post-training / QAT path
   qat: false                # true => fake-quant-in-the-loop training (STE)
-  calibration_steps: 400    # live calibration iterations on the test frame
+  calibration_steps: 300    # live calibration iterations (batch of augmented crops)
   patch_size: 192           # working resolution for the live demo (square crop)
 
 # ---- Run mode ----------------------------------------------------------------

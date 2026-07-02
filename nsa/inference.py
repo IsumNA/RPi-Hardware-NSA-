@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 import types
 
@@ -110,39 +111,83 @@ def disable_qat(model: nn.Module) -> nn.Module:
     return model
 
 
-def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
-              steps: int, seed: int, progress=None, crop: int = 128,
-              qat: bool = False) -> nn.Module:
-    """Short supervised fit of the model on the live frame pair.
+def _charbonnier(pred: torch.Tensor, target: torch.Tensor,
+                 eps: float = 1e-3) -> torch.Tensor:
+    """Charbonnier (smooth-L1) loss — the denoising-standard objective.
 
-    Trains on random spatial crops (cheaper per step and translation-invariant,
-    so it transfers to the full frame) with an MSE objective (directly maximises
-    PSNR) and a cosine-decayed learning rate.
+    Robust to outliers and much less blurry than plain MSE, so it recovers
+    sharper edges/texture and typically a higher PSNR at the same budget.
+    """
+    diff = pred - target
+    return torch.sqrt(diff * diff + eps * eps).mean()
+
+
+def _augment_pair(x: torch.Tensor, y: torch.Tensor,
+                  g: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random dihedral augmentation (8×): h/v flips + 90° rotations.
+
+    Turns a single frame into an effectively much larger, symmetry-complete
+    training set so the on-frame fit generalises to the whole image.
+    """
+    if torch.rand(1, generator=g).item() < 0.5:
+        x, y = torch.flip(x, [-1]), torch.flip(y, [-1])
+    if torch.rand(1, generator=g).item() < 0.5:
+        x, y = torch.flip(x, [-2]), torch.flip(y, [-2])
+    k = int(torch.randint(0, 4, (1,), generator=g).item())
+    if k:
+        x, y = torch.rot90(x, k, [-2, -1]), torch.rot90(y, k, [-2, -1])
+    return x, y
+
+
+def _sample_batch(tensors, crop: int, batch: int,
+                  g: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    """Assemble an augmented minibatch of same-sized crops across frames."""
+    c = min([crop] + [min(t[0].shape[-2:]) for t in tensors])
+    xs, ys = [], []
+    for _ in range(batch):
+        xi, yi = tensors[int(torch.randint(0, len(tensors), (1,), generator=g))]
+        h, w = xi.shape[-2:]
+        iy = int(torch.randint(0, h - c + 1, (1,), generator=g))
+        ix = int(torch.randint(0, w - c + 1, (1,), generator=g))
+        xc = xi[..., iy:iy + c, ix:ix + c]
+        yc = yi[..., iy:iy + c, ix:ix + c]
+        xc, yc = _augment_pair(xc, yc, g)
+        xs.append(xc)
+        ys.append(yc)
+    return torch.cat(xs, 0), torch.cat(ys, 0)
+
+
+def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
+           crop: int, batch: int, qat: bool, lr: float) -> nn.Module:
+    """Shared training loop: Charbonnier + 8× aug + warmup-cosine LR + grad clip.
+
+    Gradient clipping and a short warmup keep even deep transpose-conv nets
+    (DRUNet / RED-Net) from diverging at an aggressive learning rate, while the
+    minibatch of augmented crops gives stable, low-variance gradients.
     """
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
-    x_full = to_tensor(noisy)
-    y_full = to_tensor(clean)
-    h, w = x_full.shape[-2:]
-    crop = min(crop, h, w)
+    steps = max(1, steps)
+    warmup = max(1, steps // 10)
 
-    opt = torch.optim.Adam(model.parameters(), lr=4e-3)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps), eta_min=2e-4)
-    loss_fn = nn.MSELoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    def lr_at(i: int) -> float:
+        if i < warmup:
+            return (i + 1) / warmup
+        t = (i - warmup) / max(1, steps - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * t)) * (1.0 - 0.02) + 0.02
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     if qat:
         enable_qat(model)
     model.train()
-    for i in range(max(1, steps)):
-        if crop < h or crop < w:
-            iy = int(torch.randint(0, h - crop + 1, (1,), generator=g))
-            ix = int(torch.randint(0, w - crop + 1, (1,), generator=g))
-            x = x_full[..., iy:iy + crop, ix:ix + crop]
-            y = y_full[..., iy:iy + crop, ix:ix + crop]
-        else:
-            x, y = x_full, y_full
+    for i in range(steps):
+        xb, yb = _sample_batch(tensors, crop, batch, g)
         opt.zero_grad()
-        loss = loss_fn(model(x), y)
+        loss = _charbonnier(model(xb), yb)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
         if progress is not None and (i % 4 == 0 or i == steps - 1):
@@ -151,50 +196,29 @@ def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
         disable_qat(model)
     model.eval()
     return model
+
+
+def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
+              steps: int, seed: int, progress=None, crop: int = 160,
+              qat: bool = False, batch: int = 4, lr: float = 3e-3) -> nn.Module:
+    """Short supervised fit on one frame pair (Charbonnier + augmentation)."""
+    tensors = [(to_tensor(noisy), to_tensor(clean))]
+    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr)
 
 
 def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
-                    progress=None, crop: int = 128, qat: bool = False) -> nn.Module:
+                    progress=None, crop: int = 160, qat: bool = False,
+                    batch: int = 4, lr: float = 3e-3) -> nn.Module:
     """Calibrate across a set of (noisy, clean) frames (batch / multi-image fit).
 
-    Each step samples a random frame and a random crop from it - the same
-    "patches drawn across many images" strategy used by denoise-hw's training.
+    Draws an augmented minibatch of crops across all frames each step — the
+    "patches across many images" strategy from denoise-hw, with 8× dihedral
+    augmentation, a Charbonnier objective and gradient clipping for stability.
     """
     if not pairs:
         raise ValueError("calibrate_multi needs at least one (noisy, clean) pair")
-    if len(pairs) == 1:
-        return calibrate(model, pairs[0][0], pairs[0][1], steps, seed,
-                         progress, crop, qat=qat)
-
-    torch.manual_seed(seed)
-    g = torch.Generator().manual_seed(seed)
     tensors = [(to_tensor(n), to_tensor(c)) for n, c in pairs]
-
-    opt = torch.optim.Adam(model.parameters(), lr=4e-3)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps), eta_min=2e-4)
-    loss_fn = nn.MSELoss()
-    if qat:
-        enable_qat(model)
-    model.train()
-    for i in range(max(1, steps)):
-        xi, yi = tensors[int(torch.randint(0, len(tensors), (1,), generator=g))]
-        h, w = xi.shape[-2:]
-        c = min(crop, h, w)
-        iy = int(torch.randint(0, h - c + 1, (1,), generator=g))
-        ix = int(torch.randint(0, w - c + 1, (1,), generator=g))
-        x = xi[..., iy:iy + c, ix:ix + c]
-        y = yi[..., iy:iy + c, ix:ix + c]
-        opt.zero_grad()
-        loss = loss_fn(model(x), y)
-        loss.backward()
-        opt.step()
-        sched.step()
-        if progress is not None and (i % 4 == 0 or i == steps - 1):
-            progress(i + 1, steps, float(loss.item()))
-    if qat:
-        disable_qat(model)
-    model.eval()
-    return model
+    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr)
 
 
 def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):

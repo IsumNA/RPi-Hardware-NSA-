@@ -1328,7 +1328,7 @@ class App(tk.Tk):
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
         self._add_rows(body, [
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
-             [160, 400, 600, 800], 400),
+             [150, 300, 500, 800], 300),
         ])
         self._check(body, "INT8 quantization (PTQ)",
                     "Quantize weights + activations for the accelerator target.",
@@ -1417,7 +1417,7 @@ class App(tk.Tk):
             ("Run mode", mode, INK),
             ("Model", model_txt, INK),
             ("Target chip", hw_name, INK),
-            ("Calibration", f"{self._row_get('steps','400')} steps · quant {q}", INK),
+            ("Calibration", f"{self._row_get('steps','300')} steps · quant {q}", INK),
         ]
         hint = self._dataset_quality_hint()
         if hint:
