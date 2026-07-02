@@ -82,4 +82,6 @@ pi_live:
   ssh_host: rpi             # or YOUR_USER@10.x.x.x (Pi IP on lab network)
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto
+  display: ":0"             # Pi's own monitor. Use "" for headless preview PNG.
   # One-time on AI server:  ./setup_ssh_pi.sh YOUR_USER PI_IP
+  # Verify before launching:  python -m nsa.pi_remote --check

@@ -24,6 +24,9 @@ def load_pi_live_settings(project_root: Path | None = None) -> dict:
         "ssh_host": os.environ.get("RPI_SSH_HOST", "rpi"),
         "repo": os.environ.get("RPI_REPO", "~/RPi-Hardware-NSA-"),
         "source": os.environ.get("RPI_LIVE_SOURCE", "picamera"),
+        # Which display the OpenCV window renders on. ":0" = the Pi's own monitor
+        # (its local desktop session). Empty = headless (save a preview PNG only).
+        "display": os.environ.get("RPI_LIVE_DISPLAY", ":0"),
     }
     cfg_path = root / "config.yaml"
     if cfg_path.exists():
@@ -85,12 +88,56 @@ def ssh_setup_help(host: str, detail: str) -> str:
     )
 
 
-def remote_live_shell_command(repo: str, source: str = "picamera") -> str:
-    """Bash one-liner run on the Pi after SSH."""
+def remote_display_status(host: str, display: str = ":0") -> tuple[bool, str]:
+    """Probe whether ``display`` on the Pi can accept an X window.
+
+    Returns (ok, detail). Used by --check so the user learns *before* launching
+    that the plain-SSH session has no reachable desktop for the OpenCV window.
+    """
+    if not display:
+        return False, "headless (no display configured)"
+    probe = (f"export DISPLAY={display}; "
+             f"export XAUTHORITY=${{XAUTHORITY:-$HOME/.Xauthority}}; "
+             f"if command -v xset >/dev/null 2>&1; then "
+             f"xset q >/dev/null 2>&1 && echo OK || echo NODISP; "
+             f"else echo NOXSET; fi")
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, probe],
+            capture_output=True, text=True, timeout=20, check=False)
+        out = (r.stdout or "").strip()
+        if "OK" in out:
+            return True, f"display {display} reachable"
+        if "NOXSET" in out:
+            return True, (f"cannot verify {display} (xset not installed) — "
+                          f"the window will still be attempted")
+        return False, (f"no desktop on {display}. Plug a monitor into the Pi with "
+                       f"its desktop running, or set pi_live.display: '' for a "
+                       f"headless preview PNG.")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+
+
+def remote_live_shell_command(repo: str, source: str = "picamera",
+                              display: str = ":0") -> str:
+    """Bash one-liner run on the Pi after SSH.
+
+    A plain SSH session has no ``$DISPLAY``, so the OpenCV preview window has
+    nowhere to draw. Exporting ``DISPLAY`` (the Pi's own desktop, usually ``:0``)
+    makes the RAW|DENOISED window appear on the monitor attached to the Pi. When
+    ``display`` is empty we stay headless and live.py saves a preview PNG.
+    """
     repo = repo.rstrip("/")
+    disp = ""
+    if display:
+        # Point at the Pi's local X session; XAUTHORITY lets us attach to a
+        # desktop started by the same login user without needing `xhost`.
+        disp = (f"export DISPLAY={display}; "
+                f"export XAUTHORITY=${{XAUTHORITY:-$HOME/.Xauthority}}; ")
     return (
         f"cd {repo} && mkdir -p outputs && "
         f"if [ -d .venv/bin ]; then . .venv/bin/activate; fi && "
+        f"{disp}"
         f"(python3 live.py --source {source} || python live.py --source {source})"
     )
 
@@ -153,6 +200,7 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     host = str(s["ssh_host"])
     repo = str(s["repo"])
     source = str(s["source"])
+    display = str(s.get("display", ":0"))
 
     ok, detail = ssh_reachable(host)
     if not ok:
@@ -162,7 +210,7 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     if err:
         return err
 
-    remote_cmd = remote_live_shell_command(repo, source)
+    remote_cmd = remote_live_shell_command(repo, source, display)
     return launch_pi_terminal(host, remote_cmd)
 
 
@@ -176,12 +224,22 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("--check", "-c"):
         s = load_pi_live_settings(root)
         host = str(s["ssh_host"])
+        display = str(s.get("display", ":0"))
         ok, detail = ssh_reachable(host)
-        if ok:
-            print(f"SSH OK: {host}")
-            return 0
-        print(ssh_setup_help(host, detail), file=sys.stderr)
-        return 1
+        if not ok:
+            print(ssh_setup_help(host, detail), file=sys.stderr)
+            return 1
+        print(f"SSH OK: {host}")
+        disp_ok, disp_detail = remote_display_status(host, display)
+        marker = "OK" if disp_ok else "!!"
+        print(f"Display {marker}: {disp_detail}")
+        if not disp_ok:
+            print("\nThe camera window needs a screen. Options:\n"
+                  "  - Attach a monitor to the Pi (its desktop must be running), or\n"
+                  "  - Set  pi_live.display: ''  in config.yaml for a headless\n"
+                  "    preview saved to outputs/live_preview.png on the Pi.",
+                  file=sys.stderr)
+        return 0 if disp_ok else 2
     err = run_live_on_pi(root)
     if err:
         print(err, file=sys.stderr)
