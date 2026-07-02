@@ -27,6 +27,9 @@ def load_pi_live_settings(project_root: Path | None = None) -> dict:
         # running desktop (X11/Wayland). ":0" forces that display. Empty =
         # headless (save a preview PNG only).
         "display": os.environ.get("RPI_LIVE_DISPLAY", "auto"),
+        # Virtualenv on the Pi. "auto" tries .venv/venv/env; or set an explicit
+        # path (e.g. ~/RPi-Hardware-NSA-/.venv) if yours lives elsewhere.
+        "venv": os.environ.get("RPI_VENV", "auto"),
     }
     cfg_path = root / "config.yaml"
     if cfg_path.exists():
@@ -153,19 +156,40 @@ def remote_display_status(host: str, display: str = "auto") -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _venv_activate_snippet(venv: str = "auto") -> str:
+    """Bash that activates the Pi's virtualenv (so cv2/torch are importable).
+
+    "auto" tries the common names (.venv, venv, env); otherwise the given path
+    is activated directly. Emits a warning to stderr if nothing is found, since
+    running the system python usually means a missing-module error.
+    """
+    if venv and venv != "auto":
+        v = venv.rstrip("/")
+        return (f'if [ -f "{v}/bin/activate" ]; then . "{v}/bin/activate"; '
+                f'else echo "warning: no venv at {v}" >&2; fi; ')
+    return (
+        'for v in .venv venv env; do '
+        'if [ -f "$v/bin/activate" ]; then . "$v/bin/activate"; break; fi; '
+        'done; '
+        'if [ -z "$VIRTUAL_ENV" ]; then '
+        'echo "warning: no .venv/venv/env found - using system python" >&2; fi; '
+    )
+
+
 def remote_live_shell_command(repo: str, source: str = "picamera",
-                              display: str = "auto") -> str:
+                              display: str = "auto", venv: str = "auto") -> str:
     """Bash one-liner run on the Pi after SSH.
 
-    Resolves the desktop's DISPLAY/XAUTHORITY so the RAW|DENOISED window appears
-    on the monitor attached to the Pi. When ``display`` is empty we stay headless
-    and live.py saves a preview PNG instead.
+    Activates the Pi's virtualenv, resolves the desktop's DISPLAY/XAUTHORITY so
+    the RAW|DENOISED window appears on the monitor attached to the Pi, then runs
+    live.py. When ``display`` is empty we stay headless (live.py saves a PNG).
     """
     repo = repo.rstrip("/")
     disp = "" if not display else _gui_env_snippet(display)
+    act = _venv_activate_snippet(venv)
     return (
         f"cd {repo} && mkdir -p outputs && "
-        f"if [ -d .venv/bin ]; then . .venv/bin/activate; fi && "
+        f"{act}"
         f"{disp}"
         f"(python3 live.py --source {source} || python live.py --source {source})"
     )
@@ -233,6 +257,7 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     repo = str(s["repo"])
     source = str(s["source"])
     display = str(s.get("display", "auto"))
+    venv = str(s.get("venv", "auto"))
 
     ok, detail = ssh_reachable(host)
     if not ok:
@@ -242,7 +267,7 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     if err:
         return err
 
-    remote_cmd = remote_live_shell_command(repo, source, display)
+    remote_cmd = remote_live_shell_command(repo, source, display, venv)
     return launch_pi_terminal(host, remote_cmd, project_root=root)
 
 

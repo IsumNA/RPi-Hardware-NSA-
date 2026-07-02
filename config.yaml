@@ -83,4 +83,5 @@ pi_live:
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto
   display: auto             # auto-detect Pi desktop (X11/Wayland). "" = headless PNG.
+  venv: auto                # Pi virtualenv: auto (.venv/venv/env) or an explicit path
   # Verify before launching:  python -m nsa.pi_remote --check
