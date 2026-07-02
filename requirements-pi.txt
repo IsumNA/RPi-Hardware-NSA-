@@ -1,13 +1,13 @@
-# Raspberry Pi CSI camera — pip-only (no sudo apt)
+# Raspberry Pi live testing — pip-only (no sudo apt)
 #
 # Install into your venv on the Pi:
 #     source .venv/bin/activate
 #     pip install -r requirements-pi.txt
 #
-# These are also pulled automatically on aarch64 Linux when you run:
-#     pip install -r requirements.txt
-#
 # WHAT PIP CAN INSTALL (this file):
+#   opencv-python  — camera capture + the live RAW|DENOISED preview window
+#                    (use opencv-python, NOT -headless, so imshow can open a
+#                    window on the Pi's monitor)
 #   picamera2      — Python API for the CSI camera
 #   rpi-libcamera  — libcamera Python bindings
 #
@@ -16,10 +16,15 @@
 #   → package: libcamera-apps
 #   GStreamer libcamerasrc plugin → gstreamer1.0-libcamera
 #
+# NOTE: picamera2 usually ships with Pi OS. If pip can't install it, recreate the
+# venv so it can see the system package:
+#     python3 -m venv --system-site-packages .venv
+#
 # On a non-Pi machine (AI server, x86 laptop) this file will not help — there is
 # no CSI camera. Use:  python live.py --source sim  or a USB webcam on Windows.
 #
 # After install:  python pi_camera_check.py
 
+opencv-python>=4.8
 picamera2>=0.3.0
 rpi-libcamera>=0.1.0

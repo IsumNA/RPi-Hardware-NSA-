@@ -43,7 +43,19 @@ import sys
 import time
 from pathlib import Path
 
-import cv2
+try:
+    import cv2
+except ModuleNotFoundError:  # pragma: no cover - environment guard
+    import sys as _sys
+    _sys.exit(
+        "live.py needs OpenCV (module 'cv2'), which is not installed in this "
+        "environment.\n\n"
+        "On the Pi, install it into your venv:\n"
+        "    source .venv/bin/activate\n"
+        "    pip install -r requirements-pi.txt      # or: pip install opencv-python\n\n"
+        "Use opencv-python (NOT opencv-python-headless) so the live preview "
+        "window can open on the Pi's monitor."
+    )
 import numpy as np
 import torch
 
