@@ -8,17 +8,18 @@
 #   opencv-python  — camera capture + the live RAW|DENOISED preview window
 #                    (use opencv-python, NOT -headless, so imshow can open a
 #                    window on the Pi's monitor)
-#   picamera2      — Python API for the CSI camera
-#   rpi-libcamera  — libcamera Python bindings
+#
+# WHAT ALREADY SHIPS WITH Pi OS (do NOT pip-install — it fails):
+#   picamera2 + libcamera  — the CSI camera stack is preinstalled system-wide.
+#   To let your venv see it, create the venv with system packages visible:
+#       python3 -m venv --system-site-packages .venv
+#   (pip packages 'picamera2' / 'rpi-libcamera' often have no matching wheel and
+#    will error with "could not find a version that satisfies the requirement".)
 #
 # WHAT PIP CANNOT INSTALL (needs lab admin + sudo apt):
 #   rpicam-hello, rpicam-vid, libcamera-hello, libcamera-vid
 #   → package: libcamera-apps
 #   GStreamer libcamerasrc plugin → gstreamer1.0-libcamera
-#
-# NOTE: picamera2 usually ships with Pi OS. If pip can't install it, recreate the
-# venv so it can see the system package:
-#     python3 -m venv --system-site-packages .venv
 #
 # On a non-Pi machine (AI server, x86 laptop) this file will not help — there is
 # no CSI camera. Use:  python live.py --source sim  or a USB webcam on Windows.
@@ -26,5 +27,3 @@
 # After install:  python pi_camera_check.py
 
 opencv-python>=4.8
-picamera2>=0.3.0
-rpi-libcamera>=0.1.0
