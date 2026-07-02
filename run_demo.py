@@ -40,7 +40,7 @@ from nsa.inference import (calibrate, calibrate_multi, estimate_device_latency_m
 from nsa.models import build_model, count_params
 from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
                         list_frames)
-from nsa.sensors import get_sensor
+from nsa.sensors import get_sensor, with_noise_std
 from nsa.report import compute_fitness, print_report, print_target_suitability
 from nsa.scaling import render_scaling_chart, scaling_curves
 from nsa.model_opts import (instantiate_summary, model_display_line, profile_rows,
@@ -82,7 +82,7 @@ def main() -> int:
     torch.manual_seed(cfg.output.seed)
     np.random.seed(cfg.output.seed)
 
-    sensor = get_sensor(cfg.sensor.sensor)
+    sensor = with_noise_std(get_sensor(cfg.sensor.sensor), cfg.sensor.noise_std)
 
     # -- Configuration summary --------------------------------------------------
     console.print(kv_table(
@@ -121,6 +121,9 @@ def main() -> int:
     log(f"Sensor profile: {sensor.label} — {sensor.family}  ·  "
         f"QE {sensor.qe:.0%}, read {sensor.read_noise:.1f}e-, "
         f"well {sensor.full_well:,.0f}e-", "step")
+    if cfg.sensor.noise_std is not None and cfg.sensor.noise_std >= 0:
+        log(f"Noise override: injected read-noise std forced to "
+            f"{sensor.read_noise:.1f}e- (denoise-hw style)", "step")
     real_capture = bool(cfg.sensor.real_capture)
     real_source = cfg.sensor.dataset_path or cfg.sensor.input_raw
     simulate_noise = bool(cfg.sensor.simulate_noise)

@@ -12,7 +12,7 @@ framework that auto-optimizes a denoiser for whatever sensor the product uses.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -59,3 +59,17 @@ SENSOR_KEYS = tuple(SENSORS.keys())
 
 def get_sensor(key: str) -> SensorProfile:
     return SENSORS[key]
+
+
+def with_noise_std(sensor: SensorProfile, read_noise: float | None) -> SensorProfile:
+    """Return a copy of ``sensor`` with the Gaussian read-noise std overridden.
+
+    ``read_noise`` is the standard deviation of the additive Gaussian read noise,
+    in electrons RMS — the same knob David Plowman's denoise-hw exposes for
+    dialling the synthetic noise floor. ``None`` (or a negative value) leaves the
+    sensor's datasheet default untouched. The photon shot-noise term is physical
+    and always scales with the signal on top of this floor.
+    """
+    if read_noise is None or read_noise < 0:
+        return sensor
+    return replace(sensor, read_noise=float(read_noise))

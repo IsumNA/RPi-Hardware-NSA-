@@ -58,6 +58,7 @@ class SensorConfig:
     simulate_noise: bool = False    # inject sensor noise on top of loaded frames
     filter: list = field(default_factory=lambda: ["imx219", "ag12"])
     gain: int = 256
+    noise_std: float | None = None  # override Gaussian read-noise std (electrons RMS); None = sensor default
 
 
 @dataclass
@@ -262,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--qat", dest="qat", action="store_true",
                    help="quantization-aware training (fake-quant in the loop)")
     p.add_argument("--gain", type=int, choices=GAINS, help="analog gain of the test frame")
+    p.add_argument("--noise-std", dest="noise_std", type=float,
+                   help="override the injected Gaussian read-noise std (electrons RMS, denoise-hw style); "
+                        "negative restores the sensor default")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
     p.add_argument("--frames", dest="frames", type=int,
@@ -326,6 +330,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.optimization.qat = True
     if args.gain:
         cfg.sensor.gain = args.gain
+    if getattr(args, "noise_std", None) is not None:
+        cfg.sensor.noise_std = float(args.noise_std)
     if args.steps:
         cfg.optimization.calibration_steps = args.steps
     if getattr(args, "frames", None):
