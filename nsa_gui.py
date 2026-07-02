@@ -304,7 +304,7 @@ class Sidebar(tk.Canvas):
             tx = S(70)
         else:
             tx = S(22)
-        self.create_text(tx, S(36), text="NSA", anchor="w", fill=RASPBERRY,
+        self.create_text(tx, S(36), text="NAS", anchor="w", fill=RASPBERRY,
                         font=font(20, "bold"))
         self.create_text(tx, S(58), text="compiler", anchor="w", fill=SUBTLE,
                         font=font(10))
@@ -508,7 +508,7 @@ class LiveView(tk.Toplevel):
 
     def __init__(self, master, source="auto", camera_index=0):
         super().__init__(master, bg=WHITE)
-        self.title("NSA  ·  Live Testing")
+        self.title("NAS  ·  Live Testing")
         self.configure(bg=WHITE)
         # On Windows/macOS skip picamera2 and go straight to OpenCV webcams.
         if source == "auto" and not sys.platform.startswith("linux"):
@@ -613,7 +613,7 @@ class LiveView(tk.Toplevel):
         body.columnconfigure(0, weight=1, uniform="vid")
         body.columnconfigure(1, weight=1, uniform="vid")
         self._panel(body, 0, "raw", "RAW SENSOR", "noisy input", SUBTLE)
-        self._panel(body, 1, "out", "NSA DENOISED", "optimised output", GREEN)
+        self._panel(body, 1, "out", "NAS DENOISED", "optimised output", GREEN)
 
     def _panel(self, parent, col, key, title, sub, accent):
         card = tk.Frame(parent, bg=WHITE, highlightthickness=1,
@@ -875,7 +875,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         _resolve_font_family()
-        self.title("NSA — Neural Architecture Search")
+        self.title("NAS — Neural Architecture Search")
         self.configure(bg=WHITE)
         self._apply_geometry()
         # On Windows we already scale fonts via FT(); applying Tk's own scaling on
@@ -2419,7 +2419,7 @@ class App(tk.Tk):
                 if not files:
                     files = hub.model_details(mid).get("files") or []
                 weight = pick_weight_file(files, family=fam, hint=mid)
-                self._hf_q.put(("use_ok", e, weight))
+                self._hf_q.put(("use_ok", (e, weight)))
             except Exception as exc:  # noqa: BLE001
                 self._hf_q.put(("use_err", f"Download failed: {exc}"))
         threading.Thread(target=work, daemon=True).start()
@@ -3302,7 +3302,7 @@ class App(tk.Tk):
 
     def _show_log(self):
         win = tk.Toplevel(self)
-        win.title("NSA — Full compilation log")
+        win.title("NAS — Full compilation log")
         win.configure(bg=WHITE)
         win.geometry(f"{S(820)}x{S(560)}")
         con = tk.Frame(win, bg=FIELD)
