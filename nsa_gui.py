@@ -1657,9 +1657,23 @@ class App(tk.Tk):
         pass
 
     def _on_sensor_change(self):
+        key = self.rows["sensor"].get() if "sensor" in self.rows else "imx662"
+        # Keep the dataset filter aligned with the sensor so real captures for
+        # the selected module actually load (a stale imx219 filter loads nothing
+        # for imx662 and silently falls back to synthetic).
+        if hasattr(self, "filter_var"):
+            try:
+                from nsa.denoise_hw_data import (DEFAULT_FILTERS_BY_SENSOR,
+                                                 default_filter_for_sensor)
+                current = tuple((self.filter_var.get() or "").split())
+                known = {tuple(v) for v in DEFAULT_FILTERS_BY_SENSOR.values()}
+                known.add(())
+                if current in known:
+                    self.filter_var.set(" ".join(default_filter_for_sensor(key)))
+            except Exception:  # noqa: BLE001
+                pass
         if not hasattr(self, "sensor_echo"):
             return
-        key = self.rows["sensor"].get() if "sensor" in self.rows else "imx662"
         card = next((c for c in SENSOR_CARDS if c["key"] == key), None)
         if card:
             self.sensor_echo.config(

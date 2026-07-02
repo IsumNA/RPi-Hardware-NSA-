@@ -20,6 +20,13 @@ from nsa.raw_io import find_paired_folders, list_frames
 # Same test folder denoise-hw's run.sh uses (test.py cabinet_D50_100/imx219_ag12_test).
 DEFAULT_TEST_REL = "Data/cabinet_D50_100/imx219_ag12_test"
 DEFAULT_FILTER = ["imx219", "ag12"]
+# Per-sensor dataset folder keywords (denoise-hw path convention).
+DEFAULT_FILTERS_BY_SENSOR: dict[str, list[str]] = {
+    "imx219": ["imx219", "ag12"],
+    "imx662": ["imx662", "ag12"],
+    # No IMX-NG captures exist yet — use the closest Starvis 2 stand-in.
+    "imxng": ["imx662", "ag12"],
+}
 DEFAULT_DATASET_PATH = "datasets/PI_RAW"
 DEFAULT_REMOTE_PI_RAW = "/opt/datasets/PI_RAW"
 SYNTHETIC_MARKER = ".nsa_synthetic_sample"
@@ -126,11 +133,41 @@ def is_synthetic_sample_dataset(root: Path | str | None) -> bool:
     return png_only and len(pairs) <= 8
 
 
+def default_filter_for_sensor(sensor_key: str) -> list[str]:
+    """Dataset path tokens that select captures for this sensor profile."""
+    return list(DEFAULT_FILTERS_BY_SENSOR.get(sensor_key, DEFAULT_FILTER))
+
+
 def _apply_default_filter(cfg, root: Path) -> None:
-    if not cfg.sensor.filter:
+    """Pick a dataset filter matching the selected sensor (if none set)."""
+    if cfg.sensor.filter:
+        return
+    sensor_key = getattr(cfg.sensor, "sensor", "") or "imx219"
+    cfg.sensor.filter = default_filter_for_sensor(sensor_key)
+    # Legacy fallback when the sensor-specific scene is missing from the tree.
+    if sensor_key == "imx219":
         test_dir = root / DEFAULT_TEST_REL
-        if test_dir.is_dir():
+        if test_dir.is_dir() and not cfg.sensor.filter:
             cfg.sensor.filter = list(DEFAULT_FILTER)
+
+
+def sync_filter_to_sensor(cfg) -> None:
+    """When the sensor profile changes, point the dataset filter at matching scenes.
+
+    If the filter is empty or still one of the known per-sensor defaults (e.g. the
+    user switched IMX-NG → IMX662 but the filter stayed at imx219), update it.
+    Otherwise respect a custom filter the manager typed in manually.
+    """
+    sensor_key = getattr(cfg.sensor, "sensor", "") or "imx219"
+    want = default_filter_for_sensor(sensor_key)
+    current = list(cfg.sensor.filter or [])
+    if not current:
+        cfg.sensor.filter = want
+        return
+    known = {tuple(v) for v in DEFAULT_FILTERS_BY_SENSOR.values()}
+    known.add(tuple(DEFAULT_FILTER))
+    if tuple(current) in known:
+        cfg.sensor.filter = want
 
 
 def finalize_dataset_config(cfg, project_root: Path | None = None) -> bool:
@@ -138,6 +175,11 @@ def finalize_dataset_config(cfg, project_root: Path | None = None) -> bool:
     root_dir = project_root or Path(__file__).resolve().parents[1]
     if not cfg.sensor.real_capture:
         return False
+
+    # Keep the dataset filter aligned with the chosen sensor: a leftover default
+    # like [imx219, ag12] would otherwise load no frames for an IMX662 selection
+    # (and silently fall back to synthetic). Custom filters are left untouched.
+    sync_filter_to_sensor(cfg)
 
     if cfg.sensor.dataset_path:
         cfg.sensor.dataset_path = str(
