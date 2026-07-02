@@ -1076,10 +1076,9 @@ class App(tk.Tk):
         self.content.pack(fill="both", expand=True, padx=pad, pady=(S(4), 0))
 
         # Step registry: (key, title, subtitle, builder).
+        # The run type (single vs sweep) is chosen on the home screen, so the
+        # wizard does not repeat it and starts straight at the sensor step.
         self._step_defs = [
-            ("eval", "What do you want to do?",
-             "Test one specific model, or sweep & rank many to find the best.",
-             self._step_eval),
             ("sensor", "Image sensor",
              "Pick the camera module you're optimising for — everything adapts to it.",
              self._step_sensor),
@@ -1140,20 +1139,6 @@ class App(tk.Tk):
         self._show_home()
 
     # -- Individual wizard steps ---------------------------------------------
-    def _step_eval(self, body):
-        self._radio(body, "Test one specific model", "single", enabled=True,
-                    variable=self.eval_var, badge="TEST ONE",
-                    desc="Pick an exact architecture and compile it into "
-                         "hardware-ready artifacts + a performance report.",
-                    command=self._on_eval_change)
-        self._radio(body, "Sweep & rank models (find the best)", "sweep",
-                    enabled=True, variable=self.eval_var, badge="COMPARE",
-                    desc="Train all 9 model families at each depth (your chosen "
-                         "width/conv/activation stay fixed) and show a ranked, "
-                         "clickable leaderboard you can filter by Pi chip. Takes a "
-                         "few minutes; click any row to run that exact model.",
-                    command=self._on_eval_change)
-
     def _step_sensor(self, body):
         self._section(body, "PRIMARY INPUT · IMAGE SENSOR")
         tk.Label(body, text="     Pick the camera module you're optimising for. "
