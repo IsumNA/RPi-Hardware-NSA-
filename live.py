@@ -641,7 +641,9 @@ def compose(raw_bgr, out_bgr, fps, dt_ms, noise_in, noise_out, model_name,
     drop = (1.0 - noise_out / noise_in) * 100.0 if noise_in > 1e-6 else 0.0
     left_stats = [f"noise {noise_in:5.1f}"]
     if add_noise > 0:
-        left_stats.append("n: toggle   +/-: adjust")
+        left_stats.append(f"inject sigma {add_noise:.0f}   n:off  +/-:adjust")
+    else:
+        left_stats.append("inject noise: OFF   press 'n'")
     _stat_line(left, left_stats)
     _stat_line(right, [
         f"{model_name}   {dt_ms:4.1f} ms/frame   {fps:4.1f} FPS",

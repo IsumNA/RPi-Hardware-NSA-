@@ -280,6 +280,39 @@ def _pareto_front(results: list[SearchResult]) -> list[SearchResult]:
     return front
 
 
+def _select_winner(results: list[SearchResult], max_latency: "float | None",
+                   prefer: str) -> "tuple[SearchResult, bool]":
+    """Pick the winner honouring a latency budget and a preference.
+
+    Returns ``(winner, budget_met)``. When ``max_latency`` is given, the winner is
+    chosen only among configs that meet the budget; if none qualify we fall back to
+    the fastest config overall and report ``budget_met=False``. ``prefer`` decides
+    how to break ties among the qualifying pool: ``quality`` (max PSNR), ``speed``
+    (min latency), or ``balanced`` (max fitness).
+    """
+    if not results:
+        raise ValueError("no results to choose from")
+
+    pool = results
+    budget_met = True
+    if max_latency is not None:
+        within = [r for r in results if r.latency_ms <= max_latency]
+        if within:
+            pool = within
+        else:
+            budget_met = False
+            # Nothing fits — surface the fastest option so the user has a lead.
+            return min(results, key=lambda r: r.latency_ms), False
+
+    if prefer == "quality":
+        winner = max(pool, key=lambda r: (r.psnr_out, -r.latency_ms))
+    elif prefer == "speed":
+        winner = min(pool, key=lambda r: (r.latency_ms, -r.psnr_out))
+    else:  # balanced
+        winner = max(pool, key=lambda r: r.fitness)
+    return winner, budget_met
+
+
 def _save_pareto(results: list[SearchResult], front: list[SearchResult],
                  winner: SearchResult, caps: dict, args) -> Path:
     out = Path("outputs")
@@ -434,6 +467,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="frames averaged for synthetic ground truth (default: 64)")
     p.add_argument("--top", type=int, default=5,
                    help="how many top results to show in the summary (default: 5)")
+    p.add_argument("--max-latency", dest="max_latency", type=float, default=None,
+                   metavar="MS",
+                   help="goal: only accept configs with estimated latency <= MS ms. "
+                        "The winner is chosen among configs that meet this budget "
+                        "(falls back to the fastest if none qualify).")
+    p.add_argument("--prefer", choices=["quality", "speed", "balanced"],
+                   default="balanced",
+                   help="goal: how to pick the winner among configs that meet the "
+                        "latency budget — 'quality' (max PSNR), 'speed' (min latency), "
+                        "or 'balanced' (max fitness, the default).")
     p.add_argument("--optuna", dest="optuna", type=int, default=0, metavar="TRIALS",
                    help="use an Optuna TPE search of N trials instead of full grid "
                         "(falls back to grid if optuna isn't installed)")
@@ -639,7 +682,18 @@ def main() -> int:
     console.print()
     console.print(_results_table(top_n, f"Top {min(args.top, len(results))} Configurations — {caps['label']}", show_sensor=args.all_sensors))
 
-    winner = results[0]
+    # -- Goal-aware winner selection (latency budget + preference) ----------
+    winner, budget_met = _select_winner(results, args.max_latency, args.prefer)
+    if args.max_latency is not None:
+        if budget_met:
+            console.print(
+                f"\n  [{_GREEN}]Goal met:[/] best config under "
+                f"{args.max_latency:.0f} ms (prefer: {args.prefer}).")
+        else:
+            console.print(
+                f"\n  [{_AMBER}]Goal not met:[/] no config fits under "
+                f"{args.max_latency:.0f} ms on {caps['label']} — showing the "
+                f"fastest available ({winner.latency_ms:.1f} ms).")
     console.print()
     console.print(Panel(
         f"  [bold {_BRIGHT}]Best framework for[/] [bold {_GREEN}]{caps['label']}[/]\n\n"

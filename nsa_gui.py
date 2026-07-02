@@ -1160,6 +1160,9 @@ class App(tk.Tk):
 
         self._home = tk.Frame(self.content, bg=WHITE)
         home_body = self._make_scrollable(self._home)
+
+        self._build_goal_card(home_body)
+
         tk.Label(home_body, text="Compile with your current settings",
                  bg=WHITE, fg=INK, font=font(15, "bold")).pack(anchor="w",
                                                                 pady=(S(4), S(2)))
@@ -1420,6 +1423,180 @@ class App(tk.Tk):
                  justify="left").pack(anchor="w", pady=(S(10), 0))
 
     # -- Wizard navigation ----------------------------------------------------
+    # -- Goal-based auto search ---------------------------------------------
+    def _build_goal_card(self, parent):
+        """A 'state your goal, get the best model' card at the top of Home.
+
+        The user types plain-English constraints (task, target chip, latency
+        budget, quality-vs-speed) and we translate them into an architecture
+        sweep that returns the best-fitting model. Only denoising is wired up
+        today; the card is built to grow to other tasks later.
+        """
+        card = tk.Frame(parent, bg=FIELD, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=LINE)
+        card.pack(fill="x", pady=(S(4), S(16)))
+        inner = tk.Frame(card, bg=FIELD)
+        inner.pack(fill="x", padx=S(16), pady=S(14))
+
+        head = tk.Frame(inner, bg=FIELD)
+        head.pack(fill="x")
+        tk.Label(head, text="AUTO", bg=RASPBERRY, fg=WHITE,
+                 font=font(8, "bold"), padx=S(6), pady=S(1)).pack(side="left")
+        tk.Label(head, text="  Describe your goal — get the best model",
+                 bg=FIELD, fg=INK, font=font(14, "bold")).pack(side="left")
+        tk.Label(
+            inner,
+            text=("e.g.  \"need a denoise model under 20 ms on hailo, prioritise "
+                  "quality\"   ·   \"fastest denoiser for the pi 5 cpu\""),
+            bg=FIELD, fg=SUBTLE, font=font(9), wraplength=S(600),
+            justify="left").pack(anchor="w", pady=(S(4), S(8)))
+
+        self.goal_var = tk.StringVar()
+        entry = tk.Entry(inner, textvariable=self.goal_var, font=font(11),
+                         bg=WHITE, fg=INK, relief="flat",
+                         highlightthickness=1, highlightbackground=LINE,
+                         highlightcolor=RASPBERRY, insertbackground=INK)
+        entry.pack(fill="x", ipady=S(7))
+        entry.bind("<KeyRelease>", lambda _e: self._goal_preview())
+        entry.bind("<Return>", lambda _e: self._goal_search())
+
+        self._goal_hint = tk.Label(
+            inner, text="Task supported today: denoising.", bg=FIELD, fg=SUBTLE,
+            font=font(9), wraplength=S(600), justify="left")
+        self._goal_hint.pack(anchor="w", pady=(S(8), 0))
+
+        btnrow = tk.Frame(inner, bg=FIELD)
+        btnrow.pack(fill="x", pady=(S(10), 0))
+        RoundButton(btnrow, "FIND BEST MODEL", self._goal_search, kind="primary",
+                    width=200, height=42).pack(side="right")
+
+    _GOAL_HW = {
+        "hailo": "hailo8", "hailo8": "hailo8", "hailo-8": "hailo8",
+        "deepx": "deepx", "dx-m1": "deepx", "dxm1": "deepx", "dx m1": "deepx",
+        "rpi5_cpu": "rpi5_cpu", "cpu": "rpi5_cpu", "raspberry": "rpi5_cpu",
+        "rpi": "rpi5_cpu", "pi 5": "rpi5_cpu", "pi5": "rpi5_cpu",
+    }
+    _GOAL_HW_NAMES = {"rpi5_cpu": "Raspberry Pi 5 (CPU)",
+                      "hailo8": "Pi 5 + Hailo-8", "deepx": "DeepX DX-M1"}
+
+    def _parse_goal(self, text: str) -> dict:
+        """Translate a free-text goal into sweep constraints (best-effort)."""
+        import re
+        t = (text or "").lower()
+        out: dict = {"task": "denoise", "hardware": None, "max_latency": None,
+                     "prefer": None, "sensor": None, "unsupported": None}
+
+        # Task (only denoise wired up today) --------------------------------
+        for kw in ("detect", "segment", "classif", "super-res", "super res",
+                   "upscal", "pose", "depth estim"):
+            if kw in t:
+                out["unsupported"] = kw
+                break
+
+        # Target chip -------------------------------------------------------
+        for key, hw in self._GOAL_HW.items():
+            if key in t:
+                out["hardware"] = hw
+                break
+
+        # Latency budget: prefer explicit ms, else convert fps -------------
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:ms|millisec)", t)
+        if m:
+            out["max_latency"] = float(m.group(1))
+        else:
+            f = re.search(r"(\d+(?:\.\d+)?)\s*fps", t)
+            if f and float(f.group(1)) > 0:
+                out["max_latency"] = round(1000.0 / float(f.group(1)), 1)
+
+        # Preference (quality vs speed) ------------------------------------
+        if any(k in t for k in ("quality", "accura", "psnr", "sharp",
+                                "best result", "cleanest")):
+            out["prefer"] = "quality"
+        elif any(k in t for k in ("fast", "speed", "low latency", "low-latency",
+                                  "real-time", "realtime", "quick", "lightweight")):
+            out["prefer"] = "speed"
+        else:
+            out["prefer"] = "balanced"
+
+        # Sensor (optional) -------------------------------------------------
+        if "imx219" in t:
+            out["sensor"] = "imx219"
+        elif "imx662" in t or "low light" in t or "lowlight" in t or "dark" in t:
+            out["sensor"] = "imx662"
+        elif "imxng" in t or "next-gen" in t or "next gen" in t:
+            out["sensor"] = "imxng"
+        return out
+
+    def _goal_summary(self, g: dict) -> str:
+        bits = ["Denoising"]
+        if g.get("hardware"):
+            bits.append("on " + self._GOAL_HW_NAMES.get(g["hardware"], g["hardware"]))
+        if g.get("max_latency"):
+            bits.append(f"under {g['max_latency']:.0f} ms")
+        pref = g.get("prefer")
+        if pref and pref != "balanced":
+            bits.append(f"prioritising {pref}")
+        if g.get("sensor"):
+            bits.append(f"sensor {g['sensor']}")
+        return "  ·  ".join(bits)
+
+    def _goal_preview(self):
+        if not hasattr(self, "_goal_hint"):
+            return
+        text = self.goal_var.get().strip()
+        if not text:
+            self._goal_hint.config(text="Task supported today: denoising.",
+                                   fg=SUBTLE)
+            return
+        g = self._parse_goal(text)
+        if g["unsupported"]:
+            self._goal_hint.config(
+                text=(f"'{g['unsupported']}…' isn't supported yet — only denoising "
+                      "for now. I'll search denoisers matching the rest."),
+                fg=AMBER)
+            return
+        self._goal_hint.config(text="Will search:  " + self._goal_summary(g),
+                               fg=GREEN)
+
+    def _goal_search(self):
+        text = self.goal_var.get().strip()
+        if not text:
+            self._goal_hint.config(text="Type a goal first, e.g. \"denoise under "
+                                        "20 ms on hailo\".", fg=AMBER)
+            return
+        g = self._parse_goal(text)
+
+        # Apply parsed constraints to the wizard state so the sweep + summary
+        # reflect them, then switch to sweep mode.
+        if g["hardware"]:
+            try:
+                self.rows["hardware"].set(g["hardware"])
+            except Exception:
+                pass
+        if g["sensor"]:
+            try:
+                self.rows["sensor"].set(g["sensor"])
+                self._on_sensor_change()
+            except Exception:
+                pass
+        self.eval_var.set("sweep")
+        try:
+            self._on_eval_change()
+        except Exception:
+            pass
+
+        cmd = self._build_sweep_command()
+        if g["max_latency"]:
+            cmd += ["--max-latency", str(g["max_latency"])]
+        if g["prefer"]:
+            cmd += ["--prefer", g["prefer"]]
+
+        self._save_gui_state()
+        note = self._goal_summary(g)
+        if g["unsupported"]:
+            note = f"(only denoising supported) {note}"
+        self._run_command(cmd, "Auto-search…", f"Finding the best model:  {note}")
+
     def _show_home(self):
         """Quick-run landing: prominent Run, optional full config wizard."""
         self._wizard_mode = "home"
