@@ -2205,6 +2205,25 @@ class App(tk.Tk):
             self._run_command(self._build_command(), "Compiling…",
                               "Running the 6-level optimization stack")
 
+    def _run_again(self):
+        """Re-run the exact command from the last run (same parameters)."""
+        cmd = getattr(self, "_run_cmd", None)
+        if not cmd:
+            self._back()                # nothing to repeat — go back to the form
+            return
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        sweep = "search.py" in " ".join(str(c) for c in cmd)
+        if sweep:
+            self._run_command(cmd, "Searching…",
+                              "Re-running the same sweep parameters")
+        else:
+            self._run_command(cmd, "Compiling…",
+                              "Re-running with the same parameters")
+
     def _run_command(self, cmd, title="Working…", subtitle=""):
         self._run_cmd = cmd
         pad = S(34)
@@ -2944,7 +2963,7 @@ class App(tk.Tk):
         foot_top.pack(fill="x")
         foot_bot = tk.Frame(footer, bg=WHITE)
         foot_bot.pack(fill="x", pady=(S(6), 0))
-        RoundButton(foot_top, "RUN AGAIN", self._back, kind="secondary",
+        RoundButton(foot_top, "RUN AGAIN", self._run_again, kind="secondary",
                     width=120, height=40).pack(side="left")
         RoundButton(foot_top, "LIVE TEST", self._live_test, kind="primary",
                     width=120, height=40).pack(side="left", padx=(S(6), 0))
@@ -2957,8 +2976,10 @@ class App(tk.Tk):
         else:
             RoundButton(foot_top, "EXPORT", self._export_package, kind="primary",
                         width=110, height=40).pack(side="right", padx=(0, S(6)))
+        RoundButton(foot_bot, "NEW RUN", self._back, kind="secondary",
+                    width=110, height=40).pack(side="left")
         RoundButton(foot_bot, "HISTORY", self._show_history, kind="secondary",
-                    width=100, height=40).pack(side="left")
+                    width=100, height=40).pack(side="left", padx=(S(6), 0))
         RoundButton(foot_bot, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
                     width=130, height=40).pack(side="left", padx=(S(6), 0))
 
