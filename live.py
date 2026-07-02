@@ -565,16 +565,28 @@ def make_args(**overrides):
 # ---------------------------------------------------------------------------
 # Inference + metrics
 # ---------------------------------------------------------------------------
-def denoise_bgr(model, bgr: np.ndarray) -> tuple[np.ndarray, float]:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+def denoise_bgr(model, bgr: np.ndarray, max_side: int = 0) -> tuple[np.ndarray, float]:
+    """Denoise a BGR frame. If ``max_side`` > 0, run inference on a downscaled
+    copy (longest side capped) then upscale the result — the single biggest
+    speedup on the Pi CPU, since compute scales with pixel count."""
+    h0, w0 = bgr.shape[:2]
+    proc = bgr
+    if max_side and max(h0, w0) > max_side:
+        s = max_side / float(max(h0, w0))
+        proc = cv2.resize(bgr, (max(1, int(round(w0 * s))),
+                                max(1, int(round(h0 * s)))),
+                          interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     x = to_tensor(rgb)
-    with torch.no_grad():
+    with torch.inference_mode():
         t0 = time.perf_counter()
         out = model(x)
         dt_ms = (time.perf_counter() - t0) * 1000.0
     out_rgb = to_image(out)
     out_bgr = cv2.cvtColor((np.clip(out_rgb, 0, 1) * 255).astype(np.uint8),
                            cv2.COLOR_RGB2BGR)
+    if out_bgr.shape[0] != h0 or out_bgr.shape[1] != w0:
+        out_bgr = cv2.resize(out_bgr, (w0, h0), interpolation=cv2.INTER_LINEAR)
     return out_bgr, dt_ms
 
 
@@ -638,6 +650,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sensor profile for the simulated stream (default: imx662)")
     p.add_argument("--gain", type=int, default=512,
                    help="analog gain for the simulated stream (default: 512)")
+    p.add_argument("--max-side", dest="max_side", type=int, default=-1,
+                   help="cap inference resolution (longest side, px) for speed; "
+                        "-1 = auto (256 on a Pi, full res elsewhere), 0 = full res")
+    p.add_argument("--fast", action="store_true",
+                   help="low-latency preview: inference at 192px longest side")
+    p.add_argument("--full", action="store_true",
+                   help="full-resolution inference (best quality, slowest)")
     p.add_argument("--seconds", type=float, default=0.0,
                    help="auto-stop after N seconds (0 = run until 'q'/ESC)")
     p.add_argument("--seed", type=int, default=662)
@@ -658,12 +677,32 @@ def main() -> int:
     args = build_parser().parse_args()
     banner("Live Testing  ·  raw vs denoised")
 
+    # Use every CPU core and skip autograd — meaningful speedups on the Pi CPU.
+    try:
+        torch.set_num_threads(max(1, os.cpu_count() or 1))
+    except Exception:  # noqa: BLE001
+        pass
+    torch.set_grad_enabled(False)
+
+    # Resolve the inference resolution cap (biggest lever for live FPS).
+    if args.full:
+        max_side = 0
+    elif args.fast:
+        max_side = 192
+    elif args.max_side >= 0:
+        max_side = args.max_side
+    else:
+        max_side = 256 if _on_raspberry_pi() else 0  # auto: light on the Pi
+
     model, ck = load_model(args)
     model_name = str(ck.get("model", {}).get("family", "model")).upper()
     sensor_key = ck.get("sensor", args.sensor)
     gain = int(ck.get("gain", args.gain))
 
     cam = open_camera(args, sensor_key, gain)
+    log(f"Inference resolution cap: "
+        f"{'full frame' if not max_side else str(max_side) + 'px longest side'}"
+        f"  ·  {torch.get_num_threads()} CPU threads", "step")
 
     win = "NSA Live Testing — RAW  |  DENOISED   (press q or ESC to quit)"
     headless = False
@@ -689,7 +728,7 @@ def main() -> int:
             if raw.shape[2] == 4:
                 raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
 
-            out, dt_ms = denoise_bgr(model, raw)
+            out, dt_ms = denoise_bgr(model, raw, max_side=max_side)
             n_in, n_out = noise_level(raw), noise_level(out)
 
             now = time.perf_counter()
