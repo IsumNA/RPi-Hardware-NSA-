@@ -40,7 +40,9 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
@@ -628,6 +630,96 @@ def compose(raw_bgr, out_bgr, fps, dt_ms, noise_in, noise_out, model_name) -> np
 
 
 # ---------------------------------------------------------------------------
+# Browser (MJPEG) streaming — watch the live view from any device, no app
+# ---------------------------------------------------------------------------
+class _StreamState:
+    """Thread-safe holder for the latest JPEG frame served to browsers."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._jpeg: bytes | None = None
+
+    def update(self, jpeg: bytes) -> None:
+        with self._cond:
+            self._jpeg = jpeg
+            self._cond.notify_all()
+
+    def wait_for(self, last: bytes | None, timeout: float = 5.0):
+        with self._cond:
+            if self._jpeg is last or self._jpeg is None:
+                self._cond.wait(timeout)
+            return self._jpeg
+
+
+def _make_stream_handler(state: _StreamState):
+    page = (
+        b"<!doctype html><html><head><title>NSA Live</title>"
+        b"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        b"</head><body style='margin:0;background:#111;text-align:center'>"
+        b"<img src='/stream' style='max-width:100%;height:auto'></body></html>"
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # silence per-request logging
+            pass
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
+            if self.path != "/stream":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Age", "0")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header(
+                "Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            last = None
+            try:
+                while True:
+                    jpg = state.wait_for(last)
+                    if jpg is None:
+                        continue
+                    last = jpg
+                    self.wfile.write(b"--frame\r\n")
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
+                    self.wfile.write(jpg)
+                    self.wfile.write(b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+    return Handler
+
+
+def _start_stream_server(state: _StreamState, port: int) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("0.0.0.0", port), _make_stream_handler(state))
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
+def _lan_ip() -> str:
+    """Best-effort primary LAN IP for printing the stream URL."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:  # noqa: BLE001
+        return "PI_IP"
+
+
+# ---------------------------------------------------------------------------
 # CLI / main
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -657,6 +749,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="low-latency preview: inference at 192px longest side")
     p.add_argument("--full", action="store_true",
                    help="full-resolution inference (best quality, slowest)")
+    p.add_argument("--stream", action="store_true",
+                   help="serve the live view over HTTP (watch in a browser, no "
+                        "display/VNC needed) — ideal for a headless Pi")
+    p.add_argument("--stream-port", dest="stream_port", type=int, default=8080,
+                   help="port for --stream (default: 8080)")
     p.add_argument("--seconds", type=float, default=0.0,
                    help="auto-stop after N seconds (0 = run until 'q'/ESC)")
     p.add_argument("--seed", type=int, default=662)
@@ -704,15 +801,30 @@ def main() -> int:
         f"{'full frame' if not max_side else str(max_side) + 'px longest side'}"
         f"  ·  {torch.get_num_threads()} CPU threads", "step")
 
-    win = "NSA Live Testing — RAW  |  DENOISED   (press q or ESC to quit)"
-    headless = False
-    try:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    except Exception:  # noqa: BLE001
-        headless = True
-        log("No display available — will save a sample composite instead.", "warn")
+    # Browser streaming: no window, serve frames over HTTP until Ctrl-C/seconds.
+    stream_state = None
+    stream_server = None
+    if args.stream:
+        stream_state = _StreamState()
+        try:
+            stream_server = _start_stream_server(stream_state, args.stream_port)
+        except OSError as exc:
+            raise SystemExit(f"Could not start stream on port {args.stream_port}: {exc}")
+        url = f"http://{_lan_ip()}:{args.stream_port}/"
+        log(f"Live stream ready — open in any browser:  {url}", "ok")
+        log("Press Ctrl-C here (or use --seconds) to stop the stream.", "step")
 
-    log("Streaming… press 'q' or ESC in the window to stop.", "step")
+    win = "NSA Live Testing — RAW  |  DENOISED   (press q or ESC to quit)"
+    headless = bool(args.stream)
+    if not args.stream:
+        try:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        except Exception:  # noqa: BLE001
+            headless = True
+            log("No display available — will save a sample composite instead.", "warn")
+
+    if not args.stream:
+        log("Streaming… press 'q' or ESC in the window to stop.", "step")
     fps = 0.0
     t_prev = time.perf_counter()
     t_start = t_prev
@@ -739,7 +851,12 @@ def main() -> int:
             canvas = compose(raw, out, fps, dt_ms, n_in, n_out, model_name)
             saved = canvas
 
-            if headless:
+            if stream_state is not None:
+                ok, buf = cv2.imencode(".jpg", canvas,
+                                       [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    stream_state.update(buf.tobytes())
+            elif headless:
                 if now - t_start > 2.0:      # grab ~2s worth, then stop
                     break
             else:
@@ -758,6 +875,11 @@ def main() -> int:
         pass
     finally:
         cam.close()
+        if stream_server is not None:
+            try:
+                stream_server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             cv2.destroyAllWindows()
         except Exception:  # noqa: BLE001

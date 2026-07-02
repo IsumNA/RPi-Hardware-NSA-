@@ -30,6 +30,12 @@ def load_pi_live_settings(project_root: Path | None = None) -> dict:
         # Virtualenv on the Pi. "auto" tries .venv/venv/env; or set an explicit
         # path (e.g. ~/RPi-Hardware-NSA-/.venv) if yours lives elsewhere.
         "venv": os.environ.get("RPI_VENV", "auto"),
+        # Browser streaming: serve the live view over HTTP so you can watch it
+        # from your desk (no monitor/VNC on the Pi). Best when the Pi is in a
+        # remote dark room. When true, ``display`` is ignored.
+        "stream": os.environ.get("RPI_LIVE_STREAM", "").lower()
+        in ("1", "true", "yes"),
+        "stream_port": int(os.environ.get("RPI_LIVE_STREAM_PORT", "8080")),
     }
     cfg_path = root / "config.yaml"
     if cfg_path.exists():
@@ -177,21 +183,30 @@ def _venv_activate_snippet(venv: str = "auto") -> str:
 
 
 def remote_live_shell_command(repo: str, source: str = "picamera",
-                              display: str = "auto", venv: str = "auto") -> str:
+                              display: str = "auto", venv: str = "auto",
+                              stream: bool = False, stream_port: int = 8080) -> str:
     """Bash one-liner run on the Pi after SSH.
 
-    Activates the Pi's virtualenv, resolves the desktop's DISPLAY/XAUTHORITY so
-    the RAW|DENOISED window appears on the monitor attached to the Pi, then runs
-    live.py. When ``display`` is empty we stay headless (live.py saves a PNG).
+    Activates the Pi's virtualenv, then runs live.py. In ``stream`` mode it
+    serves the view over HTTP (watch from a browser — no monitor/VNC needed,
+    ideal for a Pi in a remote dark room). Otherwise it resolves the desktop's
+    DISPLAY/XAUTHORITY so the window shows on a monitor attached to the Pi (or
+    saves a preview PNG when ``display`` is empty).
     """
     repo = repo.rstrip("/")
-    disp = "" if not display else _gui_env_snippet(display)
     act = _venv_activate_snippet(venv)
+    if stream:
+        extra = f"--stream --stream-port {int(stream_port)}"
+        disp = ""  # no display needed for streaming
+    else:
+        extra = ""
+        disp = "" if not display else _gui_env_snippet(display)
+    tail = f"--source {source} {extra}".strip()
     return (
         f"cd {repo} && mkdir -p outputs && "
         f"{act}"
         f"{disp}"
-        f"(python3 live.py --source {source} || python live.py --source {source})"
+        f"(python3 live.py {tail} || python live.py {tail})"
     )
 
 
@@ -249,8 +264,23 @@ def launch_pi_terminal(host: str, remote_cmd: str,
         return f"Could not start SSH session to {host}: {exc}"
 
 
+def stream_url(host: str, port: int) -> str:
+    """Browser URL for the Pi's live stream (strip any user@ from the host)."""
+    hostname = host.split("@", 1)[-1]
+    return f"http://{hostname}:{int(port)}/"
+
+
+def pi_live_stream_info(project_root: Path | None = None) -> tuple[bool, str | None]:
+    """(streaming_enabled, url) for the current settings — for GUI messaging."""
+    root = (project_root or Path(__file__).resolve().parents[1]).resolve()
+    s = load_pi_live_settings(root)
+    if not s.get("stream"):
+        return False, None
+    return True, stream_url(str(s["ssh_host"]), int(s.get("stream_port", 8080)))
+
+
 def run_live_on_pi(project_root: Path | None = None) -> str | None:
-    """Sync model, open Pi terminal with live.py. Returns error text or None."""
+    """Sync model, launch live.py on the Pi over SSH. Returns error text or None."""
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     s = load_pi_live_settings(root)
     host = str(s["ssh_host"])
@@ -258,6 +288,8 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     source = str(s["source"])
     display = str(s.get("display", "auto"))
     venv = str(s.get("venv", "auto"))
+    stream = bool(s.get("stream"))
+    stream_port = int(s.get("stream_port", 8080))
 
     ok, detail = ssh_reachable(host)
     if not ok:
@@ -267,7 +299,8 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     if err:
         return err
 
-    remote_cmd = remote_live_shell_command(repo, source, display, venv)
+    remote_cmd = remote_live_shell_command(repo, source, display, venv,
+                                           stream=stream, stream_port=stream_port)
     return launch_pi_terminal(host, remote_cmd, project_root=root)
 
 
@@ -287,22 +320,33 @@ def main(argv: list[str] | None = None) -> int:
             print(ssh_setup_help(host, detail), file=sys.stderr)
             return 1
         print(f"SSH OK: {host}")
+        # Streaming mode needs no local display — a browser shows the view.
+        if s.get("stream"):
+            print(f"Stream OK: browser mode -> "
+                  f"{stream_url(host, int(s.get('stream_port', 8080)))}")
+            print("  (no Pi monitor/VNC needed; open that URL from your desk)")
+            return 0
         disp_ok, disp_detail = remote_display_status(host, display)
         marker = "OK" if disp_ok else "!!"
         print(f"Display {marker}: {disp_detail}")
         if not disp_ok:
-            print("\nThe camera window needs a screen. Options:\n"
+            print("\nThe camera window needs somewhere to show. Options:\n"
+                  "  - Set  pi_live.stream: true  in config.yaml to watch in a\n"
+                  "    browser from your desk (best for a remote/dark-room Pi), or\n"
                   "  - Attach a monitor to the Pi (its desktop must be running), or\n"
-                  "  - Set  pi_live.display: ''  in config.yaml for a headless\n"
-                  "    preview saved to outputs/live_preview.png on the Pi.",
+                  "  - Set  pi_live.display: ''  for a headless preview PNG.",
                   file=sys.stderr)
         return 0 if disp_ok else 2
     err = run_live_on_pi(root)
     if err:
         print(err, file=sys.stderr)
         return 1
-    print(f"Opened Pi live testing (ssh {load_pi_live_settings(root)['ssh_host']}).")
-    print("Press q or ESC in the Pi window to stop.")
+    streaming, url = pi_live_stream_info(root)
+    if streaming:
+        print(f"Started Pi live streaming — open in a browser:  {url}")
+    else:
+        print(f"Opened Pi live testing (ssh {load_pi_live_settings(root)['ssh_host']}).")
+        print("Press q or ESC in the Pi window to stop.")
     return 0
 
 

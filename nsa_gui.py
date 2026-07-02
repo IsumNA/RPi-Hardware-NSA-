@@ -2436,18 +2436,29 @@ class App(tk.Tk):
                 "(a few seconds). Continue?"):
                 return
         try:
-            from nsa.pi_remote import run_live_on_pi, should_use_pi_remote
+            from nsa.pi_remote import (run_live_on_pi, should_use_pi_remote,
+                                       pi_live_stream_info)
             if should_use_pi_remote(ROOT):
                 err = run_live_on_pi(ROOT)
                 if err is None:
-                    messagebox.showinfo(
-                        "Live testing",
-                        "Started live.py on the Pi's CSI camera over SSH.\n\n"
-                        "The RAW | DENOISED window opens on the MONITOR ATTACHED "
-                        "TO THE PI (display :0). Press q or ESC there to stop.\n\n"
-                        "No Pi monitor? Set pi_live.display: \"\" in config.yaml — "
-                        "a preview saves to outputs/live_preview.png on the Pi.\n"
-                        "AI-server SSH log: outputs/pi_live.log")
+                    streaming, url = pi_live_stream_info(ROOT)
+                    if streaming:
+                        messagebox.showinfo(
+                            "Live testing",
+                            "Started live.py on the Pi's CSI camera over SSH.\n\n"
+                            f"Watch it live in your browser:\n    {url}\n\n"
+                            "(Give it a few seconds to warm up. Works from your "
+                            "desk — no monitor or VNC on the Pi needed.)\n"
+                            "AI-server SSH log: outputs/pi_live.log")
+                    else:
+                        messagebox.showinfo(
+                            "Live testing",
+                            "Started live.py on the Pi's CSI camera over SSH.\n\n"
+                            "The RAW | DENOISED window opens on the MONITOR "
+                            "ATTACHED TO THE PI. Press q or ESC there to stop.\n\n"
+                            "Pi in a remote room? Set pi_live.stream: true in "
+                            "config.yaml to watch from your browser instead.\n"
+                            "AI-server SSH log: outputs/pi_live.log")
                     return
                 messagebox.showerror("Pi live testing", err)
                 return
