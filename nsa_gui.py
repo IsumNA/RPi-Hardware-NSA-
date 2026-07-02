@@ -109,6 +109,9 @@ def font(size: float, weight: str = "normal", family: str | None = None):
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "rpi_logo.png"
 PANEL_PATH = ROOT / "outputs" / "validation_panel.png"
+# Remembers the last-used wizard settings across launches (loaded on top of
+# config.yaml defaults; keeps config.yaml's documentation comments intact).
+GUI_STATE_PATH = ROOT / ".nsa_gui_state.json"
 
 # Image-sensor catalogue shown as the primary input. Each card carries a
 # transparent product picture so the operator can see exactly which module
@@ -1154,12 +1157,17 @@ class App(tk.Tk):
         # Initialise dependent UI state, then show the quick-run home screen.
         self._wizard_mode = "home"
         self._apply_denoise_hw_defaults()
+        self._apply_gui_state(self._load_gui_state())   # last-used settings win
         self._step = 0
         self._on_sensor_change()
         self._on_mode_change()
         self._on_source_change()
         self._on_eval_change()
         self._show_home()
+        try:
+            self.protocol("WM_DELETE_WINDOW", self._on_close)
+        except Exception:
+            pass
 
     # -- Individual wizard steps ---------------------------------------------
     def _step_sensor(self, body):
@@ -1393,6 +1401,7 @@ class App(tk.Tk):
         self._refresh_home_summary()
         self._render_wiz_header()
         self._render_nav()
+        self._save_gui_state()          # remember edits when leaving the wizard
         try:
             self.sidebar.reset()
         except Exception:
@@ -1642,6 +1651,115 @@ class App(tk.Tk):
             self._on_sensor_change()
             if hasattr(self, "_home_summary"):
                 self._refresh_home_summary()
+        except Exception:
+            pass
+
+    # -- Remembered settings (persist wizard choices across launches) ----------
+    # Rows whose widgets always exist vs. those created on demand by the
+    # model-family / loss selectors (which must be set after re-rendering).
+    _STATE_SIMPLE_ROWS = ("hardware", "sensor", "gain", "steps", "frames")
+    _STATE_MODEL_ROWS = ("base_channels", "block_depth", "conv_type", "activation")
+    _STATE_LOSS_ENTRIES = ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight")
+    _STATE_OTHER_ENTRIES = ("filter", "noise_std", "batch", "burst",
+                            "naf_enc", "naf_mid", "naf_dec")
+    _STATE_BOOL_VARS = ("sim_noise_var", "quantize_var", "qat_var", "all_sensors_var")
+    _STATE_STR_VARS = ("mode_var", "source_var", "eval_var")
+
+    def _gui_state(self) -> dict:
+        """Snapshot every user-facing wizard choice into a JSON-safe dict."""
+        state: dict = {"rows": {}, "entries": {}, "vars": {}}
+        for key in (self._STATE_SIMPLE_ROWS + self._STATE_MODEL_ROWS
+                    + ("model_family", "loss")):
+            row = self.rows.get(key)
+            if row is not None:
+                state["rows"][key] = row.get()
+        for key in (self._STATE_LOSS_ENTRIES + self._STATE_OTHER_ENTRIES):
+            var = self.entries.get(key)
+            if var is not None:
+                state["entries"][key] = var.get()
+        for name in self._STATE_BOOL_VARS:
+            var = getattr(self, name, None)
+            if var is not None:
+                state["vars"][name] = bool(var.get())
+        for name in self._STATE_STR_VARS:
+            var = getattr(self, name, None)
+            if var is not None:
+                state["vars"][name] = var.get()
+        if getattr(self, "dataset_path", None):
+            state["dataset_path"] = self.dataset_path
+        return state
+
+    def _apply_gui_state(self, state: dict):
+        """Re-apply a saved snapshot, honouring the family/loss render order."""
+        if not state:
+            return
+        try:
+            rows = state.get("rows", {})
+            entries = state.get("entries", {})
+            variables = state.get("vars", {})
+
+            for name in self._STATE_BOOL_VARS:
+                if name in variables and getattr(self, name, None) is not None:
+                    getattr(self, name).set(bool(variables[name]))
+            for name in self._STATE_STR_VARS:
+                if name in variables and getattr(self, name, None) is not None:
+                    getattr(self, name).set(variables[name])
+
+            for key in self._STATE_SIMPLE_ROWS:
+                if key in rows and key in self.rows:
+                    self.rows[key].set(rows[key])
+
+            # Model family drives which rows exist — set it, re-render, then fill.
+            if "model_family" in rows and "model_family" in self.rows:
+                self.rows["model_family"].set(rows["model_family"])
+                self._render_model_options()
+            for key in self._STATE_MODEL_ROWS:
+                if key in rows and key in self.rows:
+                    self.rows[key].set(rows[key])
+
+            # Loss name drives which parameter entries exist — same pattern.
+            if "loss" in rows and "loss" in self.rows:
+                self.rows["loss"].set(rows["loss"])
+                self._render_loss_options()
+
+            for key in (self._STATE_LOSS_ENTRIES + self._STATE_OTHER_ENTRIES):
+                if key in entries and key in self.entries:
+                    self.entries[key].set(entries[key])
+
+            if state.get("dataset_path"):
+                self.dataset_path = state["dataset_path"]
+                if hasattr(self, "dataset_label"):
+                    self.dataset_label.config(text=str(self.dataset_path), fg=SUBTLE)
+
+            # Refresh dependent UI (enabled/disabled fields, hints, summary).
+            self._on_source_change()
+            self._on_mode_change()
+            self._on_sensor_change()
+            self._on_eval_change()
+            if hasattr(self, "_home_summary"):
+                self._refresh_home_summary()
+        except Exception:
+            pass
+
+    def _load_gui_state(self) -> dict | None:
+        try:
+            if GUI_STATE_PATH.is_file():
+                return json.loads(GUI_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return None
+
+    def _save_gui_state(self):
+        try:
+            GUI_STATE_PATH.write_text(
+                json.dumps(self._gui_state(), indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _on_close(self):
+        self._save_gui_state()
+        try:
+            self.destroy()
         except Exception:
             pass
 
@@ -2079,6 +2197,7 @@ class App(tk.Tk):
 
     # -- Run view -------------------------------------------------------------
     def _run(self):
+        self._save_gui_state()          # persist the exact settings being run
         if self.eval_var.get() == "sweep":
             self._run_command(self._build_sweep_command(), "Searching…",
                               "Training & ranking model variants for this target")
@@ -2595,29 +2714,16 @@ class App(tk.Tk):
                 "(a few seconds). Continue?"):
                 return
         try:
-            from nsa.pi_remote import (run_live_on_pi, should_use_pi_remote,
-                                       pi_live_stream_info)
+            from nsa.pi_remote import run_live_on_pi, should_use_pi_remote
             if should_use_pi_remote(ROOT):
                 err = run_live_on_pi(ROOT)
                 if err is None:
-                    streaming, url = pi_live_stream_info(ROOT)
-                    if streaming:
-                        messagebox.showinfo(
-                            "Live testing",
-                            "Started live.py on the Pi's CSI camera over SSH.\n\n"
-                            f"Watch it live in your browser:\n    {url}\n\n"
-                            "(Give it a few seconds to warm up. Works from your "
-                            "desk — no monitor or VNC on the Pi needed.)\n"
-                            "AI-server SSH log: outputs/pi_live.log")
-                    else:
-                        messagebox.showinfo(
-                            "Live testing",
-                            "Started live.py on the Pi's CSI camera over SSH.\n\n"
-                            "The RAW | DENOISED window opens on the MONITOR "
-                            "ATTACHED TO THE PI. Press q or ESC there to stop.\n\n"
-                            "Pi in a remote room? Set pi_live.stream: true in "
-                            "config.yaml to watch from your browser instead.\n"
-                            "AI-server SSH log: outputs/pi_live.log")
+                    messagebox.showinfo(
+                        "Live testing",
+                        "Started live.py on the Pi's CSI camera over SSH.\n\n"
+                        "The RAW | DENOISED window opens on the MONITOR "
+                        "ATTACHED TO THE PI. Press q or ESC there to stop.\n\n"
+                        "AI-server SSH log: outputs/pi_live.log")
                     return
                 messagebox.showerror("Pi live testing", err)
                 return

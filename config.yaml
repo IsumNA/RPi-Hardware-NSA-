@@ -101,6 +101,4 @@ pi_live:
   source: picamera          # picamera | rpicam | opencv | auto
   display: auto             # auto-detect Pi desktop (X11/Wayland). "" = headless PNG.
   venv: auto                # Pi virtualenv: auto (.venv/venv/env) or an explicit path
-  stream: true              # watch live in a browser from your desk (no Pi monitor/VNC)
-  stream_port: 8080         # browser stream port -> http://PI_IP:8080/
   # Verify before launching:  python -m nsa.pi_remote --check
