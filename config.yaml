@@ -82,5 +82,5 @@ pi_live:
   ssh_host: pi@10.3.31.153  # lab Pi (or YOUR_USER@10.x.x.x)
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto
-  display: ":0"             # Pi's own monitor. Use "" for headless preview PNG.
+  display: auto             # auto-detect Pi desktop (X11/Wayland). "" = headless PNG.
   # Verify before launching:  python -m nsa.pi_remote --check

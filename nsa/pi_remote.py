@@ -23,9 +23,10 @@ def load_pi_live_settings(project_root: Path | None = None) -> dict:
         "ssh_host": os.environ.get("RPI_SSH_HOST", "rpi"),
         "repo": os.environ.get("RPI_REPO", "~/RPi-Hardware-NSA-"),
         "source": os.environ.get("RPI_LIVE_SOURCE", "picamera"),
-        # Which display the OpenCV window renders on. ":0" = the Pi's own monitor
-        # (its local desktop session). Empty = headless (save a preview PNG only).
-        "display": os.environ.get("RPI_LIVE_DISPLAY", ":0"),
+        # Which display the OpenCV window renders on. "auto" = detect the Pi's
+        # running desktop (X11/Wayland). ":0" forces that display. Empty =
+        # headless (save a preview PNG only).
+        "display": os.environ.get("RPI_LIVE_DISPLAY", "auto"),
     }
     cfg_path = root / "config.yaml"
     if cfg_path.exists():
@@ -87,52 +88,81 @@ def ssh_setup_help(host: str, detail: str) -> str:
     )
 
 
-def remote_display_status(host: str, display: str = ":0") -> tuple[bool, str]:
-    """Probe whether ``display`` on the Pi can accept an X window.
+def _gui_env_snippet(display: str) -> str:
+    """Bash that exports DISPLAY/XAUTHORITY/WAYLAND_DISPLAY for the Pi's desktop.
+
+    A plain SSH shell has none of these, so a GUI window has nowhere to draw. We
+    resolve them the robust way: copy them straight out of a currently-running
+    desktop process's ``/proc/<pid>/environ`` (works for X11, Wayland and the
+    XWayland server that Pi OS Bookworm's labwc/wayfire session uses — whose X
+    auth cookie is NOT at ~/.Xauthority). Falls back to a forced display and a
+    search of the usual XWayland/lightdm auth-file locations.
+    """
+    forced = "" if display in ("", "auto") else display
+    force_line = f'export DISPLAY="${{DISPLAY:-{forced}}}"; ' if forced else ""
+    return (
+        r'''uid=$(id -u); '''
+        r'''for pid in $(pgrep -u "$uid" 2>/dev/null); do '''
+        r'''if [ -r "/proc/$pid/environ" ] && grep -qza "^DISPLAY=" "/proc/$pid/environ" 2>/dev/null; then '''
+        r'''eval "$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | '''
+        r'''grep -E '^(DISPLAY|XAUTHORITY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR)=' | sed 's/^/export /')"; '''
+        r'''break; fi; done; '''
+        + force_line +
+        r'''if [ -z "$XAUTHORITY" ] || [ ! -f "$XAUTHORITY" ]; then '''
+        r'''for x in "$HOME/.Xauthority" /run/user/$uid/.mutter-Xwaylandauth.* '''
+        r'''/run/user/$uid/xauth_* /var/run/lightdm/root/:0; do '''
+        r'''[ -f "$x" ] && export XAUTHORITY="$x" && break; done; fi; '''
+    )
+
+
+def remote_display_status(host: str, display: str = "auto") -> tuple[bool, str]:
+    """Probe whether the Pi has a reachable desktop for the OpenCV window.
 
     Returns (ok, detail). Used by --check so the user learns *before* launching
-    that the plain-SSH session has no reachable desktop for the OpenCV window.
+    whether the window can appear on the Pi (X11 or Wayland/XWayland).
     """
     if not display:
         return False, "headless (no display configured)"
-    probe = (f"export DISPLAY={display}; "
-             f"export XAUTHORITY=${{XAUTHORITY:-$HOME/.Xauthority}}; "
-             f"if command -v xset >/dev/null 2>&1; then "
-             f"xset q >/dev/null 2>&1 && echo OK || echo NODISP; "
-             f"else echo NOXSET; fi")
+    probe = _gui_env_snippet(display) + (
+        'echo "resolved DISPLAY=${DISPLAY:-none} '
+        'WAYLAND=${WAYLAND_DISPLAY:-none} XAUTH=${XAUTHORITY:-none}"; '
+        'rt="${XDG_RUNTIME_DIR:-/run/user/$uid}"; '
+        'if [ -n "$WAYLAND_DISPLAY" ] && [ -S "$rt/$WAYLAND_DISPLAY" ]; then echo WOK; fi; '
+        'if command -v xset >/dev/null 2>&1; then '
+        'DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" xset q >/dev/null 2>&1 '
+        '&& echo XOK || echo XNO; else echo NOXSET; fi')
     try:
         r = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, probe],
             capture_output=True, text=True, timeout=20, check=False)
         out = (r.stdout or "").strip()
-        if "OK" in out:
-            return True, f"display {display} reachable"
-        if "NOXSET" in out:
-            return True, (f"cannot verify {display} (xset not installed) — "
-                          f"the window will still be attempted")
-        return False, (f"no desktop on {display}. Plug a monitor into the Pi with "
-                       f"its desktop running, or set pi_live.display: '' for a "
-                       f"headless preview PNG.")
+        resolved = ""
+        for line in out.splitlines():
+            if line.startswith("resolved "):
+                resolved = line[len("resolved "):]
+        if "XOK" in out:
+            return True, f"X display reachable  ({resolved})"
+        if "WOK" in out:
+            return True, f"Wayland session reachable via XWayland  ({resolved})"
+        if "NOXSET" in out and "DISPLAY=none" not in out:
+            return True, f"cannot verify (xset missing) — will try anyway  ({resolved})"
+        return False, (f"no reachable desktop  ({resolved or 'nothing found'}). "
+                       f"Ensure the Pi is logged into its desktop, or set "
+                       f"pi_live.display: '' for a headless preview PNG.")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
 
 
 def remote_live_shell_command(repo: str, source: str = "picamera",
-                              display: str = ":0") -> str:
+                              display: str = "auto") -> str:
     """Bash one-liner run on the Pi after SSH.
 
-    A plain SSH session has no ``$DISPLAY``, so the OpenCV preview window has
-    nowhere to draw. Exporting ``DISPLAY`` (the Pi's own desktop, usually ``:0``)
-    makes the RAW|DENOISED window appear on the monitor attached to the Pi. When
-    ``display`` is empty we stay headless and live.py saves a preview PNG.
+    Resolves the desktop's DISPLAY/XAUTHORITY so the RAW|DENOISED window appears
+    on the monitor attached to the Pi. When ``display`` is empty we stay headless
+    and live.py saves a preview PNG instead.
     """
     repo = repo.rstrip("/")
-    disp = ""
-    if display:
-        # Point at the Pi's local X session; XAUTHORITY lets us attach to a
-        # desktop started by the same login user without needing `xhost`.
-        disp = (f"export DISPLAY={display}; "
-                f"export XAUTHORITY=${{XAUTHORITY:-$HOME/.Xauthority}}; ")
+    disp = "" if not display else _gui_env_snippet(display)
     return (
         f"cd {repo} && mkdir -p outputs && "
         f"if [ -d .venv/bin ]; then . .venv/bin/activate; fi && "
@@ -202,7 +232,7 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     host = str(s["ssh_host"])
     repo = str(s["repo"])
     source = str(s["source"])
-    display = str(s.get("display", ":0"))
+    display = str(s.get("display", "auto"))
 
     ok, detail = ssh_reachable(host)
     if not ok:
@@ -226,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("--check", "-c"):
         s = load_pi_live_settings(root)
         host = str(s["ssh_host"])
-        display = str(s.get("display", ":0"))
+        display = str(s.get("display", "auto"))
         ok, detail = ssh_reachable(host)
         if not ok:
             print(ssh_setup_help(host, detail), file=sys.stderr)
