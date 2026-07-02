@@ -236,12 +236,18 @@ def _write_lock(entries: list[dict], lock_path: Path = LOCK_PATH) -> None:
 def _download_snapshot(model_id: str, sha: str, storage_dir: Path) -> str:
     try:
         from huggingface_hub import snapshot_download
-    except Exception as exc:  # noqa: BLE001
-        raise HubError("downloading a pinned snapshot needs the optional "
-                       "'huggingface_hub' package (pip install huggingface_hub).") from exc
+    except ModuleNotFoundError as exc:
+        raise HubError("downloading a pinned snapshot needs the 'huggingface_hub' "
+                       "package. Install it with:  pip install huggingface_hub") from exc
+    except ImportError as exc:  # installed but broken/incompatible
+        raise HubError("could not import 'huggingface_hub' "
+                       f"({exc}). Try:  pip install -U huggingface_hub") from exc
     dest = Path(storage_dir) / model_id.replace("/", "__")
     dest.mkdir(parents=True, exist_ok=True)
-    path = snapshot_download(repo_id=model_id, revision=sha, local_dir=str(dest))
+    try:
+        path = snapshot_download(repo_id=model_id, revision=sha, local_dir=str(dest))
+    except Exception as exc:  # noqa: BLE001  (network / auth / revision failures)
+        raise HubError(f"downloading '{model_id}@{sha[:8]}' failed: {exc}") from exc
     return str(path)
 
 

@@ -27,10 +27,11 @@ onnx>=1.15
 # Without it the sweep falls back to an exhaustive grid search.
 # optuna>=3.6
 
-# Optional: enables downloading a pinned snapshot when freezing a Hugging Face
-# model (hf_search.py --download / the GUI FREEZE button). Searching, license
-# filtering and freezing the commit hash work without it (stdlib HTTP only).
-# huggingface_hub>=0.23
+# Downloading a pinned snapshot when freezing a Hugging Face model
+# (hf_search.py --download / the GUI DOWNLOAD & USE button). Searching, license
+# filtering and freezing the commit hash work without it (stdlib HTTP only), but
+# actually pulling the weights needs this package.
+huggingface_hub>=0.23
 
 # Raspberry Pi CSI camera (Python stack)
 #
