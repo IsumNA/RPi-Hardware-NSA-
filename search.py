@@ -55,7 +55,7 @@ from nsa.inference import (
 from nsa.models import build_model, count_params
 from nsa.raw_io import build_frame, build_frame_from_source, list_frames
 from nsa.report import compute_fitness, print_report
-from nsa.sensors import SENSOR_KEYS, get_sensor
+from nsa.sensors import SENSOR_KEYS, get_sensor, with_noise_std
 from nsa.theme import RPI_GREEN, RPI_RASPBERRY, banner, console as nsa_console, log
 from nsa.visualize import render_panel
 
@@ -378,6 +378,8 @@ def build_parser() -> argparse.ArgumentParser:
                    default="imx219", help="sensor noise profile (default: imx219)")
     p.add_argument("--gain", type=int, choices=[256, 512], default=256,
                    help="analog gain of the test frame (default: 256)")
+    p.add_argument("--noise-std", dest="noise_std", type=float, default=None,
+                   help="override injected Gaussian read-noise std (electrons RMS, denoise-hw style)")
     p.add_argument("--real", dest="real_capture", action="store_true",
                    help="use real captures from --dataset as the noisy input")
     p.add_argument("--simulated", dest="simulated", action="store_true",
@@ -495,7 +497,7 @@ def main() -> int:
     def load_frames(sensor_key: str):
         if sensor_key in _frames_cache:
             return _frames_cache[sensor_key]
-        sensor = get_sensor(sensor_key)
+        sensor = with_noise_std(get_sensor(sensor_key), getattr(args, "noise_std", None))
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         frames = []

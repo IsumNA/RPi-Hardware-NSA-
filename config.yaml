@@ -51,6 +51,11 @@ sensor:
   simulate_noise: false
   filter: [imx219, ag12]    # denoise-hw test scene filter (cabinet_D50_100/imx219_ag12_test)
   gain: 256                 # analog gain multiplier (256 = moderate; 512 = stress test)
+  # Override the standard deviation of the injected Gaussian read noise, in
+  # electrons RMS (the denoise-hw noise-floor knob). null keeps the sensor's
+  # datasheet default; larger => noisier frames (e.g. imx219≈4, imx662≈2, try 8
+  # for a stress test). Only affects simulated / simulate_noise injection.
+  noise_std: null
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
 data:

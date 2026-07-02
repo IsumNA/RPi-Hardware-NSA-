@@ -1221,6 +1221,10 @@ class App(tk.Tk):
         self._check(body, "Simulate sensor noise on loaded frames",
                     "Inject the selected sensor's physics on top of the real frames.",
                     self.sim_noise_var)
+        self.noise_std_var = self._entry_row(
+            body, "noise_std", "Noise Std (read-noise e-)",
+            "Injected Gaussian noise std, denoise-hw style. Blank = sensor default; "
+            "higher = noisier (e.g. 8 to stress-test)", "")
 
         self._section(body, "LEVEL 2 · GROUND TRUTH / DATA")
         self._add_rows(body, [
@@ -1592,6 +1596,9 @@ class App(tk.Tk):
                 self.dataset_path = cfg.sensor.dataset_path
             if cfg.sensor.filter and hasattr(self, "filter_var"):
                 self.filter_var.set(" ".join(cfg.sensor.filter))
+            if hasattr(self, "noise_std_var"):
+                self.noise_std_var.set(
+                    "" if cfg.sensor.noise_std is None else str(cfg.sensor.noise_std))
             if cfg.sensor.sensor and "sensor" in self.rows:
                 self.rows["sensor"].set(cfg.sensor.sensor)
             if hasattr(self, "dataset_label"):
@@ -2083,6 +2090,8 @@ class App(tk.Tk):
         else:
             cmd += ["--simulated"]
 
+        self._append_noise_std_cli_args(cmd)
+
         if self.input_raw:
             cmd += ["--input-raw", self.input_raw]
         if self.hf_model_id:
@@ -2123,7 +2132,21 @@ class App(tk.Tk):
                 cmd += ["--filter", *tokens]
         else:
             cmd += ["--simulated"]
+        self._append_noise_std_cli_args(cmd)
         return cmd
+
+    def _append_noise_std_cli_args(self, cmd):
+        """Append --noise-std when the user typed a valid read-noise override."""
+        var = getattr(self, "noise_std_var", None)
+        if var is None:
+            return
+        raw = (var.get() or "").strip()
+        if not raw:
+            return
+        try:
+            cmd += ["--noise-std", str(float(raw))]
+        except ValueError:
+            pass
 
     def _build_cache(self):
         dataset = self.dataset_path or self._materialise_uploads()
