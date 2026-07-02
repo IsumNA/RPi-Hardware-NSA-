@@ -8,7 +8,6 @@ When you compile on the AI server and click LIVE TEST in the GUI, this syncs
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -173,43 +172,17 @@ def sync_model_to_pi(project_root: Path, host: str, repo: str) -> str | None:
     return None
 
 
-def _local_display_available() -> bool:
-    """True if THIS machine (the AI server) has its own desktop session.
-
-    A headless AI server has no ``$DISPLAY``/``$WAYLAND_DISPLAY``; trying to
-    open gnome-terminal there hangs on a D-Bus ``org.gnome.Terminal`` timeout.
-    """
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
 def launch_pi_terminal(host: str, remote_cmd: str,
                        project_root: Path | None = None) -> str | None:
-    """Start the remote live session.
+    """Start the remote live session as a detached background SSH process.
 
     The camera window renders on the *Pi's* screen (via DISPLAY in remote_cmd),
-    so the AI server does not need a visible terminal. Only pop open a local
-    terminal emulator when the AI server actually has its own desktop; otherwise
-    run SSH detached and tee its output to ``outputs/pi_live.log`` — this avoids
-    the gnome-terminal D-Bus timeout on headless servers.
+    so the AI server never needs a local terminal window. We deliberately do NOT
+    spawn gnome-terminal/konsole/etc — on a headless server those hang on a
+    D-Bus ``org.gnome.Terminal`` timeout. SSH runs in the background and its
+    output (live.py logs) is teed to ``outputs/pi_live.log``.
     """
     ssh_args = ["ssh", "-tt", host, remote_cmd]
-
-    if _local_display_available():
-        for spec in (
-            ["gnome-terminal", "--", *ssh_args],
-            ["konsole", "-e", *ssh_args],
-            ["xfce4-terminal", "-e", " ".join(ssh_args)],
-            ["xterm", "-e", *ssh_args],
-        ):
-            exe = shutil.which(spec[0])
-            if exe:
-                try:
-                    subprocess.Popen([exe, *spec[1:]])
-                    return None
-                except OSError:
-                    continue
-
-    # Headless AI server (or no terminal emulator): run SSH in the background.
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     log_path = root / "outputs" / "pi_live.log"
     try:
