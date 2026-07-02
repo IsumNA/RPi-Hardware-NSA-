@@ -346,7 +346,9 @@ class ConfigRow(tk.Frame):
         self.columnconfigure(0, weight=1)
         left = tk.Frame(self, bg=WHITE)
         left.grid(row=0, column=0, sticky="w")
-        tk.Label(left, text=title, bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
+        self._title_lbl = tk.Label(left, text=title, bg=WHITE, fg=INK,
+                                   font=font(11, "bold"))
+        self._title_lbl.pack(anchor="w")
         tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
 
         self.var = tk.StringVar(value=str(default))
@@ -365,6 +367,13 @@ class ConfigRow(tk.Frame):
 
     def set(self, value):
         self.var.set(str(value))
+
+    def set_enabled(self, on: bool):
+        try:
+            self.combo.config(state="readonly" if on else "disabled")
+            self._title_lbl.config(fg=INK if on else "#B6B6B6")
+        except tk.TclError:
+            pass
 
 
 class SensorSelector(tk.Frame):
@@ -1028,14 +1037,27 @@ class App(tk.Tk):
         row.pack(fill="x", pady=S(6))
         row.columnconfigure(0, weight=1)
         left = tk.Frame(row, bg=WHITE); left.grid(row=0, column=0, sticky="w")
-        tk.Label(left, text=title, bg=WHITE, fg=INK, font=font(11, "bold")).pack(anchor="w")
+        title_lbl = tk.Label(left, text=title, bg=WHITE, fg=INK, font=font(11, "bold"))
+        title_lbl.pack(anchor="w")
         tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
         var = tk.StringVar(value=str(default))
         ent = ttk.Entry(row, textvariable=var, width=18, font=font(10))
         ent.grid(row=0, column=1, sticky="e", padx=(S(8), 0))
         tk.Frame(parent, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
         self.entries[key] = var
+        self.entry_widgets[key] = (ent, title_lbl)
         return var
+
+    def _set_entry_enabled(self, key: str, on: bool):
+        pair = getattr(self, "entry_widgets", {}).get(key)
+        if not pair:
+            return
+        ent, lbl = pair
+        try:
+            ent.config(state="normal" if on else "disabled")
+            lbl.config(fg=INK if on else "#B6B6B6")
+        except tk.TclError:
+            pass
 
     # -- Form view (step-by-step wizard) -------------------------------------
     def _add_rows(self, parent, specs):
@@ -1056,6 +1078,7 @@ class App(tk.Tk):
         # Persistent state (kept alive across steps; steps only show/hide).
         self.rows = {}
         self.entries = {}
+        self.entry_widgets = {}
         self.mode_var = tk.StringVar(value="single")
         self.source_var = tk.StringVar(value="real")
         self.sim_noise_var = tk.BooleanVar(value=False)
@@ -1203,9 +1226,10 @@ class App(tk.Tk):
         self.filter_var = self._entry_row(
             body, "filter", "Dataset Filter",
             "Keyword filter for folders (e.g. imx219 ag12)", "imx219 ag12")
-        self._check(body, "Simulate sensor noise on loaded frames",
-                    "Inject the selected sensor's physics on top of the real frames.",
-                    self.sim_noise_var)
+        self.sim_noise_cb = self._check(
+            body, "Simulate sensor noise on loaded frames",
+            "Inject the selected sensor's physics on top of the real frames.",
+            self.sim_noise_var, command=self._on_source_change)
         self.noise_std_var = self._entry_row(
             body, "noise_std", "Noise Std (read-noise e-)",
             "Injected Gaussian noise std, denoise-hw style. Blank = sensor default; "
@@ -1642,11 +1666,29 @@ class App(tk.Tk):
                 getattr(self, attr).set_enabled(real)
         if hasattr(self, "dataset_label"):
             self.dataset_label.config(fg=(SUBTLE if real else "#C4C4C4"))
+        # Only real captures can be filtered or have their own noise; in simulated
+        # mode the scene + noise are always synthesised, so those knobs are moot.
+        self._set_entry_enabled("filter", real)
+        if hasattr(self, "sim_noise_cb"):
+            try:
+                self.sim_noise_cb.config(state="normal" if real else "disabled")
+            except tk.TclError:
+                pass
+        # Noise Std only bites when noise is actually injected: simulated capture,
+        # or real capture with "simulate sensor noise" enabled.
+        noise_simulated = (not real) or bool(self.sim_noise_var.get())
+        self._set_entry_enabled("noise_std", noise_simulated)
+        # Temporal Frames only builds a synthetic ground-truth average; with real
+        # paired gt (real + no simulated noise) it is ignored.
+        if "frames" in self.rows and hasattr(self.rows["frames"], "set_enabled"):
+            self.rows["frames"].set_enabled(noise_simulated)
         self._refresh_dataset_hint()
 
     def _on_mode_change(self):
-        # Batch size only matters in batch mode (kept editable, just a hint).
-        pass
+        # Batch size only applies to batch mode; burst only to temporal mode.
+        mode = self.mode_var.get()
+        self._set_entry_enabled("batch", mode == "batch")
+        self._set_entry_enabled("burst", mode == "temporal")
 
     def _on_sensor_change(self):
         key = self.rows["sensor"].get() if "sensor" in self.rows else "imx662"

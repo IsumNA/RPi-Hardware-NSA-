@@ -140,6 +140,15 @@ def main() -> int:
         if filter_tokens:
             log(f"Dataset filter: {' '.join(filter_tokens)}  "
                 f"({len(sources)} matching frame(s))", "step")
+        # If the filter matched nothing, don't jump straight to a synthetic scene:
+        # try again unfiltered so real captures are still used. In simulate-noise
+        # mode any real image is a valid clean source; in plain real mode any real
+        # frame is still a genuine capture (better than fabricated pixels).
+        if not sources and filter_tokens:
+            sources = list_frames(real_source, None, limit=n_want)
+            if sources:
+                log(f"No frames matched {' '.join(filter_tokens)!r}; using "
+                    f"{len(sources)} unfiltered real frame(s) instead", "warn")
         for i, s in enumerate(sources):
             try:
                 frames.append(build_frame_from_source(
