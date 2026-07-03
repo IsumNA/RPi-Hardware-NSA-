@@ -121,13 +121,19 @@ def _load_logo_photo(size: int | None = None):
     if Image is not None and ImageTk is not None:
         try:
             im = Image.open(LOGO_PATH).convert("RGBA")
-            if size is not None:
-                im = im.resize((px, px), Image.LANCZOS)
+            im = im.resize((px, px), Image.LANCZOS)
             return ImageTk.PhotoImage(im)
         except Exception:  # noqa: BLE001
             pass
+    # Tk's PNG loader can't resize; subsample by an integer factor so the
+    # native 512px asset doesn't render huge when Pillow is unavailable.
     try:
-        return tk.PhotoImage(file=str(LOGO_PATH))
+        photo = tk.PhotoImage(file=str(LOGO_PATH))
+        native = max(photo.width(), photo.height())
+        factor = max(1, round(native / px))
+        if factor > 1:
+            photo = photo.subsample(factor, factor)
+        return photo
     except Exception:  # noqa: BLE001
         return None
 
