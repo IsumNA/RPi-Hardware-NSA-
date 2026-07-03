@@ -36,8 +36,8 @@ from nsa.export import export_onnx, write_device_artifact
 from nsa.hf_runner import (calibration_steps_for_hf, copy_hf_onnx,
                            is_hf_pretrained, load_hf_model)
 from nsa.inference import (build_loss, calibrate, calibrate_multi,
-                           estimate_device_latency_ms, fake_quantize_int8, psnr,
-                           run, temporal_denoise)
+                           estimate_device_latency_ms, fake_quantize_int8, lpips,
+                           psnr, run, ssim, temporal_denoise)
 from nsa.models import build_model, count_params
 from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
                         list_frames)
@@ -440,11 +440,26 @@ def main() -> int:
     # ===========================================================================
     # OUTPUT 4 - PARETO FITNESS REPORT
     # ===========================================================================
+    # Perceptual metrics on the representative frame: SSIM (structure) and LPIPS
+    # (learned perceptual distance) catch the over-smoothing PSNR misses.
+    final_ssim = ssim(final_out, frame.clean_rgb)
+    ssim_in = ssim(frame_noisy_for_panel, frame.clean_rgb)
+    try:
+        final_lpips = lpips(final_out, frame.clean_rgb)
+        lpips_in = lpips(frame_noisy_for_panel, frame.clean_rgb)
+    except Exception as exc:  # noqa: BLE001
+        final_lpips = lpips_in = None
+        log(f"LPIPS unavailable ({exc}) — install 'lpips' for perceptual scoring",
+            "warn")
+    _lp = f"  ·  LPIPS {lpips_in:.3f} -> {final_lpips:.3f}" if final_lpips is not None else ""
+    log(f"Perceptual quality: SSIM {ssim_in:.3f} -> {final_ssim:.3f}{_lp}", "ok")
+
     fit = compute_fitness(final_psnr, latency_ms, quant_drop,
                           weight_kb=info["total_bytes"] / 1024.0,
                           act_kb=result.est_sram_kb,
                           sram_budget_kb=result.sram_budget_kb,
-                          psnr_in=psnr_in)
+                          psnr_in=psnr_in,
+                          ssim=final_ssim, lpips=final_lpips)
     profile = (f"{cfg.model.model_family.upper()} · {cfg.model.base_channels}ch × "
                f"{cfg.model.block_depth} · {cfg.model.conv_type} · "
                f"{cfg.model.activation} · {meta['precision']}")
@@ -506,6 +521,13 @@ def main() -> int:
         "psnr_in": round(psnr_in, 2),
         "psnr_out": round(final_psnr, 2),
         "psnr_gain": round(final_psnr - psnr_in, 2),
+        "ssim_in": round(ssim_in, 4),
+        "ssim_out": round(final_ssim, 4),
+        "ssim_gain": round(final_ssim - ssim_in, 4),
+        "lpips_in": round(lpips_in, 4) if lpips_in is not None else None,
+        "lpips_out": round(final_lpips, 4) if final_lpips is not None else None,
+        "lpips_gain": (round(lpips_in - final_lpips, 4)
+                       if lpips_in is not None and final_lpips is not None else None),
         "quant_drop_db": round(quant_drop, 3),
         "latency_ms": round(latency_ms, 1),
         "fps": round(1000.0 / latency_ms, 1),

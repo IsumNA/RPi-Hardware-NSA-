@@ -46,6 +46,71 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
     return 10.0 * np.log10(1.0 / mse)
 
 
+def _metric_nchw(img: np.ndarray) -> torch.Tensor:
+    """HxWxC (or HxW) image in [0,1] -> 1xCx H xW float tensor for metrics."""
+    arr = np.ascontiguousarray(img).astype(np.float32)
+    if arr.max() > 1.5:                       # tolerate 0-255 inputs
+        arr = arr / 255.0
+    t = torch.from_numpy(arr)
+    if t.dim() == 2:
+        t = t.unsqueeze(-1)
+    t = t.permute(2, 0, 1).unsqueeze(0)       # -> 1,C,H,W
+    return t.clamp(0.0, 1.0)
+
+
+def ssim(a: np.ndarray, b: np.ndarray) -> float:
+    """Structural Similarity Index (0-1, higher is better).
+
+    Unlike PSNR, SSIM compares local luminance/contrast/structure, so it
+    penalises blur and lost texture that a pixel-wise metric would ignore.
+    """
+    ta, tb = _metric_nchw(a), _metric_nchw(b)
+    with torch.no_grad():
+        return float(_ssim_index(ta, tb).clamp(-1.0, 1.0).item())
+
+
+_LPIPS_NET = None
+
+
+def _get_lpips_net():
+    """Lazily build and cache the LPIPS (AlexNet) perceptual network."""
+    global _LPIPS_NET
+    if _LPIPS_NET is None:
+        import lpips as _lpips_mod          # required dependency
+        net = _lpips_mod.LPIPS(net="alex", verbose=False)
+        net.eval()
+        for p in net.parameters():
+            p.requires_grad_(False)
+        _LPIPS_NET = net
+    return _LPIPS_NET
+
+
+def lpips(a: np.ndarray, b: np.ndarray) -> float:
+    """Learned Perceptual Image Patch Similarity (lower is better).
+
+    Compares deep CNN feature activations rather than pixels, so it tracks how
+    different two images look to a human and strongly penalises the kind of
+    over-smoothing/blur that PSNR happily rewards. Returns a perceptual distance
+    (0 = identical); typical denoising values land in ~0.0-0.5.
+    """
+    net = _get_lpips_net()
+    ta, tb = _metric_nchw(a), _metric_nchw(b)
+    if ta.shape[1] == 1:                       # LPIPS expects 3 channels
+        ta = ta.repeat(1, 3, 1, 1)
+    if tb.shape[1] == 1:
+        tb = tb.repeat(1, 3, 1, 1)
+    ta, tb = ta * 2.0 - 1.0, tb * 2.0 - 1.0    # LPIPS wants [-1, 1]
+    with torch.no_grad():
+        return float(net(ta, tb).item())
+
+
+def quality_metrics(pred: np.ndarray, target: np.ndarray) -> dict:
+    """Convenience bundle: PSNR (dB), SSIM (0-1) and LPIPS (distance)."""
+    return {"psnr": psnr(pred, target),
+            "ssim": ssim(pred, target),
+            "lpips": lpips(pred, target)}
+
+
 # ---------------------------------------------------------------------------
 # Quantization-Aware Training (true fake-quant-in-the-loop, STE gradients)
 # ---------------------------------------------------------------------------

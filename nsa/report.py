@@ -33,6 +33,15 @@ _W_LATENCY = 0.30
 _W_ROBUST = 0.18
 _W_MEMORY = 0.04
 
+# Perceptual quality blend: how the PSNR band, SSIM (structure) and LPIPS
+# (learned perceptual distance) combine into the quality term. PSNR alone
+# rewards over-smoothing, so SSIM/LPIPS get meaningful weight to penalise blur.
+_WP_PSNR = 0.40
+_WS_SSIM = 0.30
+_WL_LPIPS = 0.30
+# LPIPS distance mapped to a 0-1 score: 0 dist -> 1.0, >= this value -> 0.0.
+_LPIPS_REF = 0.5
+
 
 @dataclass
 class Fitness:
@@ -50,6 +59,10 @@ class Fitness:
     total_kb: float = 0.0      # weight + activation
     mem_score: float = 1.0     # 1 = lean, 0 = heavy (the tie-breaker)
     sram_budget_kb: float = 0.0
+    ssim: float | None = None          # structural similarity (0-1, higher better)
+    lpips: float | None = None         # perceptual distance (lower better)
+    ssim_score: float | None = None    # normalised SSIM contribution (0-1)
+    lpips_score: float | None = None   # normalised LPIPS contribution (0-1)
 
 
 def _clamp01(x: float) -> float:
@@ -79,7 +92,9 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
                     weight_kb: float | None = None, act_kb: float | None = None,
                     sram_budget_kb: float | None = None,
                     target_fps: float = 30.0,
-                    psnr_in: float | None = None) -> Fitness:
+                    psnr_in: float | None = None,
+                    ssim: float | None = None,
+                    lpips: float | None = None) -> Fitness:
     fps = 1000.0 / max(latency_ms, 1e-6)
 
     # Quality: reward measurable denoising (gain over the noisy input), not speed alone.
@@ -98,6 +113,20 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
     else:
         # Legacy path when input PSNR is unknown (absolute band only).
         quality = _clamp01((psnr - 14.0) / 12.0)
+
+    # Perceptual blend: fold SSIM (structure) and LPIPS (learned perceptual
+    # distance) into the quality term so blurry-but-smooth models can't win on
+    # PSNR alone. Falls back to the PSNR-only term when metrics are missing.
+    psnr_quality = quality
+    ssim_score = lpips_score = None
+    if ssim is not None or lpips is not None:
+        ssim_score = _clamp01(ssim) if ssim is not None else psnr_quality
+        lpips_score = (_clamp01(1.0 - (max(lpips, 0.0) / _LPIPS_REF))
+                       if lpips is not None else psnr_quality)
+        quality = (_WP_PSNR * psnr_quality + _WS_SSIM * ssim_score
+                   + _WL_LPIPS * lpips_score)
+        if gain is not None and gain > 0:
+            quality = max(quality, 0.12)
 
     # Latency: at/above target fps -> full marks, degrades below.
     latency_s = _clamp01(fps / target_fps)
@@ -131,7 +160,9 @@ def compute_fitness(psnr: float, latency_ms: float, quant_drop_db: float,
     return Fitness(psnr, latency_ms, fps, quant_drop_db, score,
                    grade, quality, latency_s, robust,
                    weight_kb=wk, act_kb=ak, total_kb=total, mem_score=mem,
-                   sram_budget_kb=(sram_budget_kb or 0.0))
+                   sram_budget_kb=(sram_budget_kb or 0.0),
+                   ssim=ssim, lpips=lpips,
+                   ssim_score=ssim_score, lpips_score=lpips_score)
 
 
 def _bar(frac: float, width: int = 22) -> Text:
@@ -154,6 +185,12 @@ def print_report(fit: Fitness, hardware_name: str, profile: str) -> None:
     table.add_row("", "")
     table.add_row("Image Quality (PSNR)",
                   Text(f"{fit.psnr:.1f} dB", style="bold white"))
+    if fit.ssim is not None:
+        table.add_row("Structural Similarity (SSIM)",
+                      Text(f"{fit.ssim:.3f}  (1.0 = perfect)", style="bold white"))
+    if fit.lpips is not None:
+        table.add_row("Perceptual Distance (LPIPS)",
+                      Text(f"{fit.lpips:.3f}  (lower = better)", style="bold white"))
     table.add_row("Target Latency / Frame Rate",
                   Text(f"{fit.latency_ms:.1f} ms  ({fit.fps:.0f} FPS)", style="bold white"))
     table.add_row("Quantization Accuracy Drop",

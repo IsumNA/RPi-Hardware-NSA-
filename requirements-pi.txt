@@ -27,3 +27,8 @@
 # After install:  python pi_camera_check.py
 
 opencv-python>=4.8
+
+# onnxruntime — lets live testing run the exported ONNX graph (the deployed
+# graph) via `python live.py --engine onnx`, instead of the FP32 PyTorch model.
+# CPU wheel; matches deployed behaviour more closely on the Pi.
+onnxruntime>=1.17

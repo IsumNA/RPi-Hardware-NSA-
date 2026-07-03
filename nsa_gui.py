@@ -3260,6 +3260,30 @@ class App(tk.Tk):
                               else "—",
                               sub="FP32 → INT8")
 
+            # -- Perceptual metrics (SSIM / LPIPS) --------------------------
+            if s.get("ssim_out") is not None or s.get("lpips_out") is not None:
+                rowp = tk.Frame(body, bg=WHITE); rowp.pack(fill="x", pady=(0, S(10)))
+                ssim_out = s.get("ssim_out")
+                ssim_gain = s.get("ssim_gain")
+                self._metric_card(
+                    rowp, "Structure (SSIM)",
+                    f"{ssim_out:.3f}" if isinstance(ssim_out, (int, float)) else "—",
+                    accent=GREEN,
+                    sub=(f"+{ssim_gain:.3f} vs input" if isinstance(ssim_gain, (int, float))
+                         else "1.0 = perfect structure"))
+                lpips_out = s.get("lpips_out")
+                lpips_gain = s.get("lpips_gain")
+                self._metric_card(
+                    rowp, "Perceptual (LPIPS)",
+                    f"{lpips_out:.3f}" if isinstance(lpips_out, (int, float)) else "—",
+                    accent=GREEN,
+                    sub=(f"-{lpips_gain:.3f} vs input" if isinstance(lpips_gain, (int, float))
+                         else "lower = looks better"))
+                self._metric_card(
+                    rowp, "Why it matters",
+                    "anti-blur",
+                    sub="LPIPS/SSIM penalise over-smoothing PSNR misses")
+
             row2 = tk.Frame(body, bg=WHITE); row2.pack(fill="x", pady=(0, S(14)))
             self._metric_card(row2, "Weight memory",
                               f"{s.get('weight_kb','—')} KB", sub="storage / flash")
@@ -3461,7 +3485,12 @@ class App(tk.Tk):
             tk.Label(body, text=f"{winner.get('family','').upper()}  "
                      f"{winner.get('base_channels')}ch × depth {winner.get('block_depth')}",
                      bg=WHITE, fg=GREEN, font=font(13, "bold")).pack(anchor="w")
-            tk.Label(body, text=f"PSNR {winner.get('psnr')} dB   ·   "
+            _wperc = ""
+            if winner.get("ssim") is not None:
+                _wperc += f"SSIM {winner.get('ssim')}   ·   "
+            if winner.get("lpips") is not None:
+                _wperc += f"LPIPS {winner.get('lpips')}   ·   "
+            tk.Label(body, text=f"PSNR {winner.get('psnr')} dB   ·   " + _wperc +
                      f"{winner.get('latency_ms')} ms   ·   "
                      f"fitness {winner.get('fitness')} / 100 ({winner.get('grade')})",
                      bg=WHITE, fg=INK, font=font(10)).pack(anchor="w", pady=(S(2), 0))
@@ -3693,6 +3722,12 @@ class App(tk.Tk):
             metrics.append(("Sensor", r.get("sensor"), RASPBERRY))
         metrics += [
             ("Sweep PSNR", f"{r.get('psnr','—')} dB", INK),
+        ]
+        if r.get("ssim") is not None:
+            metrics.append(("Sweep SSIM", f"{r.get('ssim')}", INK))
+        if r.get("lpips") is not None:
+            metrics.append(("Sweep LPIPS", f"{r.get('lpips')}", INK))
+        metrics += [
             ("Sweep latency", f"{r.get('latency_ms','—')} ms", INK),
             ("Parameters", f"{r.get('params',0):,}", INK),
             ("Sweep fitness", f"{r.get('fitness','—')} / 100  ({g})", gcol),
@@ -3954,6 +3989,10 @@ class App(tk.Tk):
                 bits.append(f"PSNR {rec['psnr_in']:.1f} -> {rec['psnr_out']:.1f} dB")
             else:
                 bits.append(f"PSNR {rec['psnr_out']:.1f} dB")
+        if rec.get("ssim_out") is not None:
+            bits.append(f"SSIM {rec['ssim_out']:.3f}")
+        if rec.get("lpips_out") is not None:
+            bits.append(f"LPIPS {rec['lpips_out']:.3f}")
         if rec.get("fps"):
             bits.append(f"{rec['fps']:.0f} FPS")
         if rec.get("latency_ms"):

@@ -51,7 +51,7 @@ from nsa.compiler import CAPS, assess_targets, compile_stack
 from nsa.model_opts import search_combo_valid
 from nsa.inference import (
     build_loss, calibrate_multi, estimate_device_latency_ms, fake_quantize_int8,
-    psnr, run,
+    lpips, psnr, run, ssim,
 )
 from nsa.models import build_model, count_params
 from nsa.raw_io import build_frame, build_frame_from_source, list_frames
@@ -94,6 +94,8 @@ class SearchResult:
     n_params: int
     duration_s: float
     chips: dict = None      # per-chip suitability {key: {verdict, fps, ...}}
+    ssim_out: float = None      # structural similarity (0-1, higher better)
+    lpips_out: float = None     # perceptual distance (lower better)
 
 
 def _build_search_cfg(
@@ -212,10 +214,22 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         export_model, cfg.optimization.patch_size, cfg.hardware, quantized
     )
     weight_kb = n_params / 1024.0 if quantized else n_params * 4 / 1024.0
+
+    # Perceptual metrics on a representative frame — SSIM/LPIPS catch the
+    # over-smoothing that PSNR rewards, so the winner is perceptually best.
+    ref = frames[0]
+    final_out = run(export_model, ref.noisy_rgb)[0]
+    ssim_out = ssim(final_out, ref.clean_rgb)
+    try:
+        lpips_out = lpips(final_out, ref.clean_rgb)
+    except Exception:
+        lpips_out = None
+
     fit = compute_fitness(final_psnr, latency_ms, quant_drop,
                           weight_kb=weight_kb, act_kb=result.est_sram_kb,
                           sram_budget_kb=result.sram_budget_kb,
-                          psnr_in=psnr_in)
+                          psnr_in=psnr_in,
+                          ssim=ssim_out, lpips=lpips_out)
 
     # Cross-chip suitability for this exact trained model (RPi5/Hailo-8/DeepX).
     chips: dict = {}
@@ -250,6 +264,8 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         n_params=n_params,
         duration_s=time.perf_counter() - t0,
         chips=chips,
+        ssim_out=ssim_out,
+        lpips_out=lpips_out,
     )
 
 
@@ -328,6 +344,8 @@ def _save_pareto(results: list[SearchResult], front: list[SearchResult],
             "psnr": round(r.psnr_out, 2),
             "psnr_in": round(r.psnr_in, 2),
             "psnr_gain": gain,
+            "ssim": round(r.ssim_out, 4) if r.ssim_out is not None else None,
+            "lpips": round(r.lpips_out, 4) if r.lpips_out is not None else None,
             "latency_ms": round(r.latency_ms, 1),
             "fitness": r.fitness, "grade": r.grade,
             "pareto": r in front,
@@ -374,7 +392,8 @@ def _results_table(results: list[SearchResult], title: str = "Search Results",
     tbl.add_column("Act",     style=_MUTED,   width=6)
     tbl.add_column("Params",  style=_MUTED,   width=8,  justify="right")
     tbl.add_column("PSNR",    style="bold",   width=8,  justify="right")
-    tbl.add_column("Gain",    style=_MUTED,   width=8,  justify="right")
+    tbl.add_column("SSIM",    style=_MUTED,   width=6,  justify="right")
+    tbl.add_column("LPIPS",   style=_MUTED,   width=6,  justify="right")
     tbl.add_column("Latency", style=_MUTED,   width=10, justify="right")
     tbl.add_column("Fitness", style="bold",   width=9,  justify="right")
     tbl.add_column("Grade",   width=11)
@@ -382,6 +401,8 @@ def _results_table(results: list[SearchResult], title: str = "Search Results",
     for i, r in enumerate(results, 1):
         gc = _grade_colour(r.grade)
         warn_marker = " ▲" if r.warnings else ""
+        ssim_txt = f"{r.ssim_out:.3f}" if r.ssim_out is not None else "—"
+        lpips_txt = f"{r.lpips_out:.3f}" if r.lpips_out is not None else "—"
         tbl.add_row(
             str(i),
             *(([r.sensor]) if show_sensor else []),
@@ -391,7 +412,8 @@ def _results_table(results: list[SearchResult], title: str = "Search Results",
             r.activation,
             f"{r.n_params/1000:.1f}K",
             f"{r.psnr_out:.1f} dB",
-            f"+{r.psnr_out - r.psnr_in:.1f} dB",
+            ssim_txt,
+            lpips_txt,
             f"{r.latency_ms:.1f} ms",
             Text(f"{r.fitness:.1f}", style=f"bold {gc}"),
             Text(f"{r.grade}{warn_marker}", style=gc),
@@ -704,7 +726,9 @@ def main() -> int:
         + "\n\n"
         f"  PSNR  [bold]{winner.psnr_out:.1f} dB[/]   "
         f"Gain  [bold]+{winner.psnr_out - winner.psnr_in:.1f} dB[/]   "
-        f"Latency  [bold]{winner.latency_ms:.1f} ms[/]   "
+        + (f"SSIM  [bold]{winner.ssim_out:.3f}[/]   " if winner.ssim_out is not None else "")
+        + (f"LPIPS  [bold]{winner.lpips_out:.3f}[/]   " if winner.lpips_out is not None else "")
+        + f"Latency  [bold]{winner.latency_ms:.1f} ms[/]   "
         f"Fitness  [bold {_grade_colour(winner.grade)}]{winner.fitness:.1f} / 100  [{winner.grade}][/]\n"
         + (f"\n  [{_AMBER}]Compiler notes: {'; '.join(winner.warnings)}[/]" if winner.warnings else ""),
         title=f"[bold {_GREEN}]RECOMMENDED CONFIGURATION[/]",

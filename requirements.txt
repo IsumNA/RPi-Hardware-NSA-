@@ -13,8 +13,15 @@ rich>=13.0
 torch>=2.2
 onnx>=1.15
 
-# Optional: running Hugging Face ONNX models directly.
-# onnxruntime>=1.17
+# Perceptual quality metrics reported alongside PSNR (SSIM is built-in; LPIPS
+# uses a pretrained AlexNet and downloads ~233 MB of weights on first use).
+# LPIPS penalises the over-smoothing/blur that PSNR happily rewards.
+lpips>=0.1.4
+torchvision>=0.17
+
+# onnxruntime: runs exported/Hugging Face ONNX graphs. Used by live testing's
+# --engine onnx (deployed-graph parity) and for HF ONNX models.
+onnxruntime>=1.17
 #
 # Optional: NAFNet models from deepghs/image_restoration (recommended Hub source).
 # dghs-imgutils>=0.19

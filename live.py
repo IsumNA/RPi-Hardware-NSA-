@@ -70,6 +70,7 @@ from nsa.theme import RPI_GREEN, RPI_RASPBERRY, banner, console, log
 
 OUT = Path("outputs")
 CKPT = OUT / "model.pt"
+ONNX_PATH = OUT / "exported_model.onnx"
 
 # BGR colours for the OpenCV overlay (OpenCV is BGR-ordered).
 _RASP_BGR = (74, 26, 197)      # raspberry red
@@ -124,6 +125,29 @@ def load_model(args) -> tuple[torch.nn.Module, dict]:
             ck.setdefault("sensor", args.sensor)
             ck.setdefault("gain", args.gain)
             return model, ck
+        # Prefer the EXPORTED graph (outputs/exported_model.onnx) run through
+        # onnxruntime — this is the exact graph that gets deployed, so the live
+        # preview reflects deployed behaviour rather than the FP32 PyTorch
+        # reference. Falls back to PyTorch if ONNX/onnxruntime is unavailable.
+        engine = getattr(args, "engine", "auto")
+        if engine in ("auto", "onnx") and ONNX_PATH.is_file():
+            try:
+                from nsa.hf_runner import OnnxDenoiser
+                model = OnnxDenoiser(ONNX_PATH)
+                model.eval()
+                log(f"Loaded exported ONNX graph via onnxruntime "
+                    f"(deployed graph) from {ONNX_PATH}", "ok")
+                ck.setdefault("sensor", args.sensor)
+                ck.setdefault("gain", args.gain)
+                return model, ck
+            except Exception as exc:  # noqa: BLE001
+                if engine == "onnx":
+                    raise SystemExit(
+                        f"--engine onnx requested but ONNX runtime failed: {exc}\n"
+                        "Install it with:  pip install onnxruntime")
+                log(f"ONNX engine unavailable ({exc}) — using FP32 PyTorch model. "
+                    "Install onnxruntime for deployed-graph parity.", "warn")
+
         cfg = ModelConfig(
             model_family=m.get("family", "nafnet"),
             base_channels=m.get("base_channels", 32),
@@ -138,7 +162,7 @@ def load_model(args) -> tuple[torch.nn.Module, dict]:
         model.load_state_dict(ck["state_dict"])
         model.eval()
         log(f"Loaded compiled model: {cfg.model_family.upper()} "
-            f"({count_params(model):,} params) from {CKPT}", "ok")
+            f"({count_params(model):,} params, FP32 PyTorch) from {CKPT}", "ok")
         ck.setdefault("sensor", args.sensor)
         ck.setdefault("gain", args.gain)
         return model, ck
@@ -785,6 +809,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seconds", type=float, default=0.0,
                    help="auto-stop after N seconds (0 = run until 'q'/ESC)")
     p.add_argument("--seed", type=int, default=662)
+    p.add_argument("--engine", choices=["auto", "onnx", "torch"], default="auto",
+                   help="inference engine: 'onnx' runs the exported ONNX graph via "
+                        "onnxruntime (matches the deployed graph), 'torch' runs the "
+                        "FP32 PyTorch model, 'auto' prefers ONNX when available "
+                        "(default: auto)")
     p.add_argument("--fresh", action="store_true",
                    help="ignore outputs/model.pt and rebuild from the flags below")
     p.add_argument("--calibrate", type=int, default=120,
