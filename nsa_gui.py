@@ -110,32 +110,38 @@ ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "rpi_logo.png"
 
 
-def _load_logo_photo(size: int | None = None):
-    """Load ``assets/rpi_logo.png`` as a Tk photo, or ``None`` if unavailable.
+def _load_scaled_photo(path, target_px: int):
+    """Load an image scaled to fit ``target_px``, or ``None`` if unavailable.
 
-    Tries Pillow first (supports resize); falls back to Tk's native PNG loader.
+    Works with or without Pillow: Pillow gives high-quality aspect-preserving
+    resizing; the Tk fallback (used when Pillow is missing) can only read PNG/GIF
+    and shrinks by an integer ``subsample`` factor so large assets don't render
+    at full native resolution.
     """
-    if not LOGO_PATH.exists():
+    path = Path(path)
+    if not path.exists():
         return None
-    px = size if size is not None else S(58)
     if Image is not None and ImageTk is not None:
         try:
-            im = Image.open(LOGO_PATH).convert("RGBA")
-            im = im.resize((px, px), Image.LANCZOS)
+            im = Image.open(path).convert("RGBA")
+            im.thumbnail((target_px, target_px), Image.LANCZOS)
             return ImageTk.PhotoImage(im)
         except Exception:  # noqa: BLE001
             pass
-    # Tk's PNG loader can't resize; subsample by an integer factor so the
-    # native 512px asset doesn't render huge when Pillow is unavailable.
     try:
-        photo = tk.PhotoImage(file=str(LOGO_PATH))
+        photo = tk.PhotoImage(file=str(path))
         native = max(photo.width(), photo.height())
-        factor = max(1, round(native / px))
+        factor = max(1, round(native / target_px))
         if factor > 1:
             photo = photo.subsample(factor, factor)
         return photo
     except Exception:  # noqa: BLE001
         return None
+
+
+def _load_logo_photo(size: int | None = None):
+    """Load ``assets/rpi_logo.png`` as a Tk photo, or ``None`` if unavailable."""
+    return _load_scaled_photo(LOGO_PATH, size if size is not None else S(58))
 
 
 def _draw_logo_fallback(canvas, cx: int, cy: int, radius: int) -> None:
@@ -444,15 +450,7 @@ class SensorSelector(tk.Frame):
         self._refresh()
 
     def _load_thumb(self, path):
-        if not (ImageTk and Path(path).exists()):
-            return None
-        try:
-            im = Image.open(path).convert("RGBA")
-            box = S(self.THUMB)
-            im.thumbnail((box, box), Image.LANCZOS)
-            return ImageTk.PhotoImage(im)
-        except Exception:
-            return None
+        return _load_scaled_photo(path, S(self.THUMB))
 
     def _build_card(self, parent, c, col):
         key = c["key"]
