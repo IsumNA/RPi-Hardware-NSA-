@@ -108,6 +108,35 @@ def font(size: float, weight: str = "normal", family: str | None = None):
 
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "rpi_logo.png"
+
+
+def _load_logo_photo(size: int | None = None):
+    """Load ``assets/rpi_logo.png`` as a Tk photo, or ``None`` if unavailable.
+
+    Tries Pillow first (supports resize); falls back to Tk's native PNG loader.
+    """
+    if not LOGO_PATH.exists():
+        return None
+    px = size if size is not None else S(58)
+    if Image is not None and ImageTk is not None:
+        try:
+            im = Image.open(LOGO_PATH).convert("RGBA")
+            if size is not None:
+                im = im.resize((px, px), Image.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return tk.PhotoImage(file=str(LOGO_PATH))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _draw_logo_fallback(canvas, cx: int, cy: int, radius: int) -> None:
+    """Simple raspberry disc when the PNG logo cannot be loaded."""
+    canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                       fill=RASPBERRY, outline="")
+    canvas.create_text(cx, cy, text="π", fill="white", font=font(12, "bold"))
 PANEL_PATH = ROOT / "outputs" / "validation_panel.png"
 # Remembers the last-used wizard settings across launches (loaded on top of
 # config.yaml defaults; keeps config.yaml's documentation comments intact).
@@ -299,14 +328,15 @@ class Sidebar(tk.Canvas):
         h = self.winfo_height() or S(600)
         self.create_line(self.WIDTH - 1, 0, self.WIDTH - 1, h, fill=LINE)
 
-        if ImageTk and LOGO_PATH.exists():
-            if self._logo_img is None:
-                im = Image.open(LOGO_PATH).convert("RGBA").resize((S(58), S(58)), Image.LANCZOS)
-                self._logo_img = ImageTk.PhotoImage(im)
-            self.create_image(S(34), S(46), image=self._logo_img)
+        logo_x, logo_y = S(34), S(46)
+        if self._logo_img is None:
+            self._logo_img = _load_logo_photo(S(58))
+        if self._logo_img is not None:
+            self.create_image(logo_x, logo_y, image=self._logo_img)
             tx = S(70)
         else:
-            tx = S(22)
+            _draw_logo_fallback(self, logo_x, logo_y, S(20))
+            tx = S(70)
         self.create_text(tx, S(36), text="NAS", anchor="w", fill=RASPBERRY,
                         font=font(20, "bold"))
         self.create_text(tx, S(58), text="compiler", anchor="w", fill=SUBTLE,
@@ -567,15 +597,10 @@ class LiveView(tk.Toplevel):
         pad = S(24)
         header = tk.Frame(self, bg=WHITE)
         header.pack(fill="x", padx=pad, pady=(S(18), S(2)))
-        if ImageTk and LOGO_PATH.exists():
-            try:
-                im = Image.open(LOGO_PATH).convert("RGBA").resize(
-                    (S(40), S(40)), Image.LANCZOS)
-                self._logo_img = ImageTk.PhotoImage(im)
-                tk.Label(header, image=self._logo_img, bg=WHITE).pack(
-                    side="left", padx=(0, S(12)))
-            except Exception:  # noqa: BLE001
-                pass
+        self._logo_img = _load_logo_photo(S(40))
+        if self._logo_img is not None:
+            tk.Label(header, image=self._logo_img, bg=WHITE).pack(
+                side="left", padx=(0, S(12)))
         htext = tk.Frame(header, bg=WHITE)
         htext.pack(side="left")
         tk.Label(htext, text="Live testing", bg=WHITE, fg=INK,
@@ -925,8 +950,9 @@ class App(tk.Tk):
         except Exception:
             pass
         try:
-            if LOGO_PATH.exists() and ImageTk:
-                self.iconphoto(True, ImageTk.PhotoImage(Image.open(LOGO_PATH)))
+            icon = _load_logo_photo()
+            if icon is not None:
+                self.iconphoto(True, icon)
         except Exception:
             pass
 
