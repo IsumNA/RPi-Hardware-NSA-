@@ -131,7 +131,9 @@ def _load_scaled_photo(path, target_px: int):
     try:
         photo = tk.PhotoImage(file=str(path))
         native = max(photo.width(), photo.height())
-        factor = max(1, round(native / target_px))
+        # Ceil division: pick the smallest integer factor that keeps the image
+        # within target_px (subsample can only shrink by whole numbers).
+        factor = max(1, -(-native // max(1, target_px)))
         if factor > 1:
             photo = photo.subsample(factor, factor)
         return photo
@@ -3344,15 +3346,11 @@ class App(tk.Tk):
 
         # -- Validation panel image -----------------------------------------
         self._section(body, "VALIDATION MATRIX")
-        if ImageTk and PANEL_PATH.exists():
-            try:
-                im = Image.open(PANEL_PATH)
-                target_w = S(640)
-                ratio = target_w / im.width
-                im = im.resize((target_w, int(im.height * ratio)), Image.LANCZOS)
-                self._result_img = ImageTk.PhotoImage(im)
+        if PANEL_PATH.exists():
+            self._result_img = _load_scaled_photo(PANEL_PATH, S(640))
+            if self._result_img is not None:
                 tk.Label(body, image=self._result_img, bg=WHITE).pack(anchor="w", pady=(S(4), S(12)))
-            except Exception:
+            else:
                 tk.Label(body, text="(could not render validation_panel.png)",
                          bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
         else:
@@ -3370,16 +3368,12 @@ class App(tk.Tk):
                  "for each Pi-class target (dashed = peak TOPS).",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(6)))
-        if ImageTk and scale_path.exists():
-            try:
-                im = Image.open(scale_path)
-                target_w = S(640)
-                ratio = target_w / im.width
-                im = im.resize((target_w, int(im.height * ratio)), Image.LANCZOS)
-                self._scaling_img = ImageTk.PhotoImage(im)
+        if scale_path.exists():
+            self._scaling_img = _load_scaled_photo(scale_path, S(640))
+            if self._scaling_img is not None:
                 tk.Label(body, image=self._scaling_img, bg=WHITE).pack(
                     anchor="w", pady=(S(4), S(12)))
-            except Exception:
+            else:
                 tk.Label(body, text="(could not render resolution_tops_scaling.png)",
                          bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
         else:
