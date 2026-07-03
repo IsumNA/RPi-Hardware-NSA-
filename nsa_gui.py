@@ -3369,6 +3369,10 @@ class App(tk.Tk):
                 ("Quantization", quant_txt or "—"),
                 ("Target", f"{s.get('hardware_name','')}  [{s.get('precision','')}]"),
             ]
+            if s.get("extended_train"):
+                ext_steps = s.get("extended_steps") or 0
+                details.append(("Extended training",
+                                f"full dataset  ·  {ext_steps} steps"))
             if m.get("custom_nafnet"):
                 details.append(("NAFNet topology",
                                 f"enc {m.get('nafnet_enc')} · mid {m.get('nafnet_middle')} "
@@ -3377,7 +3381,8 @@ class App(tk.Tk):
                 r = tk.Frame(body, bg=WHITE); r.pack(fill="x", pady=S(2))
                 tk.Label(r, text=k, bg=WHITE, fg=SUBTLE, font=font(10),
                          width=14, anchor="w").pack(side="left")
-                tk.Label(r, text=v, bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+                vcol = GREEN if k == "Extended training" else INK
+                tk.Label(r, text=v, bg=WHITE, fg=vcol, font=font(10, "bold")).pack(side="left")
 
             # -- Cross-chip suitability -------------------------------------
             if s.get("targets"):
