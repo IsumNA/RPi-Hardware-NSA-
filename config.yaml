@@ -67,6 +67,12 @@ optimization:
   qat: false                # true => fake-quant-in-the-loop training (STE)
   calibration_steps: 300    # live calibration iterations (batch of augmented crops)
   patch_size: 192           # working resolution for the live demo (square crop)
+  # Extended training: after the quick calibration, keep training on EVERY paired
+  # image in the dataset (e.g. all of PI_RAW) for a much stronger denoiser. Off by
+  # default (slower); turn on for best quality when you have a real dataset.
+  extended_train: false
+  extended_steps: 1500      # optimizer steps for the extended full-dataset pass
+  extended_max_side: 1024   # cap image long-side when loading full frames
   # Training objective. name: charbonnier | l1 | l2 | huber | ssim | charbonnier_ssim
   #   charbonnier      -> sharp, robust pixel loss (default); tune charbonnier_eps
   #   l1 / l2 (mse)    -> plain MAE / MSE (no parameters)

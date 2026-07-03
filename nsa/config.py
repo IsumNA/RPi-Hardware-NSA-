@@ -83,6 +83,11 @@ class OptimizationConfig:
     calibration_steps: int = 300
     patch_size: int = 256
     loss: LossConfig = field(default_factory=LossConfig)
+    # Optional extended training: after the quick calibration, keep training on
+    # EVERY paired image in the dataset (PI_RAW) for a much stronger denoiser.
+    extended_train: bool = False    # enable the extra full-dataset training pass
+    extended_steps: int = 1500      # optimizer steps for the extended pass
+    extended_max_side: int = 1024   # cap image long-side when loading full frames
 
 
 @dataclass
@@ -284,6 +289,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "negative restores the sensor default")
     p.add_argument("--steps", dest="steps", type=int,
                    help="override calibration steps (lower = faster demo)")
+    p.add_argument("--extended-train", dest="extended_train", action="store_true",
+                   help="after quick calibration, keep training on EVERY paired "
+                        "image in the dataset for a stronger denoiser")
+    p.add_argument("--extended-steps", dest="extended_steps", type=int,
+                   help="optimizer steps for the extended full-dataset pass "
+                        "(default 1500)")
+    p.add_argument("--extended-max-side", dest="extended_max_side", type=int,
+                   help="cap image long-side when loading full frames for extended "
+                        "training (default 1024)")
     p.add_argument("--loss", dest="loss", choices=list(LOSSES),
                    help="training loss function (default: charbonnier)")
     p.add_argument("--charbonnier-eps", dest="charbonnier_eps", type=float,
@@ -360,6 +374,12 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.sensor.noise_std = float(args.noise_std)
     if args.steps:
         cfg.optimization.calibration_steps = args.steps
+    if getattr(args, "extended_train", False):
+        cfg.optimization.extended_train = True
+    if getattr(args, "extended_steps", None):
+        cfg.optimization.extended_steps = max(1, int(args.extended_steps))
+    if getattr(args, "extended_max_side", None):
+        cfg.optimization.extended_max_side = max(64, int(args.extended_max_side))
     if getattr(args, "loss", None):
         cfg.optimization.loss.name = args.loss
     if getattr(args, "charbonnier_eps", None) is not None:

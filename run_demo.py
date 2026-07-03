@@ -40,7 +40,7 @@ from nsa.inference import (build_loss, calibrate, calibrate_multi,
                            psnr, run, ssim, temporal_denoise)
 from nsa.models import build_model, count_params
 from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
-                        list_frames)
+                        list_frames, load_training_pairs)
 from nsa.sensors import get_sensor, with_noise_std
 from nsa.report import compute_fitness, print_report, print_target_suitability
 from nsa.scaling import render_scaling_chart, scaling_curves
@@ -296,6 +296,45 @@ def main() -> int:
                             cfg.output.seed, on_step, qat=use_qat,
                             loss_fn=loss_fn)
 
+    # -- Optional extended training on the WHOLE dataset ---------------------
+    # After the quick calibration, keep training on every paired image in the
+    # dataset (e.g. all of PI_RAW) for a much stronger denoiser. Skipped for
+    # pretrained HF ONNX graphs (not trainable here).
+    ext_steps = int(cfg.optimization.extended_steps)
+    if cfg.optimization.extended_train and not hf_onnx and ext_steps > 0:
+        ext_pairs = []
+        if real_capture and real_source:
+            ext_pairs = load_training_pairs(
+                real_source, filter_tokens or None, sensor=sensor,
+                gain=cfg.sensor.gain, simulate_noise=simulate_noise,
+                seed=cfg.output.seed, temporal_frames=tframes,
+                max_side=int(cfg.optimization.extended_max_side))
+        if ext_pairs:
+            log(f"Extended training: {len(ext_pairs)} full image(s) from the "
+                f"dataset  ·  {ext_steps} steps (this is the slow, high-quality "
+                f"pass)", "step")
+            with Progress(
+                TextColumn("[muted]{task.description}"),
+                BarColumn(complete_style=RPI_GREEN, finished_style=RPI_GREEN),
+                TextColumn("[muted]{task.percentage:>3.0f}%"),
+                TextColumn("[val]loss {task.fields[loss]:.4f}"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=False,
+            ) as progress:
+                task = progress.add_task("extended training", total=ext_steps, loss=1.0)
+
+                def on_ext_step(i, total, loss):
+                    progress.update(task, completed=i, loss=loss)
+
+                calibrate_multi(model, ext_pairs, ext_steps, cfg.output.seed + 1,
+                                on_ext_step, crop=cfg.optimization.patch_size,
+                                qat=use_qat, loss_fn=loss_fn)
+            log("Extended training complete — model refined on the full dataset", "ok")
+        elif cfg.optimization.extended_train:
+            log("Extended training requested but no paired dataset images were "
+                "found — skipped (needs real captures with noisy/gt pairs)", "warn")
+
     fp32_out, fwd_ms = run(model, frame.noisy_rgb)
     psnr_fp32 = float(np.mean([psnr(run(model, f.noisy_rgb)[0], f.clean_rgb)
                                for f in frames]))
@@ -516,6 +555,9 @@ def main() -> int:
         "frames": len(frames),
         "quant_scheme": result.quant_scheme,
         "qat": use_qat,
+        "extended_train": bool(cfg.optimization.extended_train),
+        "extended_steps": (int(cfg.optimization.extended_steps)
+                           if cfg.optimization.extended_train else 0),
         "temporal_frames_out": n_video,
         "precision": meta["precision"],
         "psnr_in": round(psnr_in, 2),

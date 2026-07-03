@@ -438,6 +438,73 @@ def build_frame_from_source(
     return Frame(noisy, gt, bayer, gain, name, sensor, gt_kind=kind)
 
 
+def _cap_long_side(img: np.ndarray, max_side: int) -> np.ndarray:
+    """Downscale so the longest side is <= max_side (never upscale)."""
+    if max_side <= 0:
+        return img
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return img
+    s = max_side / float(longest)
+    return cv2.resize(img, (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+                      interpolation=cv2.INTER_AREA)
+
+
+def load_training_pairs(
+    path: str | None,
+    filter_tokens: list[str] | None = None,
+    sensor: SensorProfile | str = "imx662",
+    gain: int = 256,
+    simulate_noise: bool = False,
+    seed: int = 0,
+    temporal_frames: int = 8,
+    max_side: int = 1024,
+    min_patch: int = 64,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Load EVERY paired capture under ``path`` as full-image (noisy, clean) pairs.
+
+    Unlike :func:`build_frame_from_source` (which returns a single detail crop per
+    folder), this keeps whole images so an extended-training pass can draw many
+    diverse random crops from the entire PI_RAW dataset — the "patches across all
+    images" strategy that trains a much stronger denoiser than a single frame.
+
+    * paired noisy/gt          -> real ground truth (denoise-hw convention)
+    * paired + simulate_noise  -> use gt as clean, inject sensor noise on top
+    Images are downscaled so the longest side is <= ``max_side`` to bound memory.
+    Returns a list of ``(noisy_rgb, clean_rgb)`` float32 [0,1] arrays.
+    """
+    if not path:
+        return []
+    if isinstance(sensor, str):
+        sensor = get_sensor(sensor)
+    try:
+        from nsa.denoise_hw_data import normalize_dataset_root
+        root = str(normalize_dataset_root(path))
+    except Exception:
+        root = str(Path(path).expanduser())
+
+    pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    for i, folder in enumerate(find_paired_folders(root, filter_tokens)):
+        pr = _pair_in_folder(folder)
+        if pr is None:
+            continue
+        try:
+            noisy = _cap_long_side(_load_any(pr[0]), max_side)
+            gt = _cap_long_side(_load_any(pr[1]), max_side)
+        except Exception:
+            continue
+        h = min(noisy.shape[0], gt.shape[0])
+        w = min(noisy.shape[1], gt.shape[1])
+        if h < min_patch or w < min_patch:
+            continue
+        noisy, gt = noisy[:h, :w], gt[:h, :w]
+        if simulate_noise:                       # gt is clean -> simulate sensor noise
+            noisy, gt = _synth_noisy_gt(gt, gain, sensor, temporal_frames, seed + i)
+        pairs.append((noisy.astype(np.float32), gt.astype(np.float32)))
+    return pairs
+
+
 def build_frame(
     input_raw: str | None,
     gain: int,

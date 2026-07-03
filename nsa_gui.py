@@ -1147,6 +1147,8 @@ class App(tk.Tk):
         self.sim_noise_var = tk.BooleanVar(value=False)
         self.quantize_var = tk.BooleanVar(value=True)
         self.qat_var = tk.BooleanVar(value=False)
+        self.extended_train_var = tk.BooleanVar(value=False)
+        self.extended_steps_var = tk.StringVar(value="1500")
         self.eval_var = tk.StringVar(value="single")     # single | sweep
         self.all_sensors_var = tk.BooleanVar(value=False)
         self._nafnet_topo = {"enc": "", "mid": "", "dec": ""}
@@ -1445,6 +1447,35 @@ class App(tk.Tk):
                     "quantization loss. Auto-on for gelu→DeepX / non-native acts.",
                     self.qat_var)
 
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
+        self._check(body, "Extended training on the full dataset",
+                    "After the quick calibration, keep training on EVERY paired "
+                    "image in the dataset (all of PI_RAW). Much stronger denoising, "
+                    "but slower. Recommended when you have real captures.",
+                    self.extended_train_var, command=self._on_extended_toggle)
+        ext_row = tk.Frame(body, bg=WHITE)
+        ext_row.pack(fill="x", pady=(0, S(4)))
+        ext_row.columnconfigure(0, weight=1)
+        ext_left = tk.Frame(ext_row, bg=WHITE); ext_left.grid(row=0, column=0, sticky="w")
+        self._ext_steps_lbl = tk.Label(ext_left, text="     Extended steps",
+                                       bg=WHITE, fg=INK, font=font(10))
+        self._ext_steps_lbl.pack(anchor="w")
+        tk.Label(ext_left, text="     more steps = better quality, longer wait "
+                 "(typical 1000–3000)", bg=WHITE, fg=SUBTLE,
+                 font=font(9)).pack(anchor="w")
+        self._ext_steps_entry = ttk.Entry(ext_row, textvariable=self.extended_steps_var,
+                                          width=18, font=font(10))
+        self._ext_steps_entry.grid(row=0, column=1, sticky="e", padx=(S(8), 0))
+        self._on_extended_toggle()
+
+    def _on_extended_toggle(self):
+        on = bool(self.extended_train_var.get())
+        try:
+            self._ext_steps_entry.config(state="normal" if on else "disabled")
+            self._ext_steps_lbl.config(fg=INK if on else "#B6B6B6")
+        except (tk.TclError, AttributeError):
+            pass
+
     def _step_review(self, body):
         self._section(body, "REVIEW")
         self._review_box = tk.Frame(body, bg=WHITE)
@@ -1691,6 +1722,10 @@ class App(tk.Tk):
             ("Calibration", f"{self._row_get('steps','300')} steps · quant {q}", INK),
             ("Loss", self._row_get("loss", "charbonnier"), INK),
         ]
+        if self.extended_train_var.get():
+            ext = (self.extended_steps_var.get() or "1500").strip()
+            rows.append(("Extended training",
+                         f"full dataset · {ext} steps", GREEN))
         hint = self._dataset_quality_hint()
         if hint:
             rows.append(("Dataset", hint[0], hint[1]))
@@ -1855,6 +1890,10 @@ class App(tk.Tk):
                     self.rows[key].set(val)
             self.quantize_var.set(cfg.optimization.quantize)
             self.qat_var.set(cfg.optimization.qat)
+            self.extended_train_var.set(bool(getattr(cfg.optimization, "extended_train", False)))
+            self.extended_steps_var.set(str(getattr(cfg.optimization, "extended_steps", 1500)))
+            if hasattr(self, "_on_extended_toggle"):
+                self._on_extended_toggle()
             self.mode_var.set(cfg.run.mode)
             if cfg.sensor.real_capture:
                 self.source_var.set("real")
@@ -1899,8 +1938,9 @@ class App(tk.Tk):
     _STATE_LOSS_ENTRIES = ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight")
     _STATE_OTHER_ENTRIES = ("filter", "noise_std", "batch", "burst",
                             "naf_enc", "naf_mid", "naf_dec")
-    _STATE_BOOL_VARS = ("sim_noise_var", "quantize_var", "qat_var", "all_sensors_var")
-    _STATE_STR_VARS = ("mode_var", "source_var", "eval_var")
+    _STATE_BOOL_VARS = ("sim_noise_var", "quantize_var", "qat_var", "all_sensors_var",
+                        "extended_train_var")
+    _STATE_STR_VARS = ("mode_var", "source_var", "eval_var", "extended_steps_var")
 
     def _gui_state(self) -> dict:
         """Snapshot every user-facing wizard choice into a JSON-safe dict."""
@@ -2532,6 +2572,10 @@ class App(tk.Tk):
             cmd += ["--no-quantize"]
         if self.qat_var.get():
             cmd += ["--qat"]
+        if self.extended_train_var.get():
+            cmd += ["--extended-train"]
+            ext = (self.extended_steps_var.get() or "1500").strip()
+            cmd += ["--extended-steps", ext if ext.isdigit() else "1500"]
         mode = self.mode_var.get()
         if mode == "batch":
             bs = (self.batch_var.get() or "6").strip()
