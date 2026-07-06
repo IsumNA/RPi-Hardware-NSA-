@@ -1,29 +1,34 @@
-# IMX662 dataset template
+# IMX662 + existing PI_RAW dataset
 
-Run this once to create the full folder tree with capture guides on disk:
+## What your manager already captured (do not move)
 
-```bash
-python scaffold_imx662.py --output datasets/imx662_project
+```
+PI_RAW/Data/
+  cabinet_D50_100/
+    imx219_ag1_test/   noisy.dng  noisy.png  gt.dng  gt.png
+    imx219_ag2_test/   …
+    imx219_ag4_test/   …
+    imx219_ag8_test/   …
+    imx219_ag12_test/  …
+  cabinet_F11_25/      (same pattern)
+  cabinet_H_10/
+  colour_stripes/
 ```
 
-On the AI server (if datasets live under `/opt/datasets/`):
+`agN` is a **denoise-hw folder tag** (not the sensor register). IMX219 work used ag1–ag12.
+
+## What you add for IMX662 noise synthesis
+
+| Path | What |
+|------|------|
+| `calibration/imx662_gain256/` | NEW bias/dark/flat lab captures → noise model JSON |
+| `clean_scenes/<scene>/` | Clean GT for synthesis — **USE EXISTING GT** copies `gt.*` from PI_RAW |
+| `PI_RAW/Data/<scene>/imx662_ag24_test/` | **Generated** noisy+gt (night tags: ag12, ag24, ag48) |
+
+Scaffold beside your existing PI_RAW:
 
 ```bash
-python scaffold_imx662.py -o /opt/datasets/imx662_project
+python scaffold_imx662.py -o /opt/datasets    # parent of PI_RAW
 ```
 
-Then open **Dataset Studio** in the NSA GUI (`DATASET STUDIO` on the home screen)
-to see what to shoot, what is already present, and thumbnail previews.
-
-## Folder map
-
-| Path | What goes here |
-|------|----------------|
-| `calibration/imx662_gain256/bias/` | Lens cap, min exposure, 5+ frames |
-| `calibration/imx662_gain256/dark/` | Lens cap, normal exposure at target gain |
-| `calibration/imx662_gain256/flat/level_XX/` | Uniform light pairs `a` + `b` |
-| `bursts/<scene>/take01/` | Sequential RAW burst before GT averaging |
-| `clean_scenes/<scene>/` | Temporally-averaged GT stills |
-| `PI_RAW/Data/<scene>/imx662_ag12_test/` | `noisy.png` + `gt.png` training pairs |
-
-See `GT_CAPTURE.md` in the scaffolded project for proper ground-truth capture.
+Open **Dataset Studio** → point at `/opt/datasets/PI_RAW`.

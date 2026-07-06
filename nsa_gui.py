@@ -957,9 +957,9 @@ class Imx662DataStudio(tk.Toplevel):
     """Browse IMX662 dataset layout: what's needed, what's on disk, GT capture help."""
 
     _SECTION_LABELS = {
-        "calibration": "① Calibration (bias / dark / flat)",
-        "clean_scenes": "② Clean ground truth",
-        "pi_raw": "③ PI_RAW training pairs",
+        "on_disk": "ON DISK — manager PI_RAW captures (do not delete)",
+        "noise_pipeline": "YOU ADD — noise calibration shoots (bias / dark / flat)",
+        "imx662_targets": "TO GENERATE — IMX662 night-vision pairs (synthesis)",
     }
     _STATUS_ICON = {
         "complete": "✓",
@@ -1007,15 +1007,17 @@ class Imx662DataStudio(tk.Toplevel):
                  font=font(17, "bold")).pack(anchor="w")
         tk.Label(
             header,
-            text=("See exactly which captures you need, what is already on this "
-                  "machine, and how to build proper ground-truth images."),
+            text=("Point at your PI_RAW folder (e.g. /opt/datasets/PI_RAW). "
+                  "Top section shows what your manager already captured "
+                  "(cabinet_*, colour_stripes, imx219_ag*). Lower sections show "
+                  "what you still need for IMX662 noise synthesis."),
             bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(900), justify="left",
         ).pack(anchor="w", pady=(S(2), 0))
 
         path_row = tk.Frame(self, bg=WHITE)
         path_row.pack(fill="x", padx=pad, pady=(S(8), 0))
         path_row.columnconfigure(1, weight=1)
-        tk.Label(path_row, text="Project root", bg=WHITE, fg=INK,
+        tk.Label(path_row, text="PI_RAW root", bg=WHITE, fg=INK,
                  font=font(10, "bold"), width=12, anchor="w").grid(row=0, column=0)
         ttk.Entry(path_row, textvariable=self.root_var, font=font(10)).grid(
             row=0, column=1, sticky="ew", padx=(S(4), S(4)))
@@ -1049,9 +1051,9 @@ class Imx662DataStudio(tk.Toplevel):
         tree_fr.pack(fill="both", expand=True, pady=(S(4), 0))
         self.tree = ttk.Treeview(tree_fr, columns=("status", "count"), show="tree headings",
                                  height=16)
-        self.tree.heading("#0", text="Folder / slot")
+        self.tree.heading("#0", text="Scene / test folder")
         self.tree.heading("status", text="")
-        self.tree.heading("count", text="Found")
+        self.tree.heading("count", text="Files")
         self.tree.column("#0", width=S(220), stretch=True)
         self.tree.column("status", width=S(28), stretch=False)
         self.tree.column("count", width=S(72), stretch=False)
@@ -1098,11 +1100,14 @@ class Imx662DataStudio(tk.Toplevel):
         tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(6), 0))
         foot = tk.Frame(self, bg=WHITE)
         foot.pack(fill="x", padx=pad, pady=S(12))
-        RoundButton(foot, "CREATE TEMPLATE FOLDERS", self._scaffold,
-                    kind="primary", width=220, height=38).pack(side="left")
-        RoundButton(foot, "BUILD GT FROM BURST…", self._build_gt,
-                    kind="secondary", width=180, height=38).pack(side="left",
+        RoundButton(foot, "USE EXISTING GT", self._export_gt_from_pi_raw,
+                    kind="primary", width=160, height=38).pack(side="left")
+        RoundButton(foot, "ADD CALIB FOLDERS", self._scaffold,
+                    kind="secondary", width=150, height=38).pack(side="left",
                                                                    padx=(S(8), 0))
+        RoundButton(foot, "GT FROM BURST…", self._build_gt,
+                    kind="secondary", width=130, height=38).pack(side="left",
+                                                                 padx=(S(4), 0))
         RoundButton(foot, "OPEN FOLDER", self._open_slot,
                     kind="secondary", width=130, height=38).pack(side="left",
                                                                    padx=(S(8), 0))
@@ -1111,7 +1116,7 @@ class Imx662DataStudio(tk.Toplevel):
 
     def _browse_root(self):
         p = filedialog.askdirectory(
-            title="IMX662 dataset project root",
+            title="PI_RAW dataset root (folder containing Data/)",
             initialdir=self.root_var.get() or str(ROOT / "datasets"),
         )
         if p:
@@ -1119,33 +1124,38 @@ class Imx662DataStudio(tk.Toplevel):
             self._refresh()
 
     def _refresh(self):
-        from nsa.dataset_layout import audit_project
+        from nsa.dataset_layout import IMX662_TARGET_AG_TAGS, audit_project
         root = Path(self.root_var.get().strip() or ".")
         try:
             gain = int(self.gain_var.get())
         except ValueError:
             gain = 256
-        ag = self.ag_tag_var.get().strip() or "ag12"
-        self._audit = audit_project(root, gain=gain, ag_tag=ag)
+        self._audit = audit_project(
+            root, gain=gain, imx662_ag_tags=IMX662_TARGET_AG_TAGS,
+        )
 
         sm = self._audit.get("summary", {})
-        pct = sm.get("percent", 0)
-        self.prog["value"] = pct
-        self.prog_lbl.config(
-            text=f"{sm.get('complete', 0)}/{sm.get('total_required', 0)} complete  "
-                 f"({pct:.0f}%)")
+        inv = self._audit.get("pi_raw_inventory", {})
         cal = self._audit.get("calibration_pipeline") or {}
-        cal_txt = ""
-        if cal.get("ready"):
-            cal_txt = "  ·  Calibration captures: READY for Phases 1–4"
-        elif cal:
-            cal_txt = (f"  ·  Calibration: bias={cal.get('bias', 0)} "
-                       f"dark={cal.get('dark', 0)} "
-                       f"flat={cal.get('flat_levels', 0)}")
-        exists = "found" if self._audit.get("exists") else "not found — create template"
+        cal_ok = "READY" if cal.get("ready") else "needed"
+        self.prog["value"] = min(
+            100.0,
+            100.0 * sm.get("imx662_pairs_on_disk", 0)
+            / max(1, len(IMX662_TARGET_AG_TAGS) * max(1, sm.get("scenes_on_disk", 1))),
+        )
+        self.prog_lbl.config(
+            text=(f"{sm.get('paired_on_disk', 0)} paired folders on disk  ·  "
+                  f"IMX662 targets missing: {sm.get('imx662_targets_missing', 0)}"))
+        exists = "found" if self._audit.get("exists") else "not found"
+        ag_on_disk = ", ".join(inv.get("ag_tags", [])[:8]) or "—"
         self.summary_lbl.config(
-            text=f"Root {exists}: {self._audit.get('root', root)}{cal_txt}",
-            fg=GREEN if pct >= 80 else (AMBER if pct >= 30 else INK),
+            text=(
+                f"PI_RAW {exists}: {self._audit.get('pi_raw_root', root)}  ·  "
+                f"{sm.get('scenes_on_disk', 0)} scenes  ·  "
+                f"tags on disk: {ag_on_disk}  ·  "
+                f"noise calibration: {cal_ok}"
+            ),
+            fg=GREEN if cal.get("ready") else AMBER,
         )
 
         for item in self.tree.get_children():
@@ -1159,15 +1169,47 @@ class Imx662DataStudio(tk.Toplevel):
             )
             for sl in slots:
                 icon = self._STATUS_ICON.get(sl["status"], "?")
-                count = f"{sl['found']}/{sl['required']}"
+                count = f"{sl.get('found', 0)}"
+                if sl.get("required"):
+                    count = f"{sl.get('found', 0)}/{sl['required']}"
                 iid = self.tree.insert(
                     sec_id, "end", text=sl["title"],
                     values=(icon, count),
                 )
                 self._tree_items[iid] = sl
-            # Expand sections with missing work first
-            missing = sum(1 for s in slots if s["status"] != "complete")
-            self.tree.item(sec_id, open=missing > 0)
+                for child in sl.get("children") or []:
+                    files = child.get("files") or {}
+                    nfiles = len(files)
+                    cicon = "✓" if child.get("has_pair") else "○"
+                    label = child.get("folder_name", "?")
+                    cid = self.tree.insert(
+                        iid, "end", text=label,
+                        values=(cicon, str(nfiles)),
+                    )
+                    self._tree_items[cid] = {
+                        **child,
+                        "title": label,
+                        "rel_path": child.get("rel_path", ""),
+                        "section": "on_disk",
+                        "status": "complete" if child.get("has_pair") else "missing",
+                        "purpose": (
+                            f"{child.get('sensor', '?')} @ {child.get('ag_tag', '?')} — "
+                            f"manager capture. Files: "
+                            + ", ".join(sorted(files.keys())) or "none"
+                        ),
+                        "how_to_capture": (
+                            "Already on disk. Each test folder should contain "
+                            "noisy.dng, noisy.png, gt.dng, gt.png (not all required, "
+                            "but noisy + gt pair must exist)."
+                        ),
+                        "files": list(files.values()),
+                    }
+            missing = sum(
+                1 for s in slots
+                if s.get("status") != "complete" and not s.get("optional")
+            )
+            self.tree.item(sec_id, open=(section != "on_disk" and missing > 0)
+                          or section == "on_disk")
 
     def _on_select(self, _evt=None):
         sel = self.tree.selection()
@@ -1190,11 +1232,14 @@ class Imx662DataStudio(tk.Toplevel):
         for w in self.thumb_row.winfo_children():
             w.destroy()
         self._thumb_refs.clear()
-        root = Path(self._audit.get("root", self.root_var.get()))
+        pi_raw = Path(self._audit.get("pi_raw_root", self.root_var.get()))
+        proj = Path(self._audit.get("project_root", pi_raw.parent))
         files = sl.get("files") or []
         self.thumb_count.config(text=f"({len(files)} file(s))")
         for rel in files[:6]:
-            fp = root / rel
+            fp = pi_raw / rel
+            if not fp.is_file():
+                fp = proj / rel
             if not fp.is_file():
                 continue
             cell = tk.Frame(self.thumb_row, bg=FIELD)
@@ -1216,7 +1261,11 @@ class Imx662DataStudio(tk.Toplevel):
         sl = self._tree_items.get(sel[0])
         if not sl:
             return None
-        return Path(self._audit.get("root", self.root_var.get())) / sl["rel_path"]
+        from nsa.dataset_layout import resolve_layout
+        proj, pi = resolve_layout(self._audit.get("project_root", self.root_var.get()))
+        if sl.get("section") == "on_disk" or sl.get("section") == "imx662_targets":
+            return pi / sl["rel_path"]
+        return proj / sl["rel_path"]
 
     def _open_slot(self):
         p = self._selected_slot_path()
@@ -1245,9 +1294,7 @@ class Imx662DataStudio(tk.Toplevel):
         except ValueError:
             gain = 256
         try:
-            scaffold_imx662_project(
-                root, gain=gain, ag_tag=self.ag_tag_var.get().strip() or "ag12",
-            )
+            scaffold_imx662_project(root, gain=gain)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Template", str(exc))
             return
@@ -1285,6 +1332,27 @@ class Imx662DataStudio(tk.Toplevel):
             f"Averaged {manifest['frames_used']} frames →\n{manifest['output']}")
         self._refresh()
 
+    def _export_gt_from_pi_raw(self):
+        from nsa.dataset_layout import export_clean_gt_from_pi_raw, resolve_layout
+        proj, pi = resolve_layout(self.root_var.get().strip())
+        clean = proj / "clean_scenes"
+        try:
+            written = export_clean_gt_from_pi_raw(pi, clean)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Use existing GT", str(exc))
+            return
+        if not written:
+            messagebox.showwarning(
+                "Use existing GT",
+                "No gt.* files found in PI_RAW scenes.\n"
+                "Check that PI_RAW/Data/<scene>/imx219_ag12_test/ exists.")
+            return
+        messagebox.showinfo(
+            "Ground truth copied",
+            f"Copied {len(written)} gt file(s) to:\n{clean}\n\n"
+            "Use clean_scenes/ as input in the Noise Dataset Wizard.")
+        self._refresh()
+
     def _open_wizard(self):
         try:
             NoiseDatasetWizard(self.app)
@@ -1308,15 +1376,15 @@ class NoiseDatasetWizard(tk.Toplevel):
         self.sensor_var = tk.StringVar(value="imx662")
         self.gain_var = tk.StringVar(value="256")
         self.temp_var = tk.StringVar()
-        _proj = ROOT / "datasets" / "imx662_project"
+        from nsa.dataset_layout import find_best_project_root, resolve_layout
+        _pi = find_best_project_root() or (ROOT / "datasets" / "PI_RAW")
+        _proj, _pi_raw = resolve_layout(_pi)
         self.clean_dir = tk.StringVar(
             value=str(_proj / "clean_scenes") if (_proj / "clean_scenes").is_dir() else "")
         self.calib_dir.set(
             str(_proj / "calibration" / "imx662_gain256")
             if (_proj / "calibration" / "imx662_gain256").is_dir() else "")
-        self.dataset_out = tk.StringVar(
-            value=str(_proj / "PI_RAW") if _proj.is_dir()
-            else str(ROOT / "datasets" / "PI_RAW_sim"))
+        self.dataset_out = tk.StringVar(value=str(_pi_raw))
         self.calib_json = tk.StringVar()
         self.ag_tag_var = tk.StringVar(value="ag12")
         self.layout_var = tk.StringVar(value="auto")
@@ -2329,8 +2397,9 @@ class App(tk.Tk):
                  bg=FIELD, fg=INK, font=font(14, "bold")).pack(side="left")
         tk.Label(
             inner,
-            text=("5-phase IMX662 workflow: calibrate on bias/dark/flat captures, "
-                  "then synthesize noisy+gt pairs in PI_RAW layout for extended training."),
+            text=("Manager PI_RAW (cabinet_*, colour_stripes, imx219_ag*) is shown in "
+                  "Dataset Studio. Add calibration shoots + synthesize imx662_ag24/48 "
+                  "night pairs — existing captures are never overwritten."),
             bg=FIELD, fg=SUBTLE, font=font(9), wraplength=S(600),
             justify="left").pack(anchor="w", pady=(S(4), S(10)))
 
