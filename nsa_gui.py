@@ -953,6 +953,345 @@ class LiveView(tk.Toplevel):
             pass
 
 
+class Imx662DataStudio(tk.Toplevel):
+    """Browse IMX662 dataset layout: what's needed, what's on disk, GT capture help."""
+
+    _SECTION_LABELS = {
+        "calibration": "① Calibration (bias / dark / flat)",
+        "clean_scenes": "② Clean ground truth",
+        "pi_raw": "③ PI_RAW training pairs",
+    }
+    _STATUS_ICON = {
+        "complete": "✓",
+        "partial": "◐",
+        "missing": "○",
+    }
+    _STATUS_FG = {
+        "complete": GREEN,
+        "partial": AMBER,
+        "missing": SUBTLE,
+    }
+
+    def __init__(self, master):
+        super().__init__(master, bg=WHITE)
+        self.app = master
+        self.title("NAS  ·  IMX662 Dataset Studio")
+        self.configure(bg=WHITE)
+        self._audit: dict = {}
+        self._thumb_refs: list = []
+
+        from nsa.dataset_layout import find_best_project_root
+        default_root = find_best_project_root()
+        if default_root is None:
+            default_root = ROOT / "datasets" / "imx662_project"
+        self.root_var = tk.StringVar(value=str(default_root))
+        self.gain_var = tk.StringVar(value="256")
+        self.ag_tag_var = tk.StringVar(value="ag12")
+
+        self._build_chrome()
+        self._refresh()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.transient(master)
+        try:
+            self.geometry(f"{S(980)}x{S(700)}+{master.winfo_rootx()+S(20)}"
+                          f"+{master.winfo_rooty()+S(20)}")
+        except Exception:  # noqa: BLE001
+            pass
+        master._grab_when_ready(self)
+
+    def _build_chrome(self):
+        pad = S(20)
+        header = tk.Frame(self, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(14), S(4)))
+        tk.Label(header, text="IMX662 Dataset Studio", bg=WHITE, fg=INK,
+                 font=font(17, "bold")).pack(anchor="w")
+        tk.Label(
+            header,
+            text=("See exactly which captures you need, what is already on this "
+                  "machine, and how to build proper ground-truth images."),
+            bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(900), justify="left",
+        ).pack(anchor="w", pady=(S(2), 0))
+
+        path_row = tk.Frame(self, bg=WHITE)
+        path_row.pack(fill="x", padx=pad, pady=(S(8), 0))
+        path_row.columnconfigure(1, weight=1)
+        tk.Label(path_row, text="Project root", bg=WHITE, fg=INK,
+                 font=font(10, "bold"), width=12, anchor="w").grid(row=0, column=0)
+        ttk.Entry(path_row, textvariable=self.root_var, font=font(10)).grid(
+            row=0, column=1, sticky="ew", padx=(S(4), S(4)))
+        RoundButton(path_row, "…", self._browse_root, kind="secondary",
+                    width=40, height=30).grid(row=0, column=2)
+        RoundButton(path_row, "REFRESH", self._refresh, kind="secondary",
+                    width=90, height=30).grid(row=0, column=3, padx=(S(6), 0))
+
+        self.summary_lbl = tk.Label(self, text="", bg=WHITE, fg=INK, font=font(10),
+                                    justify="left", wraplength=S(900))
+        self.summary_lbl.pack(anchor="w", padx=pad, pady=(S(6), 0))
+
+        prog_fr = tk.Frame(self, bg=FIELD)
+        prog_fr.pack(fill="x", padx=pad, pady=(S(6), 0))
+        self.prog = ttk.Progressbar(prog_fr, mode="determinate", length=S(400))
+        self.prog.pack(side="left", padx=S(10), pady=S(8))
+        self.prog_lbl = tk.Label(prog_fr, text="", bg=FIELD, fg=SUBTLE, font=font(9))
+        self.prog_lbl.pack(side="left", padx=(S(8), S(10)))
+
+        body = tk.Frame(self, bg=WHITE)
+        body.pack(fill="both", expand=True, padx=pad, pady=(S(8), 0))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, bg=WHITE)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, S(8)))
+        tk.Label(left, text="Checklist", bg=WHITE, fg=INK,
+                 font=font(10, "bold")).pack(anchor="w")
+        tree_fr = tk.Frame(left, bg=WHITE)
+        tree_fr.pack(fill="both", expand=True, pady=(S(4), 0))
+        self.tree = ttk.Treeview(tree_fr, columns=("status", "count"), show="tree headings",
+                                 height=16)
+        self.tree.heading("#0", text="Folder / slot")
+        self.tree.heading("status", text="")
+        self.tree.heading("count", text="Found")
+        self.tree.column("#0", width=S(220), stretch=True)
+        self.tree.column("status", width=S(28), stretch=False)
+        self.tree.column("count", width=S(72), stretch=False)
+        sy = ttk.Scrollbar(tree_fr, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sy.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sy.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        right = tk.Frame(body, bg=FIELD, highlightthickness=1,
+                         highlightbackground=LINE)
+        right.grid(row=0, column=1, sticky="nsew")
+        self.detail_title = tk.Label(right, text="Select a slot", bg=FIELD, fg=INK,
+                                     font=font(12, "bold"), anchor="w")
+        self.detail_title.pack(fill="x", padx=S(12), pady=(S(10), S(2)))
+        self.detail_path = tk.Label(right, text="", bg=FIELD, fg=SUBTLE,
+                                    font=font(9), anchor="w")
+        self.detail_path.pack(fill="x", padx=S(12))
+        self.detail_purpose = tk.Label(right, text="", bg=FIELD, fg=INK,
+                                       font=font(9), wraplength=S(480), justify="left",
+                                       anchor="w")
+        self.detail_purpose.pack(fill="x", padx=S(12), pady=(S(6), 0))
+        tk.Label(right, text="How to capture", bg=FIELD, fg=INK,
+                 font=font(9, "bold"), anchor="w").pack(fill="x", padx=S(12),
+                                                        pady=(S(8), 0))
+        cap_fr = tk.Frame(right, bg=WHITE)
+        cap_fr.pack(fill="both", expand=True, padx=S(12), pady=(S(4), S(8)))
+        self.capture_txt = tk.Text(cap_fr, height=10, wrap="word", font=font(9),
+                                   bg=WHITE, fg=INK, relief="flat",
+                                   highlightthickness=1, highlightbackground=LINE)
+        self.capture_txt.pack(fill="both", expand=True)
+        self.capture_txt.config(state="disabled")
+
+        thumb_lbl_fr = tk.Frame(right, bg=FIELD)
+        thumb_lbl_fr.pack(fill="x", padx=S(12))
+        tk.Label(thumb_lbl_fr, text="On disk", bg=FIELD, fg=INK,
+                 font=font(9, "bold")).pack(side="left")
+        self.thumb_count = tk.Label(thumb_lbl_fr, text="", bg=FIELD, fg=SUBTLE,
+                                    font=font(9))
+        self.thumb_count.pack(side="left", padx=(S(6), 0))
+        self.thumb_row = tk.Frame(right, bg=FIELD)
+        self.thumb_row.pack(fill="x", padx=S(12), pady=(S(4), S(10)))
+
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(6), 0))
+        foot = tk.Frame(self, bg=WHITE)
+        foot.pack(fill="x", padx=pad, pady=S(12))
+        RoundButton(foot, "CREATE TEMPLATE FOLDERS", self._scaffold,
+                    kind="primary", width=220, height=38).pack(side="left")
+        RoundButton(foot, "BUILD GT FROM BURST…", self._build_gt,
+                    kind="secondary", width=180, height=38).pack(side="left",
+                                                                   padx=(S(8), 0))
+        RoundButton(foot, "OPEN FOLDER", self._open_slot,
+                    kind="secondary", width=130, height=38).pack(side="left",
+                                                                   padx=(S(8), 0))
+        RoundButton(foot, "NOISE WIZARD", self._open_wizard,
+                    kind="secondary", width=130, height=38).pack(side="right")
+
+    def _browse_root(self):
+        p = filedialog.askdirectory(
+            title="IMX662 dataset project root",
+            initialdir=self.root_var.get() or str(ROOT / "datasets"),
+        )
+        if p:
+            self.root_var.set(p)
+            self._refresh()
+
+    def _refresh(self):
+        from nsa.dataset_layout import audit_project
+        root = Path(self.root_var.get().strip() or ".")
+        try:
+            gain = int(self.gain_var.get())
+        except ValueError:
+            gain = 256
+        ag = self.ag_tag_var.get().strip() or "ag12"
+        self._audit = audit_project(root, gain=gain, ag_tag=ag)
+
+        sm = self._audit.get("summary", {})
+        pct = sm.get("percent", 0)
+        self.prog["value"] = pct
+        self.prog_lbl.config(
+            text=f"{sm.get('complete', 0)}/{sm.get('total_required', 0)} complete  "
+                 f"({pct:.0f}%)")
+        cal = self._audit.get("calibration_pipeline") or {}
+        cal_txt = ""
+        if cal.get("ready"):
+            cal_txt = "  ·  Calibration captures: READY for Phases 1–4"
+        elif cal:
+            cal_txt = (f"  ·  Calibration: bias={cal.get('bias', 0)} "
+                       f"dark={cal.get('dark', 0)} "
+                       f"flat={cal.get('flat_levels', 0)}")
+        exists = "found" if self._audit.get("exists") else "not found — create template"
+        self.summary_lbl.config(
+            text=f"Root {exists}: {self._audit.get('root', root)}{cal_txt}",
+            fg=GREEN if pct >= 80 else (AMBER if pct >= 30 else INK),
+        )
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._tree_items: dict[str, dict] = {}
+        by_section = self._audit.get("by_section", {})
+        for section, slots in by_section.items():
+            sec_id = self.tree.insert(
+                "", "end", text=self._SECTION_LABELS.get(section, section),
+                values=("", ""),
+            )
+            for sl in slots:
+                icon = self._STATUS_ICON.get(sl["status"], "?")
+                count = f"{sl['found']}/{sl['required']}"
+                iid = self.tree.insert(
+                    sec_id, "end", text=sl["title"],
+                    values=(icon, count),
+                )
+                self._tree_items[iid] = sl
+            # Expand sections with missing work first
+            missing = sum(1 for s in slots if s["status"] != "complete")
+            self.tree.item(sec_id, open=missing > 0)
+
+    def _on_select(self, _evt=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        sl = self._tree_items.get(iid)
+        if sl is None:
+            return
+        self.detail_title.config(text=sl["title"])
+        self.detail_path.config(text=sl["rel_path"])
+        self.detail_purpose.config(text=sl["purpose"])
+        self.capture_txt.config(state="normal")
+        self.capture_txt.delete("1.0", "end")
+        self.capture_txt.insert("1.0", sl["how_to_capture"])
+        self.capture_txt.config(state="disabled")
+        st = sl["status"]
+        self.detail_title.config(fg=self._STATUS_FG.get(st, INK))
+
+        for w in self.thumb_row.winfo_children():
+            w.destroy()
+        self._thumb_refs.clear()
+        root = Path(self._audit.get("root", self.root_var.get()))
+        files = sl.get("files") or []
+        self.thumb_count.config(text=f"({len(files)} file(s))")
+        for rel in files[:6]:
+            fp = root / rel
+            if not fp.is_file():
+                continue
+            cell = tk.Frame(self.thumb_row, bg=FIELD)
+            cell.pack(side="left", padx=(0, S(6)))
+            photo = _load_scaled_photo(fp, S(72))
+            if photo is not None:
+                self._thumb_refs.append(photo)
+                tk.Label(cell, image=photo, bg=FIELD).pack()
+            else:
+                tk.Label(cell, text=fp.suffix, bg=WHITE, fg=SUBTLE,
+                         font=font(8), width=8, height=4).pack()
+            tk.Label(cell, text=fp.name[:14], bg=FIELD, fg=SUBTLE,
+                     font=font(7)).pack()
+
+    def _selected_slot_path(self) -> Path | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        sl = self._tree_items.get(sel[0])
+        if not sl:
+            return None
+        return Path(self._audit.get("root", self.root_var.get())) / sl["rel_path"]
+
+    def _open_slot(self):
+        p = self._selected_slot_path()
+        if p is None:
+            messagebox.showinfo("Open folder", "Select a slot in the checklist first.")
+            return
+        p.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(p))  # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])  # noqa: S603
+            else:
+                subprocess.Popen(["xdg-open", str(p)])  # noqa: S603
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Open folder", str(exc))
+
+    def _scaffold(self):
+        from nsa.dataset_layout import scaffold_imx662_project
+        root = self.root_var.get().strip()
+        if not root:
+            messagebox.showerror("Template", "Choose a project root path first.")
+            return
+        try:
+            gain = int(self.gain_var.get())
+        except ValueError:
+            gain = 256
+        try:
+            scaffold_imx662_project(
+                root, gain=gain, ag_tag=self.ag_tag_var.get().strip() or "ag12",
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Template", str(exc))
+            return
+        messagebox.showinfo(
+            "Template created",
+            f"Folder tree and CAPTURE.md guides written under:\n{root}\n\n"
+            "Shoot your frames into the labelled folders, then click REFRESH.")
+        self._refresh()
+
+    def _build_gt(self):
+        from nsa.gt_capture import burst_folder_to_gt
+        root = Path(self.root_var.get().strip())
+        burst = filedialog.askdirectory(
+            title="Burst folder (sequential RAW frames)",
+            initialdir=str(root / "bursts") if (root / "bursts").is_dir() else str(root),
+        )
+        if not burst:
+            return
+        out = filedialog.asksaveasfilename(
+            title="Save ground-truth image",
+            defaultextension=".png",
+            initialdir=str(root / "clean_scenes"),
+            initialfile="gt_01.png",
+            filetypes=[("PNG", "*.png"), ("All", "*.*")],
+        )
+        if not out:
+            return
+        try:
+            manifest = burst_folder_to_gt(burst, out, min_frames=8)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Ground truth", str(exc))
+            return
+        messagebox.showinfo(
+            "Ground truth saved",
+            f"Averaged {manifest['frames_used']} frames →\n{manifest['output']}")
+        self._refresh()
+
+    def _open_wizard(self):
+        try:
+            NoiseDatasetWizard(self.app)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Noise wizard", str(exc))
+
+
 class NoiseDatasetWizard(tk.Toplevel):
     """5-phase IMX662 noise workflow: calibrate → synthesize PI_RAW dataset."""
 
@@ -969,8 +1308,15 @@ class NoiseDatasetWizard(tk.Toplevel):
         self.sensor_var = tk.StringVar(value="imx662")
         self.gain_var = tk.StringVar(value="256")
         self.temp_var = tk.StringVar()
-        self.clean_dir = tk.StringVar()
-        self.dataset_out = tk.StringVar(value=str(ROOT / "datasets" / "PI_RAW_sim"))
+        _proj = ROOT / "datasets" / "imx662_project"
+        self.clean_dir = tk.StringVar(
+            value=str(_proj / "clean_scenes") if (_proj / "clean_scenes").is_dir() else "")
+        self.calib_dir.set(
+            str(_proj / "calibration" / "imx662_gain256")
+            if (_proj / "calibration" / "imx662_gain256").is_dir() else "")
+        self.dataset_out = tk.StringVar(
+            value=str(_proj / "PI_RAW") if _proj.is_dir()
+            else str(ROOT / "datasets" / "PI_RAW_sim"))
         self.calib_json = tk.StringVar()
         self.ag_tag_var = tk.StringVar(value="ag12")
         self.layout_var = tk.StringVar(value="auto")
@@ -1990,8 +2336,16 @@ class App(tk.Tk):
 
         btn_row = tk.Frame(inner, bg=FIELD)
         btn_row.pack(fill="x")
+        RoundButton(btn_row, "DATASET STUDIO", self._open_data_studio,
+                    kind="primary", width=180, height=40).pack(side="left")
         RoundButton(btn_row, "NOISE DATASET WIZARD", self._open_noise_wizard,
-                    kind="primary", width=240, height=40).pack(side="left")
+                    kind="secondary", width=220, height=40).pack(side="left", padx=(S(8), 0))
+
+    def _open_data_studio(self):
+        try:
+            Imx662DataStudio(self)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Dataset Studio", str(exc))
 
     def _open_noise_wizard(self):
         try:
