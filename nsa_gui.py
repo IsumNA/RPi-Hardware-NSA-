@@ -28,6 +28,14 @@ except Exception:  # pragma: no cover
     Image = ImageTk = None
 
 
+def _choice_int(val, default: int) -> int:
+    """Coerce a ConfigRow / history value to int (comboboxes store strings)."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
 # -- Display scaling (readable text on Windows, Linux and macOS) ---------------
 # Windows: derive from the real DPI. Linux/macOS: ctypes.windll doesn't exist, so
 # we use a comfortable default (text was tiny before because it fell back to 1.0
@@ -936,6 +944,9 @@ class LiveView(tk.Toplevel):
                 self._worker.join(timeout=1.5)
         except Exception:  # noqa: BLE001
             pass
+        master = self.master
+        if getattr(master, "_live_view", None) is self:
+            master._live_view = None
         try:
             self.destroy()
         except Exception:  # noqa: BLE001
@@ -970,6 +981,7 @@ class App(tk.Tk):
         self.upload_files = []
         self.hf_model_id = None
         self.hf_weight = None
+        self._live_view = None          # in-app LiveView window (if open)
 
         self._build_chrome()
 
@@ -2263,7 +2275,7 @@ class App(tk.Tk):
             self.rows[key] = r
 
         cfgrow("base_channels", "Base Channels", "Network width",
-               [16, 32, 64], prev.get("base_channels", 32))
+               [16, 32, 64], _choice_int(prev.get("base_channels"), 32))
         depth_vals = [2, 4, 8]
         if fam == "rednet":
             depth_desc = "RED blocks per encoder stage (minimum 2)"
@@ -2279,7 +2291,9 @@ class App(tk.Tk):
         else:
             depth_desc = "Stack depth (conv blocks or residual groups)"
         cfgrow("block_depth", "Block Depth", depth_desc,
-               depth_vals, max(prev.get("block_depth", 4), 2 if fam == "rednet" else 0))
+               depth_vals,
+               max(_choice_int(prev.get("block_depth"), 4),
+                   2 if fam == "rednet" else 0))
 
         if fam == "nafnet":
             tk.Label(self.model_box,
@@ -3004,6 +3018,26 @@ class App(tk.Tk):
             missing_msg=("No models frozen yet. Search the Hub, then click "
                          "FREEZE on a model to lock its commit hash."))
 
+    def _stop_live_sessions(self):
+        """Close any in-app live window and kill a previous Pi live.py session."""
+        try:
+            from nsa.pi_remote import (load_pi_live_settings, should_use_pi_remote,
+                                       stop_live_on_pi, stop_local_ssh_session)
+            stop_local_ssh_session()
+            if should_use_pi_remote(ROOT):
+                s = load_pi_live_settings(ROOT)
+                stop_live_on_pi(str(s["ssh_host"]), str(s["repo"]))
+        except Exception:  # noqa: BLE001
+            pass
+        lv = getattr(self, "_live_view", None)
+        if lv is not None:
+            try:
+                if lv.winfo_exists():
+                    lv._on_close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._live_view = None
+
     def _live_test(self):
         """Live camera: Pi over SSH from AI server, local LiveView elsewhere."""
         if not (ROOT / "outputs" / "model.pt").exists():
@@ -3013,6 +3047,7 @@ class App(tk.Tk):
                 "Live testing will rebuild and quick-calibrate a model first "
                 "(a few seconds). Continue?"):
                 return
+        self._stop_live_sessions()
         try:
             from nsa.pi_remote import run_live_on_pi, should_use_pi_remote
             if should_use_pi_remote(ROOT):
@@ -3023,12 +3058,14 @@ class App(tk.Tk):
                         "Started live.py on the Pi's CSI camera over SSH.\n\n"
                         "The RAW | DENOISED window opens on the MONITOR "
                         "ATTACHED TO THE PI. Press q or ESC there to stop.\n\n"
+                        "If you click LIVE TEST again, the previous window is "
+                        "closed automatically.\n\n"
                         "AI-server SSH log: outputs/pi_live.log")
                     return
                 messagebox.showerror("Pi live testing", err)
                 return
             src = "opencv" if sys.platform.startswith("win") else "auto"
-            LiveView(self, source=src)
+            self._live_view = LiveView(self, source=src)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Live testing", str(exc))
 

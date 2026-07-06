@@ -8,11 +8,16 @@ When you compile on the AI server and click LIVE TEST in the GUI, this syncs
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from nsa.pi_camera import on_raspberry_pi
+
+# Local SSH process that is running live.py on the Pi (if any).
+_active_ssh: subprocess.Popen | None = None
 
 
 def load_pi_live_settings(project_root: Path | None = None) -> dict:
@@ -227,6 +232,53 @@ def sync_model_to_pi(project_root: Path, host: str, repo: str) -> str | None:
     return None
 
 
+def stop_local_ssh_session() -> None:
+    """Terminate the background SSH session we started for the last live test."""
+    global _active_ssh
+    proc = _active_ssh
+    _active_ssh = None
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if sys.platform != "win32":
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=3)
+    except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+        try:
+            if sys.platform != "win32":
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def stop_live_on_pi(host: str, repo: str | None = None) -> None:
+    """Kill any live.py still running on the Pi (camera + OpenCV window).
+
+    Starting a second live test without stopping the first leaves multiple
+    OpenCV windows on the Pi desktop; only the focused one receives key
+    input, so q/ESC appears to do nothing on the older window.
+    """
+    repo = (repo or "").rstrip("/")
+    # Match our launcher: python3 live.py --source … from the project repo.
+    kill = (
+        "pkill -TERM -f '[l]ive.py --source' 2>/dev/null || true; "
+        "sleep 0.4; "
+        "pkill -KILL -f '[l]ive.py --source' 2>/dev/null || true"
+    )
+    if repo:
+        kill = f"cd {repo} 2>/dev/null || true; {kill}"
+    try:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, kill],
+            capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def launch_pi_terminal(host: str, remote_cmd: str,
                        project_root: Path | None = None) -> str | None:
     """Start the remote live session as a detached background SSH process.
@@ -237,16 +289,24 @@ def launch_pi_terminal(host: str, remote_cmd: str,
     D-Bus ``org.gnome.Terminal`` timeout. SSH runs in the background and its
     output (live.py logs) is teed to ``outputs/pi_live.log``.
     """
+    global _active_ssh
     ssh_args = ["ssh", "-tt", host, remote_cmd]
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     log_path = root / "outputs" / "pi_live.log"
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         logf = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
-        subprocess.Popen(ssh_args, stdout=logf, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL)
+        popen_kw: dict = {
+            "stdout": logf,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+        }
+        if sys.platform != "win32":
+            popen_kw["start_new_session"] = True
+        _active_ssh = subprocess.Popen(ssh_args, **popen_kw)
         return None
     except OSError as exc:
+        _active_ssh = None
         return f"Could not start SSH session to {host}: {exc}"
 
 
@@ -267,6 +327,12 @@ def run_live_on_pi(project_root: Path | None = None) -> str | None:
     err = sync_model_to_pi(root, host, repo)
     if err:
         return err
+
+    # Stop any previous live session so the camera and keyboard aren't stuck
+    # on an old OpenCV window.
+    stop_local_ssh_session()
+    stop_live_on_pi(host, repo)
+    time.sleep(0.2)
 
     remote_cmd = remote_live_shell_command(repo, source, display, venv)
     return launch_pi_terminal(host, remote_cmd, project_root=root)

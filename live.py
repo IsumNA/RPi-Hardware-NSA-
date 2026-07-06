@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -876,9 +877,24 @@ def main() -> int:
     if not args.stream:
         try:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            # Raise once so a restarted session steals focus from any stale window.
+            try:
+                cv2.setWindowProperty(win, cv2.WND_PROP_TOPMOST, 1)
+                cv2.setWindowProperty(win, cv2.WND_PROP_TOPMOST, 0)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             headless = True
             log("No display available — will save a sample composite instead.", "warn")
+
+    stop = False
+
+    def _request_stop(signum, _frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
 
     add_noise = max(0.0, float(args.add_noise))
     last_noise = add_noise if add_noise > 0 else 20.0   # toggle-back default
@@ -894,7 +910,7 @@ def main() -> int:
     t_start = t_prev
     saved = None
     try:
-        while True:
+        while not stop:
             raw = cam.read()
             if raw is None:
                 log("Camera returned no frame — stopping.", "warn")
