@@ -953,6 +953,427 @@ class LiveView(tk.Toplevel):
             pass
 
 
+class NoiseDatasetWizard(tk.Toplevel):
+    """5-phase IMX662 noise workflow: calibrate → synthesize PI_RAW dataset."""
+
+    def __init__(self, master):
+        super().__init__(master, bg=WHITE)
+        self.app = master
+        self.title("NAS  ·  Noise dataset builder")
+        self.configure(bg=WHITE)
+        self._step = 0
+        self._busy = False
+
+        self.calib_dir = tk.StringVar()
+        self.model_out = tk.StringVar(value=str(ROOT / "models" / "noise" / "imx662_gain256.json"))
+        self.sensor_var = tk.StringVar(value="imx662")
+        self.gain_var = tk.StringVar(value="256")
+        self.temp_var = tk.StringVar()
+        self.clean_dir = tk.StringVar()
+        self.dataset_out = tk.StringVar(value=str(ROOT / "datasets" / "PI_RAW_sim"))
+        self.calib_json = tk.StringVar()
+        self.ag_tag_var = tk.StringVar(value="ag12")
+        self.layout_var = tk.StringVar(value="auto")
+        self.temporal_var = tk.StringVar(value="64")
+        self.write_config_var = tk.BooleanVar(value=True)
+        self.use_legacy_var = tk.BooleanVar(value=False)
+
+        self._build_chrome()
+        self._show_step(0)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.transient(master)
+        try:
+            self.geometry(f"{S(720)}x{S(640)}+{master.winfo_rootx()+S(40)}"
+                          f"+{master.winfo_rooty()+S(30)}")
+        except Exception:  # noqa: BLE001
+            pass
+        master._grab_when_ready(self)
+
+    def _build_chrome(self):
+        pad = S(24)
+        header = tk.Frame(self, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(16), S(4)))
+        tk.Label(header, text="Build training dataset", bg=WHITE, fg=INK,
+                 font=font(17, "bold")).pack(anchor="w")
+        self.step_lbl = tk.Label(
+            header,
+            text="Step 1 of 2  ·  Phases 1–4: calibrate IMX662 noise model",
+            bg=WHITE, fg=SUBTLE, font=font(10))
+        self.step_lbl.pack(anchor="w", pady=(S(2), 0))
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(8), 0))
+
+        self.body = tk.Frame(self, bg=WHITE)
+        self.body.pack(fill="both", expand=True, padx=pad, pady=(S(8), 0))
+
+        self.page_calib = tk.Frame(self.body, bg=WHITE)
+        self.page_synth = tk.Frame(self.body, bg=WHITE)
+        self._build_calib_page(self.page_calib)
+        self._build_synth_page(self.page_synth)
+
+        log_fr = tk.Frame(self, bg=FIELD)
+        log_fr.pack(fill="x", padx=pad, pady=(S(6), 0))
+        self.status_lbl = tk.Label(log_fr, text="Ready.", bg=FIELD, fg=SUBTLE,
+                                   font=font(9), wraplength=S(640), justify="left")
+        self.status_lbl.pack(anchor="w", padx=S(10), pady=S(8))
+
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(6), 0))
+        foot = tk.Frame(self, bg=WHITE)
+        foot.pack(fill="x", padx=pad, pady=S(12))
+        self.back_btn = RoundButton(foot, "BACK", self._prev_step, kind="secondary",
+                                    width=100, height=38)
+        self.back_btn.pack(side="left")
+        self.next_btn = RoundButton(foot, "NEXT", self._next_step, kind="secondary",
+                                    width=100, height=38)
+        self.next_btn.pack(side="left", padx=(S(6), 0))
+        self.run_btn = RoundButton(foot, "RUN", self._run_current, kind="primary",
+                                   width=140, height=38)
+        self.run_btn.pack(side="right")
+        self.all_btn = RoundButton(foot, "RUN ALL", self._run_all, kind="primary",
+                                   width=120, height=38)
+        self.all_btn.pack(side="right", padx=(0, S(6)))
+
+    def _path_row(self, parent, label, var, browse_cmd):
+        row = tk.Frame(parent, bg=WHITE)
+        row.pack(fill="x", pady=S(4))
+        row.columnconfigure(1, weight=1)
+        tk.Label(row, text=label, bg=WHITE, fg=INK, font=font(10, "bold"),
+                 width=16, anchor="w").grid(row=0, column=0, sticky="w")
+        ent = ttk.Entry(row, textvariable=var, font=font(10))
+        ent.grid(row=0, column=1, sticky="ew", padx=(S(4), S(4)))
+        RoundButton(row, "…", browse_cmd, kind="secondary",
+                    width=44, height=30).grid(row=0, column=2)
+
+    def _build_calib_page(self, parent):
+        tk.Label(
+            parent,
+            text=("Organise Phase-1 captures: bias/ (lens capped, min exposure), "
+                  "dark/ (lens capped, normal exposure), flat/level_XX/ pairs "
+                  "at 10–15 brightness levels. Repeat per gain and temperature."),
+            bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(620),
+            justify="left").pack(anchor="w", pady=(0, S(10)))
+        self._path_row(parent, "Calibration folder", self.calib_dir, self._browse_calib)
+        self._path_row(parent, "Noise model JSON", self.model_out, self._browse_model_out)
+
+        opts = tk.Frame(parent, bg=WHITE)
+        opts.pack(fill="x", pady=(S(8), 0))
+        tk.Label(opts, text="Sensor", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+        ttk.Combobox(opts, textvariable=self.sensor_var, width=10,
+                     values=["imx662", "imx219", "imxng"], state="readonly",
+                     style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
+        tk.Label(opts, text="Gain", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+        ttk.Combobox(opts, textvariable=self.gain_var, width=6,
+                     values=["256", "512"], state="readonly",
+                     style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
+        tk.Label(opts, text="Temp °C", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+        ttk.Entry(opts, textvariable=self.temp_var, width=6, font=font(10)).pack(side="left",
+                                                                                  padx=(S(8), 0))
+
+    def _build_synth_page(self, parent):
+        tk.Label(
+            parent,
+            text=("Phase 5: inject calibrated noise on clean ground-truth images "
+                  "and write PI_RAW/Data/<scene>/<sensor_test>/noisy.png + gt.png."),
+            bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(620),
+            justify="left").pack(anchor="w", pady=(0, S(10)))
+        self._path_row(parent, "Clean images", self.clean_dir, self._browse_clean)
+        self._path_row(parent, "Calibration JSON", self.calib_json, self._browse_calib_json)
+        self._path_row(parent, "Output PI_RAW", self.dataset_out, self._browse_dataset_out)
+
+        opts = tk.Frame(parent, bg=WHITE)
+        opts.pack(fill="x", pady=(S(8), 0))
+        tk.Label(opts, text="Layout", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+        ttk.Combobox(opts, textvariable=self.layout_var, width=8,
+                     values=["auto", "flat", "scenes"], state="readonly",
+                     style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(12)))
+        tk.Label(opts, text="AG tag", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+        ttk.Entry(opts, textvariable=self.ag_tag_var, width=8, font=font(10)).pack(
+            side="left", padx=(S(8), S(12)))
+        tk.Label(opts, text="GT frames", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
+        ttk.Entry(opts, textvariable=self.temporal_var, width=6, font=font(10)).pack(
+            side="left", padx=(S(8), 0))
+
+        tk.Checkbutton(
+            parent, text="  Update config.yaml to use the new dataset",
+            variable=self.write_config_var, bg=WHITE, fg=INK, selectcolor=WHITE,
+            activebackground=WHITE, font=font(10)).pack(anchor="w", pady=(S(8), 0))
+        tk.Checkbutton(
+            parent, text="  Skip calibration — use datasheet noise model (legacy)",
+            variable=self.use_legacy_var, bg=WHITE, fg=INK, selectcolor=WHITE,
+            activebackground=WHITE, font=font(10),
+            command=self._on_legacy_toggle).pack(anchor="w", pady=(S(4), 0))
+
+    def _on_legacy_toggle(self):
+        if self.use_legacy_var.get():
+            self.calib_json.set("")
+
+    def _show_step(self, step: int):
+        self._step = max(0, min(step, 1))
+        self.page_calib.pack_forget()
+        self.page_synth.pack_forget()
+        if self._step == 0:
+            self.page_calib.pack(fill="both", expand=True)
+            self.step_lbl.config(
+                text="Step 1 of 2  ·  Phases 1–4: calibrate IMX662 noise model")
+            self.run_btn.set_text("CALIBRATE")
+        else:
+            self.page_synth.pack(fill="both", expand=True)
+            if not self.calib_json.get() and self.model_out.get():
+                self.calib_json.set(self.model_out.get())
+            self.step_lbl.config(
+                text="Step 2 of 2  ·  Phase 5: synthesize PI_RAW training pairs")
+            self.run_btn.set_text("BUILD DATASET")
+        self.back_btn.set_enabled(self._step > 0)
+
+    def _prev_step(self):
+        self._show_step(self._step - 1)
+
+    def _next_step(self):
+        self._show_step(self._step + 1)
+
+    def _set_status(self, text: str, ok: bool = False):
+        self.status_lbl.config(text=text, fg=GREEN if ok else SUBTLE)
+
+    def _browse_calib(self):
+        p = filedialog.askdirectory(title="Phase-1 calibration folder (bias/dark/flat)")
+        if p:
+            self.calib_dir.set(p)
+
+    def _browse_model_out(self):
+        p = filedialog.asksaveasfilename(
+            title="Save noise model JSON",
+            defaultextension=".json",
+            initialfile=Path(self.model_out.get() or "imx662.json").name,
+            initialdir=str(ROOT / "models" / "noise"),
+            filetypes=[("JSON", "*.json")])
+        if p:
+            self.model_out.set(p)
+
+    def _browse_clean(self):
+        p = filedialog.askdirectory(title="Folder of clean ground-truth images")
+        if p:
+            self.clean_dir.set(p)
+
+    def _browse_calib_json(self):
+        p = filedialog.askopenfilename(
+            title="Calibrated noise model JSON",
+            initialdir=str(ROOT / "models" / "noise"),
+            filetypes=[("JSON", "*.json")])
+        if p:
+            self.calib_json.set(p)
+            self.use_legacy_var.set(False)
+
+    def _browse_dataset_out(self):
+        p = filedialog.askdirectory(title="Output PI_RAW dataset root")
+        if p:
+            self.dataset_out.set(p)
+
+    def _set_busy(self, on: bool):
+        self._busy = on
+        self.run_btn.set_enabled(not on)
+        self.all_btn.set_enabled(not on)
+
+    def _run_current(self):
+        if self._step == 0:
+            self._run_calibrate()
+        else:
+            self._run_synthesize()
+
+    def _run_calibrate(self):
+        if self._busy:
+            return
+        calib = self.calib_dir.get().strip()
+        out = self.model_out.get().strip()
+        if not calib or not Path(calib).is_dir():
+            messagebox.showerror("Calibrate", "Pick a calibration folder (bias/dark/flat).")
+            return
+        if not out:
+            messagebox.showerror("Calibrate", "Choose where to save the noise model JSON.")
+            return
+        temp = self.temp_var.get().strip()
+        temp_c = float(temp) if temp else None
+
+        def work():
+            try:
+                from nsa.noise_calib import run_calibration_pipeline
+                model, validation = run_calibration_pipeline(
+                    calib, out,
+                    sensor=self.sensor_var.get(),
+                    gain=int(self.gain_var.get()),
+                    temperature_c=temp_c,
+                )
+                ok = validation.get("ok", True)
+                msg = (f"Calibration saved → {out}\n"
+                       f"shot a={model.shot_a:.4g}  read={model.read_dist.kind}  "
+                       f"validation={'PASS' if ok else 'CHECK'}")
+                self.after(0, lambda: self._calibrate_done(out, msg, ok))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self._calibrate_fail(str(exc)))
+
+        self._set_busy(True)
+        self._set_status("Running Phases 2–4 (extract → fit → validate)…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _calibrate_done(self, out: str, msg: str, ok: bool):
+        self._set_busy(False)
+        self.calib_json.set(out)
+        self._set_status(msg, ok=ok)
+        if ok:
+            messagebox.showinfo("Calibration complete", msg + "\n\nClick Next to build the dataset.")
+        else:
+            messagebox.showwarning("Calibration finished with warnings", msg)
+
+    def _calibrate_fail(self, err: str):
+        self._set_busy(False)
+        self._set_status(f"Calibration failed: {err}")
+        messagebox.showerror("Calibration failed", err)
+
+    def _run_synthesize(self):
+        if self._busy:
+            return
+        clean = self.clean_dir.get().strip()
+        out = self.dataset_out.get().strip()
+        if not clean or not Path(clean).is_dir():
+            messagebox.showerror("Build dataset", "Pick a folder of clean images.")
+            return
+        if not out:
+            messagebox.showerror("Build dataset", "Choose an output PI_RAW folder.")
+            return
+        calib = self.calib_json.get().strip() or None
+        if not self.use_legacy_var.get() and not calib:
+            messagebox.showerror("Build dataset",
+                                 "Pick a calibration JSON or enable legacy datasheet noise.")
+            return
+        if calib and not Path(calib).is_file():
+            messagebox.showerror("Build dataset", f"Calibration file not found:\n{calib}")
+            return
+        try:
+            temporal = max(1, int(self.temporal_var.get() or "64"))
+        except ValueError:
+            temporal = 64
+
+        def work():
+            try:
+                from nsa.dataset_sim import build_dataset
+                manifest = build_dataset(
+                    clean, out,
+                    sensor=self.sensor_var.get(),
+                    gain=int(self.gain_var.get()),
+                    layout=self.layout_var.get(),
+                    ag_tag=self.ag_tag_var.get().strip() or None,
+                    temporal_frames=temporal,
+                    calibration=None if self.use_legacy_var.get() else calib,
+                    overwrite=True,
+                )
+                if self.write_config_var.get():
+                    from nsa.denoise_hw_data import patch_config_dataset
+                    patch_config_dataset(ROOT / "config.yaml", Path(out))
+                n = manifest.get("pairs_written", 0)
+                wf = manifest.get("workflow", "")
+                self.after(0, lambda: self._synth_done(out, n, wf))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self._synth_fail(str(exc)))
+
+        self._set_busy(True)
+        self._set_status("Phase 5: synthesizing noisy/gt pairs…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _synth_done(self, out: str, pairs: int, workflow: str):
+        self._set_busy(False)
+        msg = f"Wrote {pairs} pair(s) → {out}  ({workflow})"
+        self._set_status(msg, ok=True)
+        self.app.dataset_path = out
+        if hasattr(self.app, "dataset_label"):
+            self.app.dataset_label.config(text=out, fg=GREEN)
+        self.app.source_var.set("real")
+        self.app._on_source_change()
+        messagebox.showinfo(
+            "Dataset ready",
+            msg + "\n\nconfig.yaml updated. Use Real captures + Extended training to compile.")
+        self._show_step(1)
+
+    def _synth_fail(self, err: str):
+        self._set_busy(False)
+        self._set_status(f"Build failed: {err}")
+        messagebox.showerror("Build dataset failed", err)
+
+    def _run_all(self):
+        if self._busy:
+            return
+        if self.use_legacy_var.get():
+            if not self.clean_dir.get().strip():
+                messagebox.showinfo("Run all", "Set the clean images folder on Step 2.")
+                self._show_step(1)
+                return
+            self._run_synthesize()
+            return
+        if not self.calib_dir.get().strip():
+            messagebox.showinfo("Run all", "Set the calibration folder on Step 1 first.")
+            self._show_step(0)
+            return
+        if not self.clean_dir.get().strip():
+            messagebox.showinfo("Run all", "Set the clean images folder on Step 2 first.")
+            self._show_step(1)
+            return
+
+        def chain():
+            try:
+                from nsa.noise_calib import run_calibration_pipeline
+                from nsa.dataset_sim import build_dataset
+                from nsa.denoise_hw_data import patch_config_dataset
+
+                calib = self.calib_dir.get().strip()
+                out_model = self.model_out.get().strip()
+                temp = self.temp_var.get().strip()
+                temp_c = float(temp) if temp else None
+                self.after(0, lambda: self._set_status("Phases 1–4: calibrating…"))
+                _model, validation = run_calibration_pipeline(
+                    calib, out_model,
+                    sensor=self.sensor_var.get(),
+                    gain=int(self.gain_var.get()),
+                    temperature_c=temp_c,
+                )
+                self.after(0, lambda: self.calib_json.set(out_model))
+                clean = self.clean_dir.get().strip()
+                out_ds = self.dataset_out.get().strip()
+                temporal = max(1, int(self.temporal_var.get() or "64"))
+                self.after(0, lambda: self._set_status("Phase 5: building dataset…"))
+                manifest = build_dataset(
+                    clean, out_ds,
+                    sensor=self.sensor_var.get(),
+                    gain=int(self.gain_var.get()),
+                    layout=self.layout_var.get(),
+                    ag_tag=self.ag_tag_var.get().strip() or None,
+                    temporal_frames=temporal,
+                    calibration=out_model,
+                    overwrite=True,
+                )
+                if self.write_config_var.get():
+                    patch_config_dataset(ROOT / "config.yaml", Path(out_ds))
+                n = manifest.get("pairs_written", 0)
+                ok = validation.get("ok", True)
+                self.after(0, lambda: self._all_done(out_ds, n, ok))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self._synth_fail(str(exc)))
+
+        self._set_busy(True)
+        threading.Thread(target=chain, daemon=True).start()
+
+    def _all_done(self, out: str, pairs: int, calib_ok: bool):
+        self._set_busy(False)
+        msg = f"Pipeline complete — {pairs} pair(s) at {out}"
+        self._set_status(msg, ok=calib_ok)
+        self.app.dataset_path = out
+        if hasattr(self.app, "dataset_label"):
+            self.app.dataset_label.config(text=out, fg=GREEN)
+        self.app.source_var.set("real")
+        self.app._on_source_change()
+        if calib_ok:
+            messagebox.showinfo("Noise dataset ready", msg)
+        else:
+            messagebox.showwarning("Dataset built (check calibration)",
+                                   msg + "\n\nPhase-4 validation had warnings — review the model.")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1208,6 +1629,7 @@ class App(tk.Tk):
         home_body = self._make_scrollable(self._home)
 
         self._build_goal_card(home_body)
+        self._build_noise_dataset_card(home_body)
 
         tk.Label(home_body, text="Compile with your current settings",
                  bg=WHITE, fg=INK, font=font(15, "bold")).pack(anchor="w",
@@ -1544,6 +1966,38 @@ class App(tk.Tk):
         btnrow.pack(fill="x", pady=(S(10), 0))
         RoundButton(btnrow, "FIND BEST MODEL", self._goal_search, kind="primary",
                     width=200, height=42).pack(side="right")
+
+    def _build_noise_dataset_card(self, parent):
+        """Home card: 5-phase IMX662 noise calibration → PI_RAW dataset builder."""
+        card = tk.Frame(parent, bg=FIELD, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=LINE)
+        card.pack(fill="x", pady=(S(4), S(16)))
+        inner = tk.Frame(card, bg=FIELD)
+        inner.pack(fill="x", padx=S(16), pady=S(14))
+
+        head = tk.Frame(inner, bg=FIELD)
+        head.pack(fill="x")
+        tk.Label(head, text="DATA", bg=RASPBERRY, fg=WHITE,
+                 font=font(8, "bold"), padx=S(6), pady=S(1)).pack(side="left")
+        tk.Label(head, text="  Build training dataset from clean images",
+                 bg=FIELD, fg=INK, font=font(14, "bold")).pack(side="left")
+        tk.Label(
+            inner,
+            text=("5-phase IMX662 workflow: calibrate on bias/dark/flat captures, "
+                  "then synthesize noisy+gt pairs in PI_RAW layout for extended training."),
+            bg=FIELD, fg=SUBTLE, font=font(9), wraplength=S(600),
+            justify="left").pack(anchor="w", pady=(S(4), S(10)))
+
+        btn_row = tk.Frame(inner, bg=FIELD)
+        btn_row.pack(fill="x")
+        RoundButton(btn_row, "NOISE DATASET WIZARD", self._open_noise_wizard,
+                    kind="primary", width=240, height=40).pack(side="left")
+
+    def _open_noise_wizard(self):
+        try:
+            NoiseDatasetWizard(self)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Noise dataset wizard", str(exc))
 
     _GOAL_HW = {
         "hailo": "hailo8", "hailo8": "hailo8", "hailo-8": "hailo8",

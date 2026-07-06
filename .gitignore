@@ -16,6 +16,8 @@ third_party/
 
 # Frozen Hugging Face snapshots (pinned model weights, can be large)
 models/frozen/
+models/noise/*.json
+models/noise/*.validation.json
 
 # Remembered GUI wizard settings (per-machine, not shared)
 .nsa_gui_state.json
