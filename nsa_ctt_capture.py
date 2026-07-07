@@ -36,6 +36,7 @@ Example
 from __future__ import annotations
 
 import argparse
+import shlex
 import shutil
 import subprocess
 import sys
@@ -183,6 +184,118 @@ class CTTClient:
 
 
 # --------------------------------------------------------------------------- #
+#  SSH — reach the Pi and auto-start the CTT server if it isn't running
+# --------------------------------------------------------------------------- #
+# accept-new trusts a new host key once (so a fresh Pi doesn't hard-fail);
+# BatchMode fails fast instead of hanging on a password prompt (use key auth).
+SSH_OPTS = ["-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+
+def _ssh_cmd(ssh: str, inner: str) -> list[str]:
+    """An ssh argv that runs ``inner`` in a NON-login shell on the Pi.
+
+    A login shell (``bash -lc``) would source the Pi's profile — which on
+    Raspberry Pi OS prints a password-warning banner to stdout that pollutes
+    command output. We use ``bash -c`` and rely on explicit paths / discovery
+    instead of the login PATH.
+    """
+    return ["ssh", *SSH_OPTS, ssh, f"bash -c {shlex.quote(inner)}"]
+
+
+def _discover_ctt_server(ssh: str) -> str | None:
+    """Locate the ctt-server executable on the Pi (usually a venv console script).
+
+    Checks the common venv/user-bin spots, then falls back to a shallow find —
+    so the user doesn't have to know it lives in e.g. ~/ctt-venv/bin.
+    """
+    probe = (
+        "for p in ~/ctt-venv/bin/ctt-server ~/.local/bin/ctt-server "
+        "~/venv/bin/ctt-server ~/env/bin/ctt-server ~/.venv/bin/ctt-server "
+        "/usr/local/bin/ctt-server; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; "
+        "find ~ -maxdepth 4 -name ctt-server -type f 2>/dev/null | head -1"
+    )
+    res = subprocess.run(_ssh_cmd(ssh, probe), capture_output=True, text=True)
+    # Guard against stray shell output: only accept an absolute path to ctt-server.
+    for ln in res.stdout.splitlines():
+        ln = ln.strip()
+        if ln.startswith("/") and ln.endswith("ctt-server"):
+            return ln
+    return None
+
+
+def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-server",
+                  port: int = 5000, workspace: str | None = None,
+                  autostart: bool = True, wait_s: float = 45.0,
+                  status: Callable[[str], None] = lambda _m: None) -> str:
+    """Make sure the CTT server is answering; SSH in and start it if not.
+
+    Returns "running" (already up), "started" (we launched it), and raises
+    CTTError with an actionable message otherwise.
+    """
+    try:
+        client.health()
+        return "running"
+    except CTTError:
+        pass  # not reachable yet
+
+    if not autostart:
+        raise CTTError(f"CTT server at {client.base} is not responding "
+                       "(auto-start is off).")
+    if not ssh:
+        raise CTTError("CTT server is not reachable and no SSH target is set to "
+                       "start it. Set the Pi SSH target (e.g. pi@10.3.195.212).")
+    if shutil.which("ssh") is None:
+        raise CTTError("ssh was not found on PATH on this machine.")
+
+    # If the given command isn't directly runnable (common when it's a venv
+    # console script off the login PATH), auto-discover its real location.
+    # Skipped for compound commands like 'source …/activate && ctt-server'.
+    if all(tok not in ctt_cmd for tok in ("&&", ";", "|", " ")):
+        chk = subprocess.run(_ssh_cmd(ssh, f"command -v {shlex.quote(ctt_cmd)}"),
+                             capture_output=True, text=True)
+        if chk.returncode != 0:
+            discovered = _discover_ctt_server(ssh)
+            if discovered:
+                status(f"Located ctt-server at {discovered}")
+                ctt_cmd = discovered
+            else:
+                raise CTTError(
+                    f"'{ctt_cmd}' is not on the Pi and could not be found in the "
+                    "usual venv locations. Give the full path (e.g. "
+                    "~/ctt-venv/bin/ctt-server) or a command like "
+                    "'source ~/ctt-venv/bin/activate && ctt-server'."
+                    + (f"\n(ssh error: {chk.stderr.strip()})" if chk.stderr.strip() else ""))
+
+    status(f"Starting {ctt_cmd} on {ssh} …")
+    full = f"{ctt_cmd} --host 0.0.0.0 --port {int(port)}"
+    if workspace:
+        full += f" --workspace {shlex.quote(workspace)}"
+    # setsid+nohup+</dev/null fully detaches so the ssh call returns immediately
+    # while the server keeps running; output goes to a log on the Pi.
+    launch = f"setsid nohup {full} > ~/ctt-server.log 2>&1 < /dev/null & echo LAUNCHED"
+    res = subprocess.run(_ssh_cmd(ssh, launch), capture_output=True, text=True, timeout=25)
+    if res.returncode != 0 or "LAUNCHED" not in res.stdout:
+        raise CTTError("Could not start ctt-server over SSH: "
+                       + (res.stderr.strip() or res.stdout.strip() or "unknown error"))
+
+    deadline = time.time() + wait_s
+    last = ""
+    while time.time() < deadline:
+        time.sleep(2.0)
+        try:
+            client.health()
+            status("ctt-server is up.")
+            return "started"
+        except CTTError as exc:
+            last = str(exc)
+            status(f"Waiting for ctt-server to come up… "
+                   f"({max(0, int(deadline - time.time()))}s left)")
+    raise CTTError(f"ctt-server did not respond within {int(wait_s)}s — check "
+                   f"~/ctt-server.log on the Pi. Last error: {last}")
+
+
+# --------------------------------------------------------------------------- #
 #  Transfer backends — get the raw DNGs from the Pi onto this machine
 # --------------------------------------------------------------------------- #
 class Transfer:
@@ -213,7 +326,8 @@ class RsyncTransfer(Transfer):
 
     def _sync(self) -> None:
         cmd = [
-            "rsync", "-az", "--include=*/", "--include=*.dng", "--exclude=*",
+            "rsync", "-az", "-e", "ssh " + " ".join(SSH_OPTS),
+            "--include=*/", "--include=*.dng", "--exclude=*",
             f"{self.ssh}:{self.remote}", f"{self.mirror}/",
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -655,9 +769,17 @@ def main() -> int:
     # Transfer
     p.add_argument("--transfer", choices=("rsync", "archive"), default=None,
                    help="how to pull DNGs (default: rsync if --pi-ssh given, else archive)")
-    p.add_argument("--pi-ssh", default=None, help="ssh target for rsync, e.g. pi@10.3.195.212")
+    p.add_argument("--pi-ssh", default=None,
+                   help="ssh target for rsync + auto-start, e.g. pi@10.3.195.212")
     p.add_argument("--pi-workspace", default="~/ctt-server-workspace",
                    help="CTT workspace root on the Pi (CTT_CAPTURE_WORKSPACE)")
+    p.add_argument("--pi-ctt-cmd", default="ctt-server",
+                   help="command to launch the CTT server on the Pi "
+                        "(auto-discovered in common venvs if not on PATH)")
+    p.add_argument("--no-autostart", action="store_true",
+                   help="do not SSH in to start ctt-server if it isn't already running")
+    p.add_argument("--autostart-wait", type=float, default=45.0,
+                   help="seconds to wait for ctt-server to come up after launching")
     # Behaviour
     p.add_argument("--run-post", action="store_true",
                    help="also run calibrate_noise / capture_gt / simulate_dataset")
@@ -679,6 +801,17 @@ def main() -> int:
 
     controls_range: dict = {}
     if not args.dry_run:
+        # Make sure the server is up — SSH in and start it if needed.
+        try:
+            state = ensure_server(
+                client, ssh=args.pi_ssh, ctt_cmd=args.pi_ctt_cmd, port=args.port,
+                workspace=args.pi_workspace, autostart=not args.no_autostart,
+                wait_s=args.autostart_wait, status=lambda m: log(m, "info"))
+            if state == "started":
+                log("Auto-started ctt-server on the Pi.", "ok")
+        except CTTError as exc:
+            log(str(exc), "err")
+            return 2
         try:
             h = client.health()
         except CTTError as exc:

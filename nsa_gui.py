@@ -1840,6 +1840,8 @@ class CttCaptureWizard(tk.Toplevel):
         self.transfer_var = tk.StringVar(value="archive")
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
+        self.autostart_var = tk.BooleanVar(value=True)
+        self.cttcmd_var = tk.StringVar(value="ctt-server")
 
         self._build_chrome()
         self._show_connect()
@@ -1964,6 +1966,18 @@ class CttCaptureWizard(tk.Toplevel):
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(6), 0))
 
+        # Auto-start: SSH in and launch ctt-server if it isn't already running.
+        asr = tk.Frame(parent, bg=WHITE)
+        asr.pack(fill="x", pady=(S(10), 0))
+        tk.Checkbutton(
+            asr, text="  Auto-start ctt-server on the Pi via SSH if it's not running",
+            variable=self.autostart_var, bg=WHITE, fg=INK, selectcolor=WHITE,
+            activebackground=WHITE, font=font(10)).pack(side="left")
+        tk.Label(asr, text="CTT command", bg=WHITE, fg=INK,
+                 font=font(10)).pack(side="left", padx=(S(12), S(6)))
+        ttk.Entry(asr, textvariable=self.cttcmd_var, width=24, font=font(10)).pack(
+            side="left")
+
     def _build_station_page(self, parent):
         cols = tk.Frame(parent, bg=WHITE)
         cols.pack(fill="both", expand=True)
@@ -2063,6 +2077,14 @@ class CttCaptureWizard(tk.Toplevel):
         from nsa.dataset_layout import resolve_layout, scaffold_imx662_project
         args = self._args_namespace()
 
+        ssh = self.ssh_var.get().strip() or None
+        autostart = bool(self.autostart_var.get())
+        ctt_cmd = self.cttcmd_var.get().strip() or "ctt-server"
+        workspace = self.workspace_var.get().strip() or None
+
+        def status(msg):
+            self.after(0, lambda: self._set_status(msg))
+
         def work():
             try:
                 project_root, _ = resolve_layout(self.root_var.get().strip())
@@ -2071,6 +2093,10 @@ class CttCaptureWizard(tk.Toplevel):
                     scenes=tuple(args.scenes),
                     flat_levels=max(2, args.flat_levels))
                 client = self.backend.CTTClient(host, port)
+                # SSH in and start ctt-server if it isn't answering yet.
+                self.backend.ensure_server(
+                    client, ssh=ssh, ctt_cmd=ctt_cmd, port=port,
+                    workspace=workspace, autostart=autostart, status=status)
                 h = client.health()
                 if not h.get("camera"):
                     raise self.backend.CTTError(
