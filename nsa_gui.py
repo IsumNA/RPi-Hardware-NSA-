@@ -1788,6 +1788,569 @@ class NoiseDatasetWizard(tk.Toplevel):
                                    msg + "\n\nPhase-4 validation had warnings — review the model.")
 
 
+class CttCaptureWizard(tk.Toplevel):
+    """Guided **Camera Tuning Tool → NSA** capture.
+
+    Drives a Raspberry Pi CTT server over its HTTP API station-by-station
+    (bias → dark → flat levels → scene bursts), shows a live preview + readback
+    so you can set up the rig, fires each burst, pulls the DNGs back, and files
+    them into the NSA calibration + bursts layout. A thin GUI over the tested
+    ``nsa_ctt_capture`` backend; captures run on worker threads so the window
+    stays responsive.
+    """
+
+    PANEL_W = 430
+    PANEL_H = 250
+
+    def __init__(self, master):
+        super().__init__(master, bg=WHITE)
+        self.app = master
+        self.title("NAS  ·  Camera capture")
+        self.configure(bg=WHITE)
+
+        import types
+        import nsa_ctt_capture as backend
+        from nsa.dataset_layout import MANAGER_SCENES
+        self.backend = backend
+        self._types = types
+
+        self._client = None
+        self._transfer = None
+        self._plan: list = []
+        self._idx = 0
+        self._recorded: list = []
+        self._project_root = None
+        self._controls_range: dict = {}
+        self._busy = False
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest_jpeg = None
+        self._imgs = {}
+
+        # Connection / plan parameters.
+        self.host_var = tk.StringVar(value="10.3.195.212")
+        self.port_var = tk.StringVar(value="5000")
+        self.project_var = tk.StringVar(value="imx662")
+        self.root_var = tk.StringVar(value=str(ROOT / "datasets" / "imx662_project"))
+        self.gain_var = tk.StringVar(value="256")
+        self.again_var = tk.StringVar(value="16")
+        self.flatlevels_var = tk.StringVar(value="12")
+        self.burst_var = tk.StringVar(value="48")
+        self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
+        self.transfer_var = tk.StringVar(value="archive")
+        self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
+        self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
+
+        self._build_chrome()
+        self._show_connect()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.transient(master)
+        try:
+            self.geometry(f"{S(940)}x{S(720)}+{master.winfo_rootx()+S(30)}"
+                          f"+{master.winfo_rooty()+S(20)}")
+        except Exception:  # noqa: BLE001
+            pass
+        self.minsize(S(820), S(600))
+        master._grab_when_ready(self)
+        self.after(100, self._paint)
+
+    # -- chrome --------------------------------------------------------------
+    def _build_chrome(self):
+        pad = S(24)
+        header = tk.Frame(self, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(16), S(4)))
+        tk.Label(header, text="Camera capture", bg=WHITE, fg=INK,
+                 font=font(17, "bold")).pack(anchor="w")
+        self.step_lbl = tk.Label(
+            header, text="Connect to the CTT server on the Pi",
+            bg=WHITE, fg=SUBTLE, font=font(10))
+        self.step_lbl.pack(anchor="w", pady=(S(2), 0))
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(8), 0))
+
+        self.body = tk.Frame(self, bg=WHITE)
+        self.body.pack(fill="both", expand=True, padx=pad, pady=(S(8), 0))
+        self.page_connect = tk.Frame(self.body, bg=WHITE)
+        self.page_station = tk.Frame(self.body, bg=WHITE)
+        self._build_connect_page(self.page_connect)
+        self._build_station_page(self.page_station)
+
+        log_fr = tk.Frame(self, bg=FIELD)
+        log_fr.pack(fill="x", padx=pad, pady=(S(6), 0))
+        self.status_lbl = tk.Label(log_fr, text="Ready.", bg=FIELD, fg=SUBTLE,
+                                   font=font(9), wraplength=S(880), justify="left")
+        self.status_lbl.pack(anchor="w", padx=S(10), pady=S(8))
+
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(6), 0))
+        foot = tk.Frame(self, bg=WHITE)
+        foot.pack(fill="x", padx=pad, pady=S(12))
+        self.back_btn = RoundButton(foot, "BACK", self._prev_station,
+                                    kind="secondary", width=100, height=38)
+        self.back_btn.pack(side="left")
+        self.skip_btn = RoundButton(foot, "SKIP", self._skip_station,
+                                    kind="secondary", width=100, height=38)
+        self.skip_btn.pack(side="left", padx=(S(6), 0))
+        self.connect_btn = RoundButton(foot, "CONNECT", self._connect,
+                                       kind="primary", width=150, height=38)
+        self.connect_btn.pack(side="right")
+        self.capture_btn = RoundButton(foot, "CAPTURE", self._capture,
+                                       kind="primary", width=170, height=38)
+        self.apply_btn = RoundButton(foot, "RE-APPLY", self._apply_current,
+                                     kind="secondary", width=130, height=38)
+
+    def _build_connect_page(self, parent):
+        tk.Label(
+            parent,
+            text=("Point this at the CTT server running on the Pi. It captures the "
+                  "bias/dark/flat frames for the noise model and static scene bursts "
+                  "for ground truth, then files the DNGs into the NSA layout."),
+            bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(860),
+            justify="left").pack(anchor="w", pady=(0, S(10)))
+
+        grid = tk.Frame(parent, bg=WHITE)
+        grid.pack(fill="x")
+        for c in (1, 3):
+            grid.columnconfigure(c, weight=1)
+
+        def row(r, label, var, col=0, hint=None):
+            tk.Label(grid, text=label, bg=WHITE, fg=INK, font=font(10, "bold"),
+                     anchor="w").grid(row=r, column=col*2, sticky="w", pady=S(4),
+                                      padx=(0, S(6)))
+            ttk.Entry(grid, textvariable=var, font=font(10)).grid(
+                row=r, column=col*2+1, sticky="ew", padx=(0, S(16)))
+
+        row(0, "Host / IP", self.host_var, 0)
+        row(0, "Port", self.port_var, 1)
+        row(1, "CTT project", self.project_var, 0)
+        row(1, "Calib gain", self.gain_var, 1)
+        row(2, "Analogue gain", self.again_var, 0)
+        row(2, "Flat levels", self.flatlevels_var, 1)
+        row(3, "Burst frames", self.burst_var, 0)
+
+        tk.Label(grid, text="NSA project root", bg=WHITE, fg=INK,
+                 font=font(10, "bold")).grid(row=4, column=0, sticky="w", pady=S(4))
+        rootrow = tk.Frame(grid, bg=WHITE)
+        rootrow.grid(row=4, column=1, columnspan=3, sticky="ew")
+        rootrow.columnconfigure(0, weight=1)
+        ttk.Entry(rootrow, textvariable=self.root_var, font=font(10)).grid(
+            row=0, column=0, sticky="ew")
+        RoundButton(rootrow, "…", self._browse_root, kind="secondary",
+                    width=44, height=30).grid(row=0, column=1, padx=(S(4), 0))
+
+        tk.Label(grid, text="Scenes", bg=WHITE, fg=INK,
+                 font=font(10, "bold")).grid(row=5, column=0, sticky="w", pady=S(4))
+        ttk.Entry(grid, textvariable=self.scenes_var, font=font(10)).grid(
+            row=5, column=1, columnspan=3, sticky="ew")
+
+        # Transfer method.
+        tfr = tk.Frame(parent, bg=WHITE)
+        tfr.pack(fill="x", pady=(S(12), 0))
+        tk.Label(tfr, text="Transfer", bg=WHITE, fg=INK,
+                 font=font(10, "bold")).pack(side="left")
+        ttk.Combobox(tfr, textvariable=self.transfer_var, width=10,
+                     values=["archive", "rsync"], state="readonly",
+                     style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
+        tk.Label(tfr, text="SSH (rsync)", bg=WHITE, fg=INK,
+                 font=font(10)).pack(side="left")
+        ttk.Entry(tfr, textvariable=self.ssh_var, width=20, font=font(10)).pack(
+            side="left", padx=(S(6), S(12)))
+        tk.Label(tfr, text="Pi workspace", bg=WHITE, fg=INK,
+                 font=font(10)).pack(side="left")
+        ttk.Entry(tfr, textvariable=self.workspace_var, width=22, font=font(10)).pack(
+            side="left", padx=(S(6), 0))
+        tk.Label(
+            parent,
+            text=("archive = pull the project ZIP over HTTPS (no setup). "
+                  "rsync = incremental pull over SSH (needs key access to the Pi)."),
+            bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
+            justify="left").pack(anchor="w", pady=(S(6), 0))
+
+    def _build_station_page(self, parent):
+        cols = tk.Frame(parent, bg=WHITE)
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=0)
+        cols.columnconfigure(1, weight=1)
+
+        # Left: live preview + readback. Fixed-pixel holder so the (imageless)
+        # label doesn't balloon to character-unit dimensions before frame 1.
+        left = tk.Frame(cols, bg=WHITE)
+        left.grid(row=0, column=0, sticky="nw", padx=(0, S(16)))
+        holder = tk.Frame(left, bg="#111111", width=S(self.PANEL_W), height=S(self.PANEL_H))
+        holder.pack()
+        holder.pack_propagate(False)
+        self.preview_lbl = tk.Label(holder, text="live preview…", bg="#111111",
+                                    fg="#888888", font=font(9))
+        self.preview_lbl.pack(fill="both", expand=True)
+        self.readback_lbl = tk.Label(left, text="", bg=WHITE, fg=INK,
+                                     font=font(9), justify="left", anchor="w")
+        self.readback_lbl.pack(anchor="w", pady=(S(8), 0))
+        self.clip_lbl = tk.Label(left, text="", bg=WHITE, fg=SUBTLE,
+                                 font=font(9), justify="left", anchor="w")
+        self.clip_lbl.pack(anchor="w")
+
+        # Right: station title + setup instructions + applied settings.
+        right = tk.Frame(cols, bg=WHITE)
+        right.grid(row=0, column=1, sticky="new")
+        self.station_title = tk.Label(right, text="", bg=WHITE, fg=RASPBERRY,
+                                      font=font(13, "bold"), justify="left", anchor="w")
+        self.station_title.pack(anchor="w")
+        self.setup_lbl = tk.Label(right, text="", bg=WHITE, fg=INK, font=font(10),
+                                  wraplength=S(400), justify="left", anchor="w")
+        self.setup_lbl.pack(anchor="w", pady=(S(8), 0))
+        self.applied_lbl = tk.Label(right, text="", bg=FIELD, fg=INK, font=font(9),
+                                    wraplength=S(400), justify="left", anchor="w")
+        self.applied_lbl.pack(anchor="w", fill="x", pady=(S(12), 0), ipady=S(6),
+                              ipadx=S(6))
+        self.progress_lbl = tk.Label(right, text="", bg=WHITE, fg=SUBTLE,
+                                     font=font(9), anchor="w")
+        self.progress_lbl.pack(anchor="w", pady=(S(10), 0))
+
+    # -- page switching ------------------------------------------------------
+    def _show_connect(self):
+        self.page_station.pack_forget()
+        self.page_connect.pack(fill="both", expand=True)
+        self.step_lbl.config(text="Connect to the CTT server on the Pi")
+        self.connect_btn.pack(side="right")
+        self.capture_btn.pack_forget()
+        self.apply_btn.pack_forget()
+        self.back_btn.set_enabled(False)
+        self.skip_btn.set_enabled(False)
+
+    def _show_station_page(self):
+        self.page_connect.pack_forget()
+        self.page_station.pack(fill="both", expand=True)
+        self.connect_btn.pack_forget()
+        self.apply_btn.pack(side="right", padx=(0, S(6)))
+        self.capture_btn.pack(side="right")
+
+    # -- helpers -------------------------------------------------------------
+    def _set_status(self, text: str, kind: str = "info"):
+        colour = {"ok": GREEN, "warn": AMBER, "err": RASPBERRY}.get(kind, SUBTLE)
+        self.status_lbl.config(text=text, fg=colour)
+
+    def _set_busy(self, on: bool):
+        self._busy = on
+        for b in (self.capture_btn, self.apply_btn, self.back_btn,
+                  self.skip_btn, self.connect_btn):
+            b.set_enabled(not on)
+
+    def _browse_root(self):
+        p = filedialog.askdirectory(title="NSA project root (PI_RAW / calibration / bursts)")
+        if p:
+            self.root_var.set(p)
+
+    def _args_namespace(self):
+        scenes = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
+        return self._types.SimpleNamespace(
+            gain=int(self.gain_var.get() or "256"),
+            analogue_gain=float(self.again_var.get() or "16"),
+            bias_frames=8, dark_frames=5, dark_exposure_ms=20.0,
+            flat_levels=int(self.flatlevels_var.get() or "12"),
+            flat_gain=1.0, flat_min_ms=1.0, flat_max_ms=30.0,
+            burst_frames=int(self.burst_var.get() or "48"),
+            scenes=scenes, colour_temp=5000, lux=None,
+        )
+
+    # -- connect -------------------------------------------------------------
+    def _connect(self):
+        if self._busy:
+            return
+        host = self.host_var.get().strip()
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("Connect", "Port must be a number.")
+            return
+        from nsa.dataset_layout import resolve_layout, scaffold_imx662_project
+        args = self._args_namespace()
+
+        def work():
+            try:
+                project_root, _ = resolve_layout(self.root_var.get().strip())
+                scaffold_imx662_project(
+                    project_root, gain=args.gain,
+                    scenes=tuple(args.scenes),
+                    flat_levels=max(2, args.flat_levels))
+                client = self.backend.CTTClient(host, port)
+                h = client.health()
+                if not h.get("camera"):
+                    raise self.backend.CTTError(
+                        f"CTT is up but reports no camera: {h.get('error', 'unknown')}")
+                client.ensure_project(self.project_var.get().strip())
+                controls = client.get_controls()
+                plan = self.backend.build_plan(project_root, args, controls)
+                self.after(0, lambda: self._connected(client, project_root, plan))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._connect_fail(str(e)))
+
+        self._set_busy(True)
+        self._set_status(f"Connecting to https://{host}:{port} …")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _connect_fail(self, err: str):
+        self._set_busy(False)
+        self._set_status(f"Connect failed: {err}", "err")
+        messagebox.showerror("Connect failed", err)
+
+    def _connected(self, client, project_root, plan):
+        self._set_busy(False)
+        self._client = client
+        self._project_root = project_root
+        self._plan = plan
+        self._idx = 0
+        self._recorded = []
+        # Build the transfer backend.
+        mirror = project_root / ".ctt_mirror"
+        try:
+            if self.transfer_var.get() == "rsync":
+                self._transfer = self.backend.RsyncTransfer(
+                    self.ssh_var.get().strip(), self.workspace_var.get().strip(),
+                    self.project_var.get().strip(), mirror)
+            else:
+                self._transfer = self.backend.ArchiveTransfer(
+                    client, self.project_var.get().strip(), mirror)
+        except self.backend.CTTError as exc:
+            messagebox.showerror("Transfer", str(exc))
+            return
+        self._set_status(f"Connected — camera ready. {len(plan)} stations planned.", "ok")
+        self._show_station_page()
+        self._start_preview()
+        self._poll_controls()
+        self._show_station(0)
+
+    # -- live preview + readback --------------------------------------------
+    def _start_preview(self):
+        threading.Thread(target=self._preview_worker, daemon=True).start()
+
+    def _preview_worker(self):
+        url = f"{self._client.base}/api/preview"
+        try:
+            r = self._client.s.get(url, stream=True, timeout=15)
+            buf = b""
+            for chunk in r.iter_content(chunk_size=16384):
+                if self._stop.is_set():
+                    break
+                buf += chunk
+                a = buf.find(b"\xff\xd8")
+                b_ = buf.find(b"\xff\xd9", a + 2) if a != -1 else -1
+                if a != -1 and b_ != -1:
+                    with self._lock:
+                        self._latest_jpeg = buf[a:b_ + 2]
+                    buf = buf[b_ + 2:]
+                if len(buf) > 4_000_000:  # guard against runaway buffering
+                    buf = b""
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _paint(self):
+        if self._stop.is_set():
+            return
+        import io
+        with self._lock:
+            jpg = self._latest_jpeg
+        if jpg and Image is not None:
+            try:
+                im = Image.open(io.BytesIO(jpg)).convert("RGB")
+                im.thumbnail((S(self.PANEL_W), S(self.PANEL_H)), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(im)
+                self._imgs["preview"] = photo
+                self.preview_lbl.config(image=photo, text="")
+            except Exception:  # noqa: BLE001
+                pass
+        self.after(120, self._paint)
+
+    def _poll_controls(self):
+        if self._stop.is_set() or self._client is None:
+            return
+
+        def work():
+            try:
+                c = self._client.get_controls()
+                h = self._client.histogram()
+            except Exception:  # noqa: BLE001
+                return
+            self.after(0, lambda: self._update_readback(c, h))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(1300, self._poll_controls)
+
+    def _update_readback(self, c: dict, h: dict):
+        self.readback_lbl.config(text=(
+            f"exposure  {c.get('exposure', 0)/1000:.2f} ms      "
+            f"gain  {c.get('gain', 0):g}×\n"
+            f"colour temp  {c.get('colour_temp', 0)} K      "
+            f"lux  {c.get('lux', 0)}      focus  {c.get('focus_fom', 0)}\n"
+            f"auto-exposure  {'ON' if c.get('auto_exposure') else 'off (locked)'}"))
+        clip = h.get("clipping") or {}
+        if clip:
+            hot = any(float(v) > 1.0 for v in clip.values())
+            self.clip_lbl.config(
+                text="clipping  " + "  ".join(f"{k} {v}%" for k, v in clip.items()),
+                fg=AMBER if hot else SUBTLE)
+
+    # -- station flow --------------------------------------------------------
+    def _show_station(self, idx: int):
+        if idx >= len(self._plan):
+            self._finish()
+            return
+        self._idx = max(0, idx)
+        st = self._plan[self._idx]
+        self.step_lbl.config(text=f"Station {self._idx+1} of {len(self._plan)}")
+        self.station_title.config(text=st.title)
+        self.setup_lbl.config(text=st.setup)
+        self.progress_lbl.config(
+            text=f"→ files land in  {st.dest}")
+        self.back_btn.set_enabled(self._idx > 0)
+        self.skip_btn.set_enabled(True)
+        self._apply_current()
+
+    def _prev_station(self):
+        if not self._busy:
+            self._show_station(self._idx - 1)
+
+    def _skip_station(self):
+        if not self._busy:
+            self._set_status(f"Skipped {self._plan[self._idx].station_id}.", "warn")
+            self._show_station(self._idx + 1)
+
+    def _apply_current(self):
+        if self._busy or not self._plan:
+            return
+        st = self._plan[self._idx]
+
+        def work():
+            try:
+                applied = self.backend._apply_controls(self._client, st)
+                self.after(0, lambda: self._applied(applied))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._set_status(f"Apply failed: {e}", "err"))
+
+        self._set_busy(True)
+        self._set_status("Applying camera settings…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _applied(self, applied: dict):
+        self._set_busy(False)
+        st = self._plan[self._idx]
+        mode = "auto-metered then locked" if st.controls is None else "locked"
+        self.applied_lbl.config(text=(
+            f"Applied ({mode}):  exposure {applied.get('exposure', 0)/1000:.2f} ms  ·  "
+            f"gain {applied.get('gain', 0):g}×\n"
+            f"Set up the rig as above, then press CAPTURE "
+            f"({st.frames} frame(s))."))
+        self._set_status("Ready to capture.", "ok")
+
+    def _capture(self):
+        if self._busy or not self._plan:
+            return
+        st = self._plan[self._idx]
+        project = self.project_var.get().strip()
+        incremental = isinstance(self._transfer, self.backend.RsyncTransfer)
+
+        def work():
+            try:
+                added = self._client.capture(
+                    project, image_type=st.image_type, frames=st.frames,
+                    colour_temp=st.colour_temp, lux=st.lux)
+                fnames = [a["filename"] for a in added
+                          if a.get("filename", "").lower().endswith(".dng")]
+                rec = self.backend.Recorded(station=st, ctt_filenames=fnames)
+                self._recorded.append(rec)
+                placed = 0
+                if incremental:
+                    mirror = self._transfer.fetch(fnames)
+                    placed = self.backend._place_files(mirror, rec)
+                self.after(0, lambda: self._captured(len(fnames), placed, incremental))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._capture_fail(str(e)))
+
+        self._set_busy(True)
+        self._set_status(f"Capturing {st.frames} frame(s)…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _capture_fail(self, err: str):
+        self._set_busy(False)
+        self._set_status(f"Capture failed: {err}", "err")
+        messagebox.showerror("Capture failed", err)
+
+    def _captured(self, n: int, placed: int, incremental: bool):
+        self._set_busy(False)
+        if incremental:
+            self._set_status(f"Captured {n} DNG(s), filed {placed} → advancing.", "ok")
+        else:
+            self._set_status(f"Captured {n} DNG(s) (pulled at finish) → advancing.", "ok")
+        self.after(600, lambda: self._show_station(self._idx + 1))
+
+    # -- finish --------------------------------------------------------------
+    def _finish(self):
+        self.step_lbl.config(text="Capture complete")
+        self.station_title.config(text="All stations captured")
+        n_scenes = sum(1 for r in self._recorded if r.station.station_id.startswith("burst_"))
+        self.setup_lbl.config(text=(
+            f"Captured {len(self._recorded)} station(s), {n_scenes} scene burst(s).\n"
+            "Finalising the transfer and filing DNGs into the NSA layout…"))
+        self.capture_btn.pack_forget()
+        self.apply_btn.pack_forget()
+        self.skip_btn.set_enabled(False)
+
+        def work():
+            try:
+                mirror = self._transfer.finalize()
+                total = 0
+                for rec in self._recorded:
+                    have = len(list(rec.station.dest.glob("*.dng"))) \
+                        if rec.station.dest.is_dir() else 0
+                    if have >= len(rec.ctt_filenames) and have > 0:
+                        continue
+                    total += self.backend._place_files(mirror, rec)
+                self.after(0, lambda: self._finished(total))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._set_status(f"Finalise failed: {e}", "err"))
+
+        self._set_busy(True)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finished(self, placed: int):
+        self._set_busy(False)
+        gain = self.gain_var.get()
+        cal_dir = self._project_root / f"calibration/imx662_gain{gain}"
+        clean_dir = self._project_root / "clean_scenes"
+        self.applied_lbl.config(text=(
+            f"Filed {placed} DNG(s).\n"
+            f"Calibration → {cal_dir}\n"
+            f"Scene bursts → {self._project_root / 'bursts'}"))
+        self._set_status("Capture done. Build the noise model + dataset next.", "ok")
+        if not self.backend._have_rawpy():
+            messagebox.showwarning(
+                "rawpy not installed",
+                "The DNGs are captured and filed, but building the noise model and "
+                "ground truth needs rawpy to decode raw DNGs:\n\n    pip install rawpy")
+        self.back_btn.set_enabled(False)
+        build = RoundButton(self, "BUILD NOISE DATASET", self._open_builder,
+                            kind="primary", width=240, height=42)
+        build.pack(pady=(0, S(10)))
+        self._builder_prefill = (str(cal_dir), str(clean_dir))
+
+    def _open_builder(self):
+        # Hand off to the existing noise dataset wizard, prefilled.
+        try:
+            wiz = NoiseDatasetWizard(self.app)
+            cal_dir, clean_dir = self._builder_prefill
+            wiz.calib_dir.set(cal_dir)
+            wiz.gain_var.set(self.gain_var.get())
+            if Path(clean_dir).is_dir():
+                wiz.clean_dir.set(clean_dir)
+            self._on_close()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Noise dataset wizard", str(exc))
+
+    def _on_close(self):
+        self._stop.set()
+        try:
+            self.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2405,10 +2968,18 @@ class App(tk.Tk):
 
         btn_row = tk.Frame(inner, bg=FIELD)
         btn_row.pack(fill="x")
+        RoundButton(btn_row, "CAMERA CAPTURE", self._open_capture_wizard,
+                    kind="primary", width=190, height=40).pack(side="left")
         RoundButton(btn_row, "DATASET STUDIO", self._open_data_studio,
-                    kind="primary", width=180, height=40).pack(side="left")
+                    kind="secondary", width=170, height=40).pack(side="left", padx=(S(8), 0))
         RoundButton(btn_row, "NOISE DATASET WIZARD", self._open_noise_wizard,
                     kind="secondary", width=220, height=40).pack(side="left", padx=(S(8), 0))
+
+    def _open_capture_wizard(self):
+        try:
+            CttCaptureWizard(self)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Camera capture", str(exc))
 
     def _open_data_studio(self):
         try:
