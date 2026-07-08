@@ -1799,8 +1799,8 @@ class CttCaptureWizard(tk.Toplevel):
     stays responsive.
     """
 
-    PANEL_W = 430
-    PANEL_H = 250
+    PANEL_W = 680  # ~1.77:1, matching the IMX662's 1936x1096 sensor aspect
+    PANEL_H = 385
 
     def __init__(self, master):
         super().__init__(master, bg=WHITE)
@@ -1854,11 +1854,11 @@ class CttCaptureWizard(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.transient(master)
         try:
-            self.geometry(f"{S(940)}x{S(720)}+{master.winfo_rootx()+S(30)}"
+            self.geometry(f"{S(1180)}x{S(760)}+{master.winfo_rootx()+S(30)}"
                           f"+{master.winfo_rooty()+S(20)}")
         except Exception:  # noqa: BLE001
             pass
-        self.minsize(S(820), S(600))
+        self.minsize(S(1020), S(660))
         master._grab_when_ready(self)
         self.after(100, self._paint)
 
@@ -2048,10 +2048,10 @@ class CttCaptureWizard(tk.Toplevel):
                                       font=font(13, "bold"), justify="left", anchor="w")
         self.station_title.pack(anchor="w")
         self.setup_lbl = tk.Label(right, text="", bg=WHITE, fg=INK, font=font(10),
-                                  wraplength=S(400), justify="left", anchor="w")
+                                  wraplength=S(360), justify="left", anchor="w")
         self.setup_lbl.pack(anchor="w", pady=(S(8), 0))
         self.applied_lbl = tk.Label(right, text="", bg=FIELD, fg=INK, font=font(9),
-                                    wraplength=S(400), justify="left", anchor="w")
+                                    wraplength=S(360), justify="left", anchor="w")
         self.applied_lbl.pack(anchor="w", fill="x", pady=(S(12), 0), ipady=S(6),
                               ipadx=S(6))
 
@@ -2059,7 +2059,7 @@ class CttCaptureWizard(tk.Toplevel):
         # is attached. Shows the auto-metered result and lets you override it.
         self.light_fr = tk.Frame(right, bg=WHITE)
         self.light_lbl = tk.Label(self.light_fr, text="", bg=WHITE, fg=SUBTLE,
-                                  font=font(9), wraplength=S(400), justify="left",
+                                  font=font(9), wraplength=S(360), justify="left",
                                   anchor="w")
         self.light_lbl.pack(anchor="w")
         override = tk.Frame(self.light_fr, bg=WHITE)
