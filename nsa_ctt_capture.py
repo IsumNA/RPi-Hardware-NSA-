@@ -63,14 +63,34 @@ from nsa.theme import banner, console, kv_table, level_rule, log
 # Capture is capped server-side at 16 frames per POST (see ctt-server capture()).
 CTT_MAX_BURST = 16
 
-# lightSTUDIO-S illuminant names (from probe).
+# lightSTUDIO-S illuminant names (from probe) — direct 1:1 matches.
 LIGHTBOX_ILLUMINANTS = {
-    "F12": "F12",      # F12 fluorescent
-    "F11": "F11",      # F11 fluorescent
-    "D50": "D50",      # D50 daylight
-    "D65": "D65",      # D65 daylight
-    "H": "Halogen400",  # horizon/warm → halogen 400 lux
+    "F12": "F12",  # F12 fluorescent
+    "F11": "F11",  # F11 fluorescent
+    "D50": "D50",  # D50 daylight
+    "D65": "D65",  # D65 daylight
 }
+
+
+def _resolve_illuminant(illum_code: str, target_lux: int | None) -> str:
+    """Map a scene's illuminant code to a lightSTUDIO-S channel name.
+
+    'H' (horizon/warm) has no single matching channel — the box instead
+    exposes three separate halogen channels rated for different brightness
+    regimes (Halogen10/100/400, ~10/100/400 lux at their default intensity).
+    Pick whichever is closest to the scene's target lux rather than always
+    using the brightest one.
+    """
+    if illum_code in LIGHTBOX_ILLUMINANTS:
+        return LIGHTBOX_ILLUMINANTS[illum_code]
+    if illum_code == "H":
+        lux = target_lux or 100
+        if lux <= 20:
+            return "Halogen10"
+        if lux <= 150:
+            return "Halogen100"
+        return "Halogen400"
+    return illum_code
 
 
 def parse_scene_light(scene: str) -> tuple[str | None, int | None]:
@@ -82,11 +102,9 @@ def parse_scene_light(scene: str) -> tuple[str | None, int | None]:
     illum_str, lux_str = parts[1], parts[2]
     try:
         lux = int(lux_str)
-        # Map recognized names to lightbox channels.
-        illum = LIGHTBOX_ILLUMINANTS.get(illum_str, illum_str)
-        return illum, lux
-    except (ValueError, KeyError):
+    except ValueError:
         return None, None
+    return _resolve_illuminant(illum_str, lux), lux
 
 
 # --------------------------------------------------------------------------- #
@@ -182,25 +200,38 @@ class CTTClient:
             pass
         return None
 
-    def meter_to_lux(self, target_lux: int, illuminant: str | None = None, *,
-                     percent_range: tuple[float, float] = (5, 100),
-                     max_iter: int = 8, tol: float = 0.1) -> tuple[float, float]:
+    def _settled_lux(self, *, settle: float = 0.6, retries: int = 4) -> float:
+        """Read measured lux, retrying briefly if it comes back 0 — a transient
+        right after a light/exposure change while auto-exposure re-converges.
+        Trusting a stray 0 here sends the meter_to_lux binary search the wrong
+        way for the rest of its iterations."""
+        lux = 0.0
+        for _ in range(retries):
+            time.sleep(settle)
+            lux = self.get_controls().get("lux", 0)
+            if lux > 0:
+                return lux
+        return lux
+
+    def meter_to_lux(self, target_lux: int, illuminant: str, *,
+                     percent_range: tuple[float, float] = (1, 100),
+                     max_iter: int = 10, tol: float = 0.12) -> tuple[float, float]:
         """Binary-search the lightbox intensity to hit a target lux, reading the
         camera's measured lux from /api/controls. Returns (percent, measured_lux).
-        If ``illuminant`` is set first, skips that step. Tolerance is a ±% window."""
-        if illuminant:
-            self.set_lightbox(illuminant, (percent_range[0] + percent_range[1]) / 2)
 
+        ``illuminant`` is required on every intensity change — per the device's
+        API, setting an intensity is what selects the channel; there is no way
+        to nudge percent on an already-active channel without naming it again.
+        """
         low, high = percent_range
+        mid, measured = (low + high) / 2, 0.0
         for _ in range(max_iter):
             mid = (low + high) / 2
-            self.set_lightbox(illuminant or "", mid)
-            time.sleep(0.5)  # settle
-            ctrl = self.get_controls()
-            measured = ctrl.get("lux", 0)
+            self.set_lightbox(illuminant, mid)
+            measured = self._settled_lux()
             error_pct = abs(measured - target_lux) / target_lux if target_lux > 0 else 0
             if error_pct < tol:
-                return mid, measured
+                break
             if measured < target_lux:
                 low = mid
             else:
@@ -738,16 +769,9 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                 f"→ {st.dest}", "info")
             continue
 
-        # Apply controls up-front so the live view reflects the shot settings.
-        try:
-            _apply_controls(client, st)
-        except CTTError as exc:
-            log(f"Could not apply controls: {exc}", "err")
-            if _prompt("[s]kip this station or [q]uit?") == "q":
-                break
-            continue
-
-        # For scene bursts, set the lightbox illuminant + meter to target lux.
+        # For scene bursts, set the lightbox to the scene's target lux BEFORE
+        # the camera auto-meters — otherwise the locked exposure is metered
+        # against the wrong (pre-light-change) brightness.
         if st.meta.get("is_real_pair"):
             scene = st.meta.get("scene")
             illum, target_lux = parse_scene_light(scene)
@@ -758,6 +782,15 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                         f"(target {target_lux} lux, measured {meas:.0f})", "ok")
                 except Exception as exc:  # noqa: BLE001
                     log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
+
+        # Apply controls up-front so the live view reflects the shot settings.
+        try:
+            _apply_controls(client, st)
+        except CTTError as exc:
+            log(f"Could not apply controls: {exc}", "err")
+            if _prompt("[s]kip this station or [q]uit?") == "q":
+                break
+            continue
 
         # Verify / capture loop.
         action = "capture"

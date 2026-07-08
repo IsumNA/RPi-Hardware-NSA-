@@ -1843,6 +1843,10 @@ class CttCaptureWizard(tk.Toplevel):
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
         self.autostart_var = tk.BooleanVar(value=True)
         self.cttcmd_var = tk.StringVar(value="ctt-server")
+        self.autolight_var = tk.BooleanVar(value=True)
+        self._lightbox_present = False
+        self._lightbox_illums = []      # driver's channel names, for the override combo
+        self._light_manual_override = False  # user hand-set the light for this station
 
         self._build_chrome()
         self._show_connect()
@@ -1996,6 +2000,23 @@ class CttCaptureWizard(tk.Toplevel):
         ttk.Entry(asr, textvariable=self.cttcmd_var, width=24, font=font(10)).pack(
             side="left")
 
+        # Lightbox: if a lightSTUDIO-S is attached to the Pi, auto-set the
+        # illuminant + intensity from each scene's name (cabinet_D50_100 → D50, 100 lux).
+        lbr = tk.Frame(parent, bg=WHITE)
+        lbr.pack(fill="x", pady=(S(6), 0))
+        tk.Checkbutton(
+            lbr, text="  Auto-set lightbox from scene name (illuminant + lux)",
+            variable=self.autolight_var, bg=WHITE, fg=INK, selectcolor=WHITE,
+            activebackground=WHITE, font=font(10)).pack(side="left")
+        tk.Label(
+            parent,
+            text=("Needs a lightSTUDIO-S plugged into the Pi. Scenes named "
+                  "<name>_<illuminant>_<lux> (e.g. cabinet_D50_100) get the light "
+                  "switched and metered to that target automatically; other scene "
+                  "names are left to manual lighting."),
+            bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
+            justify="left").pack(anchor="w", pady=(S(2), 0))
+
     def _build_station_page(self, parent):
         cols = tk.Frame(parent, bg=WHITE)
         cols.pack(fill="both", expand=True)
@@ -2032,6 +2053,37 @@ class CttCaptureWizard(tk.Toplevel):
                                     wraplength=S(400), justify="left", anchor="w")
         self.applied_lbl.pack(anchor="w", fill="x", pady=(S(12), 0), ipady=S(6),
                               ipadx=S(6))
+
+        # Lightbox panel — only shown for scene stations, when a lightSTUDIO-S
+        # is attached. Shows the auto-metered result and lets you override it.
+        self.light_fr = tk.Frame(right, bg=WHITE)
+        self.light_lbl = tk.Label(self.light_fr, text="", bg=WHITE, fg=SUBTLE,
+                                  font=font(9), wraplength=S(400), justify="left",
+                                  anchor="w")
+        self.light_lbl.pack(anchor="w")
+        override = tk.Frame(self.light_fr, bg=WHITE)
+        override.pack(anchor="w", pady=(S(4), 0))
+        tk.Label(override, text="Illuminant", bg=WHITE, fg=INK,
+                 font=font(9)).pack(side="left")
+        self.light_illum_var = tk.StringVar(value="")
+        self.light_illum_combo = ttk.Combobox(
+            override, textvariable=self.light_illum_var, width=10, state="readonly",
+            style="Rpi.TCombobox")
+        self.light_illum_combo.pack(side="left", padx=(S(4), S(10)))
+        tk.Label(override, text="%", bg=WHITE, fg=INK, font=font(9)).pack(side="left")
+        self.light_pct_var = tk.StringVar(value="50")
+        ttk.Entry(override, textvariable=self.light_pct_var, width=5,
+                 font=font(9)).pack(side="left", padx=(S(4), S(8)))
+        RoundButton(override, "SET", self._set_light_manual, kind="secondary",
+                   width=64, height=26).pack(side="left")
+        tk.Label(override, text="target lux", bg=WHITE, fg=INK,
+                 font=font(9)).pack(side="left", padx=(S(10), S(4)))
+        self.light_lux_var = tk.StringVar(value="")
+        ttk.Entry(override, textvariable=self.light_lux_var, width=6,
+                 font=font(9)).pack(side="left", padx=(0, S(8)))
+        RoundButton(override, "METER", self._meter_light_manual, kind="secondary",
+                   width=70, height=26).pack(side="left")
+
         self.progress_lbl = tk.Label(right, text="", bg=WHITE, fg=SUBTLE,
                                      font=font(9), anchor="w")
         self.progress_lbl.pack(anchor="w", pady=(S(10), 0))
@@ -2159,7 +2211,21 @@ class CttCaptureWizard(tk.Toplevel):
         except self.backend.CTTError as exc:
             messagebox.showerror("Transfer", str(exc))
             return
-        self._set_status(f"Connected — camera ready. {len(plan)} stations planned.", "ok")
+        # Probe the lightbox once so the station page knows whether to offer
+        # auto-lighting / manual override.
+        try:
+            lb = client.lightbox_status() or {}
+        except Exception:  # noqa: BLE001
+            lb = {}
+        self._lightbox_present = bool(lb.get("present"))
+        self._lightbox_illums = list(lb.get("illuminants", {}).values())
+        if self._lightbox_illums:
+            self.light_illum_combo.config(values=self._lightbox_illums)
+
+        status = f"Connected — camera ready. {len(plan)} stations planned."
+        if self._lightbox_present:
+            status += f"  Lightbox: {lb.get('model', 'detected')}."
+        self._set_status(status, "ok")
         self._show_station_page()
         self._start_preview()
         self._poll_controls()
@@ -2249,6 +2315,20 @@ class CttCaptureWizard(tk.Toplevel):
             text=f"→ files land in  {st.dest}")
         self.back_btn.set_enabled(self._idx > 0)
         self.skip_btn.set_enabled(True)
+
+        # Lightbox panel only makes sense for scene stations with a device attached.
+        self._light_manual_override = False
+        is_scene = bool(st.meta.get("is_real_pair"))
+        if is_scene and self._lightbox_present:
+            illum, lux = self.backend.parse_scene_light(st.meta.get("scene", ""))
+            self.light_illum_var.set(illum or (self._lightbox_illums[0]
+                                                if self._lightbox_illums else ""))
+            self.light_lux_var.set(str(lux) if lux else "")
+            self.light_lbl.config(text="Lightbox ready.", fg=SUBTLE)
+            self.light_fr.pack(anchor="w", fill="x", pady=(S(10), 0))
+        else:
+            self.light_fr.pack_forget()
+
         self._apply_current()
 
     def _prev_station(self):
@@ -2264,19 +2344,32 @@ class CttCaptureWizard(tk.Toplevel):
         if self._busy or not self._plan:
             return
         st = self._plan[self._idx]
+        auto_light = (bool(st.meta.get("is_real_pair")) and self._lightbox_present
+                     and bool(self.autolight_var.get())
+                     and not self._light_manual_override)
 
         def work():
             try:
+                light_info = None
+                # Light the scene BEFORE the camera auto-meters, otherwise the
+                # locked exposure is metered against the wrong brightness.
+                if auto_light:
+                    illum, target_lux = self.backend.parse_scene_light(
+                        st.meta.get("scene", ""))
+                    if illum and target_lux:
+                        pct, meas = self._client.meter_to_lux(target_lux, illuminant=illum)
+                        light_info = (illum, pct, target_lux, meas)
                 applied = self.backend._apply_controls(self._client, st)
-                self.after(0, lambda: self._applied(applied))
+                self.after(0, lambda: self._applied(applied, light_info))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._set_status(f"Apply failed: {e}", "err"))
 
         self._set_busy(True)
-        self._set_status("Applying camera settings…")
+        self._set_status("Applying camera settings…" if not auto_light
+                         else "Metering lightbox, then applying camera settings…")
         threading.Thread(target=work, daemon=True).start()
 
-    def _applied(self, applied: dict):
+    def _applied(self, applied: dict, light_info: tuple | None = None):
         self._set_busy(False)
         st = self._plan[self._idx]
         mode = "auto-metered then locked" if st.controls is None else "locked"
@@ -2291,7 +2384,79 @@ class CttCaptureWizard(tk.Toplevel):
             f"gain {applied.get('gain', 0):g}×\n"
             f"Set up the rig as above, then press CAPTURE "
             f"({st.frames} frame(s))." + dark_note))
+        if light_info:
+            illum, pct, target_lux, meas = light_info
+            self.light_illum_var.set(illum)
+            self.light_pct_var.set(f"{pct:.0f}")
+            ok = abs(meas - target_lux) / max(target_lux, 1) < 0.15
+            self.light_lbl.config(
+                text=(f"Auto-set {illum} to {pct:.0f}% → measured {meas:.0f} lux "
+                     f"(target {target_lux}). Override below if needed."),
+                fg=SUBTLE if ok else AMBER)
+        elif st.meta.get("is_real_pair") and self._lightbox_present:
+            self.light_lbl.config(
+                text="Auto-light off or scene name unparseable — set manually below.",
+                fg=SUBTLE)
         self._set_status("Ready to capture.", "ok")
+
+    # -- lightbox manual override --------------------------------------------
+    def _set_light_manual(self):
+        if self._busy or self._client is None:
+            return
+        illum = self.light_illum_var.get().strip()
+        if not illum:
+            messagebox.showerror("Lightbox", "Pick an illuminant first.")
+            return
+        try:
+            pct = float(self.light_pct_var.get())
+        except ValueError:
+            messagebox.showerror("Lightbox", "Percent must be a number.")
+            return
+        self._light_manual_override = True
+
+        def work():
+            try:
+                self._client.set_lightbox(illum, pct)
+                self.after(0, lambda: self._set_status(
+                    f"Lightbox set to {illum} at {pct:.0f}%.", "ok"))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._set_status(
+                    f"Lightbox set failed: {e}", "err"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _meter_light_manual(self):
+        if self._busy or self._client is None:
+            return
+        illum = self.light_illum_var.get().strip()
+        if not illum:
+            messagebox.showerror("Lightbox", "Pick an illuminant first.")
+            return
+        try:
+            target_lux = int(self.light_lux_var.get())
+        except ValueError:
+            messagebox.showerror("Lightbox", "Target lux must be a number.")
+            return
+        self._light_manual_override = True
+
+        def work():
+            try:
+                pct, meas = self._client.meter_to_lux(target_lux, illuminant=illum)
+                self.after(0, lambda: self._light_metered(pct, meas, target_lux))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._set_status(f"Meter failed: {e}", "err"))
+
+        self._set_status(f"Metering {illum} to {target_lux} lux…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _light_metered(self, pct: float, meas: float, target_lux: int):
+        self.light_pct_var.set(f"{pct:.0f}")
+        ok = abs(meas - target_lux) / max(target_lux, 1) < 0.15
+        self.light_lbl.config(
+            text=f"Metered to {meas:.0f} lux (target {target_lux}) at {pct:.0f}%.",
+            fg=SUBTLE if ok else AMBER)
+        self._set_status("Lightbox metered. Re-apply (RE-APPLY) to lock exposure "
+                         "to the new light level.", "ok")
 
     def _capture(self):
         if self._busy or not self._plan:
