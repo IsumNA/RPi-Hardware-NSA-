@@ -2573,20 +2573,51 @@ class CttCaptureWizard(tk.Toplevel):
             threading.Thread(target=work, daemon=True).start()
             return
 
-        # Calibration mode → hand off to the noise dataset builder.
+        # Calibration mode → average each scene's burst into a clean GT
+        # reference (clean_scenes/<scene>/gt_01.png), same as the CLI's
+        # post_process() step, THEN hand off to the noise dataset builder.
+        # Without this, "Clean images" in step 2 points at an empty folder.
         gain = self.gain_var.get()
         cal_dir = self._project_root / f"calibration/imx662_gain{gain}"
         clean_dir = self._project_root / "clean_scenes"
-        self.applied_lbl.config(text=(
-            f"Filed {placed} DNG(s).\n"
-            f"Calibration → {cal_dir}\n"
-            f"Scene bursts → {self._project_root / 'bursts'}"))
-        self._set_status("Capture done. Build the noise model + dataset next.", "ok")
         if not rawpy_ok:
             messagebox.showwarning(
                 "rawpy not installed",
-                "The DNGs are captured and filed, but building the noise model and "
-                "ground truth needs rawpy to decode raw DNGs:\n\n    pip install rawpy")
+                "The DNGs are captured and filed, but building the clean GT "
+                "references and noise model needs rawpy to decode raw "
+                "DNGs:\n\n    pip install rawpy")
+        self.applied_lbl.config(text=(
+            f"Filed {placed} DNG(s).\n"
+            f"Calibration → {cal_dir}\n"
+            "Averaging scene bursts into clean GT references…"))
+        self._set_status("Building clean GT references…")
+
+        def work():
+            from nsa.gt_capture import burst_folder_to_gt
+            out = []
+            for rec in self._recorded:
+                if not rec.station.station_id.startswith("burst_"):
+                    continue
+                scene = rec.station.meta.get("scene")
+                gt_path = clean_dir / scene / "gt_01.png"
+                try:
+                    manifest = burst_folder_to_gt(
+                        str(rec.station.dest), str(gt_path),
+                        min_frames=min(8, int(self.burst_var.get() or "48")))
+                    out.append(f"{scene}: gt_01.png ({manifest['frames_used']} frames)")
+                except Exception as exc:  # noqa: BLE001
+                    out.append(f"{scene}: FAILED — {exc}")
+            self.after(0, lambda: self._clean_scenes_done(cal_dir, clean_dir, out))
+
+        self._set_busy(True)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clean_scenes_done(self, cal_dir: Path, clean_dir: Path, lines: list):
+        self._set_busy(False)
+        self.applied_lbl.config(text=(
+            "Clean GT references built:\n" + "\n".join(lines) +
+            f"\n\nCalibration → {cal_dir}\nClean scenes → {clean_dir}"))
+        self._set_status("Ready — build the noise model + dataset next.", "ok")
         build = RoundButton(self, "BUILD NOISE DATASET", self._open_builder,
                             kind="primary", width=240, height=42)
         build.pack(pady=(0, S(10)))
