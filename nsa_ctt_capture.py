@@ -420,9 +420,12 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         station_id="bias",
         title="BIAS  ·  read noise + ADC offset",
         setup=(
-            "• Put the LENS CAP on (or fully dark enclosure).\n"
-            "• Shortest possible exposure, analogue gain 1×.\n"
-            "• No light must reach the sensor."
+            "• LENS CAP ON — any fully OPAQUE cap (colour doesn't matter; black is\n"
+            "  ideal as it also won't reflect internally). It must not leak light —\n"
+            "  tape foil over a thin/translucent cap.\n"
+            "• With the cap on, ROOM LIGHTING DOESN'T MATTER — no need to darken the\n"
+            "  room. Only if you can't cap the lens: use a fully dark enclosure.\n"
+            "• Measures read noise + ADC offset. The preview is BLACK on purpose."
         ),
         image_type="dark",
         frames=args.bias_frames,
@@ -437,9 +440,11 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         station_id="dark",
         title=f"DARK  ·  fixed-pattern noise at {args.analogue_gain:g}× gain",
         setup=(
-            "• Keep the LENS CAP on.\n"
-            f"• Analogue gain {args.analogue_gain:g}×, exposure {args.dark_exposure_ms:g} ms.\n"
-            "• Still fully dark — this measures dark current / row noise."
+            "• Keep the LENS CAP ON (opaque, no leaks — same as bias).\n"
+            f"• Runs at {args.analogue_gain:g}× gain, so any stray light gets\n"
+            "  AMPLIFIED — the cap matters even more here than for bias.\n"
+            "• Room lighting is irrelevant with the cap on.\n"
+            "• Measures dark current / fixed-pattern (row) noise. Preview stays black."
         ),
         image_type="dark",
         frames=args.dark_frames,
@@ -460,7 +465,9 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         exp = int(round(lo * (hi / lo) ** t))
         lvl = f"{k:02d}"
         setup = (
-            "• Fill the frame with a UNIFORM, evenly-lit grey card / integrating sphere.\n"
+            "• LENS CAP OFF now. This station NEEDS light — a dark room won't work.\n"
+            "• Fill the frame with a UNIFORM, evenly-lit grey card / diffuser /\n"
+            "  integrating sphere (no texture, no hotspots).\n"
             "• Keep the LIGHT and GAIN constant for every level — the wizard ramps\n"
             "  exposure automatically to walk up the signal curve.\n"
             f"• Level {k}/{n}: exposure ≈ {exp/1000:.2f} ms (auto-set)."
@@ -484,10 +491,13 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             station_id=f"burst_{scene}",
             title=f"SCENE BURST  ·  {scene}",
             setup=(
-                f"• Frame the scene '{scene}' on a rigid tripod — it must be perfectly STATIC.\n"
-                "• Normal lighting. The wizard meters once, locks exposure/gain, then\n"
-                f"  shoots {args.burst_frames} identical frames for temporal averaging.\n"
-                "• Nothing in the frame may move during the burst."
+                f"• LENS CAP OFF. Frame the scene '{scene}' on a rigid tripod — it\n"
+                "  must be perfectly STATIC during the burst.\n"
+                "• Light it WELL (this is the CLEAN reference — don't shoot it dark;\n"
+                "  the low-light version is synthesised later from the noise model).\n"
+                "• The wizard meters once, locks exposure/gain, then shoots\n"
+                f"  {args.burst_frames} identical frames for temporal averaging.\n"
+                "• Nothing in the frame may move until capture finishes."
             ),
             image_type="macbeth",
             frames=args.burst_frames,
