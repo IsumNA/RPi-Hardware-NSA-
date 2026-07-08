@@ -1799,6 +1799,8 @@ class CttCaptureWizard(tk.Toplevel):
     stays responsive.
     """
 
+    # Fallback preview size (logical px); the real size is computed per-display
+    # in _size_preview_to_screen() so the preview is as large as will fit.
     PANEL_W = 430
     PANEL_H = 250
 
@@ -1849,18 +1851,49 @@ class CttCaptureWizard(tk.Toplevel):
         self._light_manual_override = False  # user hand-set the light for this station
         self._capture_lux = None  # actual lux to send with capture() — CTT requires >0 for macbeth
 
+        # Size the live preview to the actual display before building the UI:
+        # make it as large as will fit (4:3) while guaranteeing the instruction
+        # column and the footer buttons stay on-screen. The default UI scale is
+        # 1.9×, so a fixed large window would otherwise push the footer past the
+        # bottom edge on ordinary monitors.
+        self._size_preview_to_screen(master)
+
         self._build_chrome()
         self._show_connect()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.transient(master)
         try:
-            self.geometry(f"{S(940)}x{S(720)}+{master.winfo_rootx()+S(30)}"
+            self.geometry(f"{self._win_w}x{self._win_h}+{master.winfo_rootx()+S(30)}"
                           f"+{master.winfo_rooty()+S(20)}")
         except Exception:  # noqa: BLE001
             pass
-        self.minsize(S(820), S(600))
+        self.minsize(min(self._win_w, S(720)), min(self._win_h, S(520)))
         master._grab_when_ready(self)
         self.after(100, self._paint)
+
+    def _size_preview_to_screen(self, master):
+        """Pick the biggest 4:3 preview that still leaves room for the station
+        instructions and the always-visible footer, clamped to the display."""
+        try:
+            sw = master.winfo_screenwidth()
+            sh = master.winfo_screenheight()
+        except Exception:  # noqa: BLE001
+            sw, sh = 1920, 1080
+        # Scaled-pixel budget for everything that is NOT the preview: header,
+        # readback/clip lines, status bar, footer buttons and paddings.
+        chrome_h = S(300)
+        avail_h = max(S(240), int(sh * 0.94) - chrome_h)
+        # Work in logical units so the S() wrappers at the use sites still apply.
+        ph = min(760, int(avail_h / SCALE))
+        pw = int(ph * 4 / 3)
+        # Never crowd out the instruction column on the right.
+        max_pw = int((sw * 0.94) / SCALE) - 470
+        if pw > max_pw:
+            pw = max(320, max_pw)
+            ph = int(pw * 3 / 4)
+        self.PANEL_W, self.PANEL_H = pw, ph
+        self._win_w = min(int(sw * 0.96), S(pw + 500))
+        self._win_h = min(int(sh * 0.96), S(ph) + chrome_h)
 
     # -- chrome --------------------------------------------------------------
     def _build_chrome(self):
