@@ -1957,7 +1957,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
         self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
-        self.transfer_var = tk.StringVar(value="http")
+        self.transfer_var = tk.StringVar(value="rsync")
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
         self.autostart_var = tk.BooleanVar(value=True)
@@ -2095,7 +2095,7 @@ class CttCaptureWizard(tk.Toplevel):
         tk.Label(tfr, text="Transfer", bg=WHITE, fg=INK,
                  font=font(10, "bold")).pack(side="left")
         ttk.Combobox(tfr, textvariable=self.transfer_var, width=10,
-                     values=["http", "rsync", "archive"], state="readonly",
+                     values=["rsync", "http", "archive"], state="readonly",
                      style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
         tk.Label(tfr, text="SSH (rsync)", bg=WHITE, fg=INK,
                  font=font(10)).pack(side="left")
@@ -2107,10 +2107,11 @@ class CttCaptureWizard(tk.Toplevel):
             side="left", padx=(S(6), 0))
         tk.Label(
             parent,
-            text=("http = direct per-file over the CTT API — no zip, no SSH; "
-                  "images land straight in the folder (default). "
-                  "rsync = incremental pull over SSH (needs key access). "
-                  "archive = whole-project ZIP over HTTPS."),
+            text=("rsync = incremental, direct file copy over SSH — no zip, saves "
+                  "each cabinet as it's shot (recommended; needs key access). "
+                  "http = over the CTT API, unpacked to loose DNGs (the Pi server "
+                  "has no per-file raw route, so it pulls the project archive and "
+                  "extracts it — no zip kept). archive = same as http."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(6), 0))
 
@@ -2610,8 +2611,9 @@ class CttCaptureWizard(tk.Toplevel):
             return
         st = self._plan[self._idx]
         project = self.project_var.get().strip()
-        # Everything except the whole-project ZIP files DNGs per station.
-        incremental = not isinstance(self._transfer, self.backend.ArchiveTransfer)
+        # Backends that support per-station fetch let us save each cabinet as it's
+        # captured; the archive path defers to a single pull at the end.
+        incremental = self._transfer.incremental
         capture_lux = self._capture_lux if self._capture_lux else st.lux
 
         # Real-pair scenes sweep the whole gain series after this single setup.

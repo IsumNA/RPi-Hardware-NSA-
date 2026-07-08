@@ -542,6 +542,12 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
 class Transfer:
     """Interface: make captured DNGs available locally, keyed by CTT filename."""
 
+    # True  → fetch() pulls just this station's files (rsync); the wizard can save
+    #         each cabinet as it's captured.
+    # False → files are only available in bulk at finalize() (archive ZIP); the
+    #         wizard defers filing to the end so it doesn't re-pull per cabinet.
+    incremental: bool = False
+
     def fetch(self, filenames: list[str]) -> dict[str, Path]:
         """Return {ctt_filename: local_path} for the given DNG filenames.
 
@@ -556,6 +562,8 @@ class Transfer:
 
 class RsyncTransfer(Transfer):
     """Incremental pull of the CTT project directory over SSH with rsync."""
+
+    incremental = True
 
     def __init__(self, ssh: str, remote_workspace: str, project: str, mirror: Path):
         self.ssh = ssh
@@ -588,12 +596,37 @@ class RsyncTransfer(Transfer):
         return self._index()
 
 
-class HttpFileTransfer(Transfer):
-    """Direct per-file pull over the CTT HTTP API — no ZIP, no SSH.
+def _extract_archive_dngs(client: "CTTClient", project: str, mirror: Path) -> dict[str, Path]:
+    """Pull the project archive and extract loose DNGs into ``mirror``.
 
-    Downloads each captured DNG straight into the local mirror (and from there
-    into the NSA folder), using the same port-5000 channel as capture. This is
-    the default: files land directly in the existing folder as they're shot.
+    The ZIP is a transient transport only — it's downloaded to a temp dir,
+    the DNGs are unpacked as individual files, and the ZIP is discarded. No
+    archive file is ever kept in the dataset.
+    """
+    mirror.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        zip_path = Path(td) / f"{project}.zip"
+        log("Pulling captured DNGs from CTT (project archive, extracted to "
+            "loose files — no zip kept) …", "info")
+        client.download_archive(project, zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            for member in zf.namelist():
+                if member.lower().endswith(".dng"):
+                    out = mirror / Path(member).name
+                    with zf.open(member) as src, out.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+    return {p.name: p for p in mirror.rglob("*.dng")}
+
+
+class HttpFileTransfer(Transfer):
+    """Pull captured DNGs over the CTT HTTP API — no SSH, files land loose.
+
+    The stock rpi-ctt server exposes raw DNGs only via the whole-project
+    archive (there is no per-file raw route — ``/captures/<f>/jpeg`` serves a
+    developed JPEG, not the DNG). So this backend tries a direct per-file
+    download first (for custom servers that support it) and otherwise falls
+    back to extracting the archive into loose files. Either way the result is
+    individual DNGs in the folder — never a saved zip.
     """
 
     def __init__(self, client: "CTTClient", project: str, mirror: Path):
@@ -601,30 +634,51 @@ class HttpFileTransfer(Transfer):
         self.project = project
         self.mirror = mirror
         self.mirror.mkdir(parents=True, exist_ok=True)
+        # None = not probed yet; True = per-file route works; False = fell back
+        # to the archive (then behaves like ArchiveTransfer: bulk at finalize).
+        self._direct: bool | None = None
+
+    @property
+    def incremental(self) -> bool:  # type: ignore[override]
+        return self._direct is not False
 
     def fetch(self, filenames: list[str]) -> dict[str, Path]:
+        if self._direct is False:
+            return {}  # no per-file route — defer to a single archive pull
         out: dict[str, Path] = {}
         for fn in filenames:
             dst = self.mirror / fn
-            if not (dst.exists() and dst.stat().st_size > 0):
-                try:
-                    self.client.download_file(self.project, fn, dst)
-                except CTTError as exc:
-                    log(f"Direct download failed for {fn}: {exc}", "warn")
-                    continue
-            out[fn] = dst
+            if dst.exists() and dst.stat().st_size > 0:
+                out[fn] = dst
+                continue
+            try:
+                self.client.download_file(self.project, fn, dst)
+                out[fn] = dst
+            except CTTError:
+                # First failure: this server has no per-file DNG route. Switch to
+                # the archive once and stop hammering 404s for every frame.
+                self._direct = False
+                log("CTT server has no per-file download route — switching to the "
+                    "project archive (still extracted to loose DNGs, no zip kept).",
+                    "warn")
+                return {}
+        self._direct = True
         return out
 
     def finalize(self) -> dict[str, Path]:
-        return {p.name: p for p in self.mirror.rglob("*.dng")}
+        if self._direct:
+            return {p.name: p for p in self.mirror.rglob("*.dng")}
+        return _extract_archive_dngs(self.client, self.project, self.mirror)
 
 
 class ArchiveTransfer(Transfer):
-    """Zero-setup fallback: pull the whole-project ZIP and extract DNGs.
+    """Zero-setup fallback: pull the whole-project ZIP and extract loose DNGs.
 
     Downloading the archive re-zips the entire project each call, so this backend
     defers to a single pull in ``finalize`` rather than fetching per station.
     """
+
+    incremental = False
 
     def __init__(self, client: CTTClient, project: str, mirror: Path):
         self.client = client
@@ -636,17 +690,7 @@ class ArchiveTransfer(Transfer):
         return {}  # deferred — see finalize()
 
     def finalize(self) -> dict[str, Path]:
-        with tempfile.TemporaryDirectory() as td:
-            zip_path = Path(td) / f"{self.project}.zip"
-            log(f"Downloading project archive from CTT …", "info")
-            self.client.download_archive(self.project, zip_path)
-            with zipfile.ZipFile(zip_path) as zf:
-                for member in zf.namelist():
-                    if member.lower().endswith(".dng"):
-                        out = self.mirror / Path(member).name
-                        with zf.open(member) as src, out.open("wb") as dst:
-                            shutil.copyfileobj(src, dst)
-        return {p.name: p for p in self.mirror.glob("*.dng")}
+        return _extract_archive_dngs(self.client, self.project, self.mirror)
 
 
 # --------------------------------------------------------------------------- #
@@ -1016,8 +1060,6 @@ def _prompt(msg: str) -> str:
 def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                *, dry_run: bool) -> list[Recorded]:
     recorded: list[Recorded] = []
-    # Everything except the whole-project ZIP supports per-station fetch.
-    incremental = not isinstance(transfer, ArchiveTransfer)
 
     for n, st in enumerate(stations, 1):
         level_rule(n, st.title)
@@ -1099,7 +1141,7 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                     break
                 continue
             recorded.extend(recs)
-            if incremental:
+            if transfer.incremental:
                 for rec in recs:
                     try:
                         mirror = transfer.fetch(rec.ctt_filenames)
@@ -1127,8 +1169,9 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         log(f"Captured {len(fnames)} DNG(s): {', '.join(fnames[:4])}"
             + (" …" if len(fnames) > 4 else ""), "ok")
 
-        # Pull + place immediately for rsync; archive defers to finalize().
-        if incremental:
+        # Pull + place immediately when the backend supports per-station fetch;
+        # the archive path defers to finalize().
+        if transfer.incremental:
             try:
                 mirror = transfer.fetch(fnames)
                 placed = _place_files(mirror, rec)
@@ -1345,11 +1388,13 @@ def main() -> int:
     p.add_argument("--burst-frames", type=int, default=48,
                    help="frames per scene burst (looped over the 16-frame cap)")
     # Transfer
-    p.add_argument("--transfer", choices=("http", "rsync", "archive"), default=None,
-                   help="how to pull DNGs: http = direct per-file over the CTT API "
-                        "(no zip/ssh, default), rsync = incremental over ssh, "
-                        "archive = whole-project zip (default: rsync if --pi-ssh "
-                        "given, else http)")
+    p.add_argument("--transfer", choices=("rsync", "http", "archive"), default=None,
+                   help="how to pull DNGs into the folder: rsync = incremental, "
+                        "direct file copy over ssh (no zip; recommended); "
+                        "http = over the CTT API, extracted to loose files (the "
+                        "stock server has no per-file raw route, so this pulls the "
+                        "project archive and unpacks it — no zip kept); archive = "
+                        "same as http. Default: rsync if --pi-ssh given, else http.")
     p.add_argument("--pi-ssh", default=None,
                    help="ssh target for rsync + auto-start, e.g. pi@10.3.195.212")
     p.add_argument("--pi-workspace", default="~/ctt-server-workspace",
@@ -1434,11 +1479,13 @@ def main() -> int:
             log(f"Transfer: rsync from {args.pi_ssh}:{args.pi_workspace}/{args.project}", "info")
         elif mode == "archive":
             transfer = ArchiveTransfer(client, args.project, mirror)
-            log("Transfer: CTT project ZIP archive (pulled at the end).", "info")
+            log("Transfer: CTT project archive, extracted to loose DNGs "
+                "(no zip kept), pulled at the end.", "info")
         else:
             transfer = HttpFileTransfer(client, args.project, mirror)
-            log("Transfer: direct per-file over the CTT API (no zip/ssh) → "
-                "files land straight in the folder.", "info")
+            log("Transfer: over the CTT API → loose DNGs in the folder "
+                "(per-file if supported, else archive-extracted; no zip kept).",
+                "info")
     except CTTError as exc:
         log(str(exc), "err")
         return 2
