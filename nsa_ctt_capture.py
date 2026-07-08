@@ -560,13 +560,9 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         station_id="bias",
         title=f"BIAS  ·  read noise + ADC offset at {cal_gain:g}× gain",
         setup=(
-            "• LENS CAP ON — any fully OPAQUE cap (colour doesn't matter; black is\n"
-            "  ideal as it also won't reflect internally). It must not leak light —\n"
-            "  tape foil over a thin/translucent cap.\n"
-            "• With the cap on, ROOM LIGHTING DOESN'T MATTER — no need to darken the\n"
-            "  room. Only if you can't cap the lens: use a fully dark enclosure.\n"
-            f"• Shot at {cal_gain:g}× (the real low-light gain) so read noise matches\n"
-            "  the regime we synthesise. Measures read noise + ADC offset;\n"
+            "• LENS CAP ON — fully opaque, no light leaks (tape foil over a thin cap).\n"
+            "• Room lighting doesn't matter with the cap on.\n"
+            f"• Shot at {cal_gain:g}× gain. Measures read noise + ADC offset;\n"
             "  the preview is BLACK on purpose."
         ),
         image_type="dark",
@@ -582,11 +578,9 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         station_id="dark",
         title=f"DARK  ·  fixed-pattern noise at {cal_gain:g}× gain",
         setup=(
-            "• Keep the LENS CAP ON (opaque, no leaks — same as bias).\n"
-            f"• Runs at {cal_gain:g}× gain — the real night gain — so any stray light\n"
-            "  gets AMPLIFIED; the cap matters even more here than for bias.\n"
-            "• Room lighting is irrelevant with the cap on.\n"
-            "• Measures dark current / fixed-pattern (row) noise. Preview stays black."
+            "• LENS CAP ON (opaque, no leaks — same as bias).\n"
+            f"• Shot at {cal_gain:g}× gain. Measures dark current / fixed-pattern\n"
+            "  (row) noise. Preview stays black on purpose."
         ),
         image_type="dark",
         frames=args.dark_frames,
@@ -609,13 +603,10 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         exp = int(round(lo * (hi / lo) ** t))
         lvl = f"{k:02d}"
         setup = (
-            "• LENS CAP OFF now. This station NEEDS light — a dark room won't work.\n"
-            "• Fill the frame with a UNIFORM, evenly-lit grey card / diffuser /\n"
-            "  integrating sphere (no texture, no hotspots).\n"
-            f"• Shot at {flat_gain:g}× gain (the operating gain). Watch the CLIPPING\n"
-            "  readout — at high gain, DIM the light until the brightest level sits\n"
-            "  just below clipping. Then keep the LIGHT and GAIN constant; the\n"
-            "  wizard ramps exposure to walk up the signal curve.\n"
+            "• Lens cap OFF, room lit. Fill the frame with a UNIFORM grey card /\n"
+            "  diffuser (no texture, no hotspots).\n"
+            f"• Shot at {flat_gain:g}× gain. If CLIPPING flags the brightest level,\n"
+            "  dim the light, then keep light + gain fixed.\n"
             f"• Level {k}/{n}: exposure ≈ {exp/1000:.2f} ms (auto-set)."
         ) if k == 1 else None
         stations.append(Station(
@@ -640,19 +631,11 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
             title = f"REAL PAIR SWEEP  ·  {scene}"
             setup = (
-                f"• LENS CAP OFF. Frame '{scene}' on a rigid tripod and keep it\n"
-                "  perfectly STATIC — nothing may move for the whole sweep.\n"
-                "• LIGHT IT WELL, then leave the light alone. Use the Illuminant +\n"
-                "  intensity % control below: aim for a bright, clearly-lit preview\n"
-                "  with NO clipping (watch the CLIPPING readout on the left). Start\n"
-                "  around 100% and lower only if the highlights clip. You do NOT need\n"
-                "  to pick a lux value — leave it lit; the wizard measures it and adds\n"
-                "  the low-light noise itself by RAISING the gain, not by dimming.\n"
-                f"• Press CAPTURE once: it locks this brightness, then shoots\n"
-                f"  {args.burst_frames} frames at EACH gain ({gains_txt}) — lowering\n"
-                "  exposure as gain rises, so higher gain = more noise. noisy = 1 real\n"
-                "  frame per gain; gt = the averaged burst (clean).\n"
-                f"• → PI_RAW/Data/{scene}/imx662_ag<GAIN>_test/  (noisy.png + gt.png)"
+                f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
+                "• Light it well (~100%, back off only if CLIPPING flags highlights).\n"
+                f"• CAPTURE shoots {args.burst_frames} frames at each gain "
+                f"({gains_txt}), dropping exposure as gain rises.\n"
+                f"• → PI_RAW/Data/{scene}/imx662_ag<GAIN>_test/"
             )
             meta = {
                 "scene": scene, "is_real_pair": True, "gain_sweep": list(gain_sweep),
@@ -663,13 +646,11 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         else:
             title = f"SCENE BURST  ·  {scene}"
             setup = (
-                f"• LENS CAP OFF. Frame the scene '{scene}' on a rigid tripod — it\n"
-                "  must be perfectly STATIC during the burst.\n"
-                "• Light it WELL (this is the CLEAN reference — don't shoot it dark;\n"
-                "  the low-light version is synthesised later from the noise model).\n"
-                "• The wizard meters once, locks exposure/gain, then shoots\n"
-                f"  {args.burst_frames} identical frames for temporal averaging.\n"
-                "• Nothing in the frame may move until capture finishes."
+                f"• Rigid tripod, lens cap OFF. Nothing may move during the burst.\n"
+                "• Light it well — this is the CLEAN reference (low-light is\n"
+                "  synthesised later from the noise model).\n"
+                f"• CAPTURE meters once, locks exposure/gain, then shoots "
+                f"{args.burst_frames} frames to average."
             )
             meta = {"scene": scene}
         # CTT rejects "macbeth"-type captures with no (or non-positive) lux.

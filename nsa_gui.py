@@ -1924,22 +1924,25 @@ class CttCaptureWizard(tk.Toplevel):
         self.step_lbl.pack(anchor="w", pady=(S(2), 0))
         tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(8), 0))
 
-        self.body = tk.Frame(self, bg=WHITE)
-        self.body.pack(fill="both", expand=True, padx=pad, pady=(S(8), 0))
-        self.page_connect = tk.Frame(self.body, bg=WHITE)
-        self.page_station = tk.Frame(self.body, bg=WHITE)
-        self._build_connect_page(self.page_connect)
-        self._build_station_page(self.page_station)
-
+        # Pin the footer + status bar to the BOTTOM first. Tk clips the widgets
+        # packed last when the window is too short, so packing these before the
+        # (expanding) body guarantees the CAPTURE/BACK buttons stay visible
+        # instead of being pushed off-screen.
+        foot = tk.Frame(self, bg=WHITE)
+        foot.pack(side="bottom", fill="x", padx=pad, pady=S(12))
+        tk.Frame(self, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
         log_fr = tk.Frame(self, bg=FIELD)
-        log_fr.pack(fill="x", padx=pad, pady=(S(6), 0))
+        log_fr.pack(side="bottom", fill="x", padx=pad, pady=(S(6), 0))
         self.status_lbl = tk.Label(log_fr, text="Ready.", bg=FIELD, fg=SUBTLE,
                                    font=font(9), wraplength=S(880), justify="left")
         self.status_lbl.pack(anchor="w", padx=S(10), pady=S(8))
 
-        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(6), 0))
-        foot = tk.Frame(self, bg=WHITE)
-        foot.pack(fill="x", padx=pad, pady=S(12))
+        self.body = tk.Frame(self, bg=WHITE)
+        self.body.pack(side="top", fill="both", expand=True, padx=pad, pady=(S(8), S(6)))
+        self.page_connect = tk.Frame(self.body, bg=WHITE)
+        self.page_station = tk.Frame(self.body, bg=WHITE)
+        self._build_connect_page(self.page_connect)
+        self._build_station_page(self.page_station)
         self.back_btn = RoundButton(foot, "BACK", self._prev_station,
                                     kind="secondary", width=100, height=38)
         self.back_btn.pack(side="left")
@@ -2063,11 +2066,9 @@ class CttCaptureWizard(tk.Toplevel):
             activebackground=WHITE, font=font(10)).pack(side="left")
         tk.Label(
             parent,
-            text=("Needs a lightSTUDIO-S plugged into the Pi. Scenes named "
-                  "<name>_<illuminant>_<lux> (e.g. cabinet_D50_100) get that "
-                  "illuminant switched on at the default intensity; set the exact "
-                  "intensity % per station with the SET button. Other scene names "
-                  "are left to manual lighting."),
+            text=("Needs a lightSTUDIO-S on the Pi. Scenes named "
+                  "<name>_<illuminant>_<lux> (e.g. cabinet_D50_100) switch that "
+                  "illuminant on; tune the % per station with SET."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2085,10 +2086,9 @@ class CttCaptureWizard(tk.Toplevel):
                   font=font(10)).pack(side="left", fill="x", expand=True)
         tk.Label(
             parent,
-            text=("After the pairs are built they're copied here and verified "
-                  "(size-checked read-back). This is the path NSA training "
-                  "auto-detects on the AI machine — leave it as /opt/datasets/PI_RAW "
-                  "unless your dataset lives elsewhere."),
+            text=("Finished pairs are copied here and verified. This is the path NSA "
+                  "training auto-detects — leave as /opt/datasets/PI_RAW unless your "
+                  "dataset lives elsewhere."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2115,9 +2115,14 @@ class CttCaptureWizard(tk.Toplevel):
                                  font=font(9), justify="left", anchor="w")
         self.clip_lbl.pack(anchor="w")
 
-        # Right: station title + setup instructions + applied settings.
+        # Right: station title + setup instructions + applied settings. The
+        # column expands to fill the window; wraplengths are updated on resize
+        # (see _on_right_resize) so text uses the full width instead of a thin
+        # strip that leaves the right of the window empty.
         right = tk.Frame(cols, bg=WHITE)
         right.grid(row=0, column=1, sticky="new")
+        self._right_col = right
+        right.bind("<Configure>", self._on_right_resize)
         self.station_title = tk.Label(right, text="", bg=WHITE, fg=RASPBERRY,
                                       font=font(13, "bold"), justify="left", anchor="w")
         self.station_title.pack(anchor="w")
@@ -2154,8 +2159,18 @@ class CttCaptureWizard(tk.Toplevel):
                    width=64, height=26).pack(side="left")
 
         self.progress_lbl = tk.Label(right, text="", bg=WHITE, fg=SUBTLE,
-                                     font=font(9), anchor="w")
+                                     font=font(9), anchor="w", justify="left")
         self.progress_lbl.pack(anchor="w", pady=(S(10), 0))
+
+    def _on_right_resize(self, event):
+        # Keep the instruction/applied text wrapping to the actual column width
+        # so it fills the window rather than a fixed 360px strip. Guarded because
+        # <Configure> can fire mid-construction before every label exists.
+        w = max(S(260), event.width - S(12))
+        for name in ("setup_lbl", "applied_lbl", "light_lbl", "progress_lbl"):
+            lbl = getattr(self, name, None)
+            if lbl is not None:
+                lbl.config(wraplength=w)
 
     # -- page switching ------------------------------------------------------
     def _show_connect(self):
@@ -2382,10 +2397,8 @@ class CttCaptureWizard(tk.Toplevel):
         self.station_title.config(text=st.title)
         self.setup_lbl.config(text=st.setup)
         if st.meta.get("gain_sweep"):
-            gains = st.meta["gain_sweep"]
             self.progress_lbl.config(
-                text=(f"→ sweeps gains {', '.join(str(g) for g in gains)} into  "
-                      f"{st.meta['pair_root']}/imx662_ag<gain>_test"))
+                text=f"→ {st.meta['pair_root']}/imx662_ag<gain>_test")
         else:
             self.progress_lbl.config(text=f"→ files land in  {st.dest}")
         self.back_btn.set_enabled(self._idx > 0)
@@ -2458,22 +2471,18 @@ class CttCaptureWizard(tk.Toplevel):
         # by design — call that out so it doesn't read as a broken feed.
         dark_note = ""
         if st.image_type == "dark":
-            dark_note = ("\nThe live preview is BLACK here on purpose — this station "
-                         "measures the sensor with the lens capped / minimal exposure.")
+            dark_note = "  ·  preview is BLACK on purpose (lens capped)."
         if st.meta.get("gain_sweep"):
             gains = st.meta["gain_sweep"]
             self.applied_lbl.config(text=(
-                f"Metered at gain 1× (exposure {applied.get('exposure', 0)/1000:.2f} ms) "
-                f"= this scene's brightness. When you press CAPTURE the wizard sweeps "
-                f"{len(gains)} gains ({', '.join(str(g) for g in gains)}), "
-                f"{st.frames} frames each, holding this brightness (exposure drops as "
-                "gain rises). No need to dim anything — just make sure it's well-lit "
-                "with no clipping." + dark_note))
+                f"Metered at 1× → {applied.get('exposure', 0)/1000:.2f} ms.  "
+                f"CAPTURE sweeps {len(gains)} gains "
+                f"({', '.join(str(g) for g in gains)}), {st.frames} frames each, "
+                "holding this brightness." + dark_note))
         else:
             self.applied_lbl.config(text=(
-                f"Applied ({mode}):  exposure {applied.get('exposure', 0)/1000:.2f} ms  ·  "
-                f"gain {applied.get('gain', 0):g}×\n"
-                f"Set up the rig as above, then press CAPTURE "
+                f"Applied ({mode}):  {applied.get('exposure', 0)/1000:.2f} ms  ·  "
+                f"gain {applied.get('gain', 0):g}×  ·  press CAPTURE "
                 f"({st.frames} frame(s))." + dark_note))
         if light_info:
             illum, pct, meas = light_info
@@ -2482,8 +2491,7 @@ class CttCaptureWizard(tk.Toplevel):
             if meas > 0:
                 self._capture_lux = int(round(meas))  # measured lux, metadata only
             self.light_lbl.config(
-                text=(f"Set {illum} to {pct:.0f}% → measured {meas:.0f} lux. "
-                     "Adjust the intensity % and press SET if needed."),
+                text=f"{illum} at {pct:.0f}% → {meas:.0f} lux.  Adjust % + SET if needed.",
                 fg=SUBTLE)
         elif st.meta.get("is_real_pair") and self._lightbox_present:
             self.light_lbl.config(
