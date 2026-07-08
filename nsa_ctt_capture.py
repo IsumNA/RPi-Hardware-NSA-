@@ -413,36 +413,46 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     exp_min = int(controls_range.get("exposure_min", 13))
     exp_max = int(controls_range.get("exposure_max", 33_000))
 
+    # CRITICAL: the noise model is fitted straight from these frames and applied
+    # at synthesis WITHOUT any gain scaling — so bias/dark/flat must ALL be shot
+    # at the real operating (low-light) gain, or the model under-represents the
+    # noise. `gain` is the target sensor gain (e.g. 256×/512×); the analogue-gain
+    # overrides default to it so calibration matches the regime we synthesise for.
+    cal_gain = float(args.analogue_gain) if getattr(args, "analogue_gain", 0) else float(gain)
+    flat_gain = float(args.flat_gain) if getattr(args, "flat_gain", 0) else cal_gain
+
     stations: list[Station] = []
 
-    # 1) bias — read noise: lens cap, minimum exposure, unity gain.
+    # 1) bias — read noise at the operating gain: lens cap, minimum exposure.
     stations.append(Station(
         station_id="bias",
-        title="BIAS  ·  read noise + ADC offset",
+        title=f"BIAS  ·  read noise + ADC offset at {cal_gain:g}× gain",
         setup=(
             "• LENS CAP ON — any fully OPAQUE cap (colour doesn't matter; black is\n"
             "  ideal as it also won't reflect internally). It must not leak light —\n"
             "  tape foil over a thin/translucent cap.\n"
             "• With the cap on, ROOM LIGHTING DOESN'T MATTER — no need to darken the\n"
             "  room. Only if you can't cap the lens: use a fully dark enclosure.\n"
-            "• Measures read noise + ADC offset. The preview is BLACK on purpose."
+            f"• Shot at {cal_gain:g}× (the real low-light gain) so read noise matches\n"
+            "  the regime we synthesise. Measures read noise + ADC offset;\n"
+            "  the preview is BLACK on purpose."
         ),
         image_type="dark",
         frames=args.bias_frames,
         dest=cal / "bias",
         naming=lambda i: f"bias_{i:02d}.dng",
-        controls={"auto_exposure": False, "exposure": exp_min, "gain": 1.0},
+        controls={"auto_exposure": False, "exposure": exp_min, "gain": cal_gain},
     ))
 
-    # 2) dark — row/pattern noise at the night gain: lens cap, normal exposure.
+    # 2) dark — row/pattern noise at the operating gain: lens cap, normal exposure.
     dark_exp = int(args.dark_exposure_ms * 1000)
     stations.append(Station(
         station_id="dark",
-        title=f"DARK  ·  fixed-pattern noise at {args.analogue_gain:g}× gain",
+        title=f"DARK  ·  fixed-pattern noise at {cal_gain:g}× gain",
         setup=(
             "• Keep the LENS CAP ON (opaque, no leaks — same as bias).\n"
-            f"• Runs at {args.analogue_gain:g}× gain, so any stray light gets\n"
-            "  AMPLIFIED — the cap matters even more here than for bias.\n"
+            f"• Runs at {cal_gain:g}× gain — the real night gain — so any stray light\n"
+            "  gets AMPLIFIED; the cap matters even more here than for bias.\n"
             "• Room lighting is irrelevant with the cap on.\n"
             "• Measures dark current / fixed-pattern (row) noise. Preview stays black."
         ),
@@ -450,14 +460,16 @@ def build_plan(project_root: Path, args: argparse.Namespace,
         frames=args.dark_frames,
         dest=cal / "dark",
         naming=lambda i: f"dark_{i:02d}.dng",
-        controls={"auto_exposure": False, "exposure": dark_exp, "gain": float(args.analogue_gain)},
+        controls={"auto_exposure": False, "exposure": dark_exp, "gain": cal_gain},
     ))
 
-    # 3) flat/level_XX — photon-transfer curve. One manual setup (uniform grey
-    #    card + constant light); the wizard ramps EXPOSURE across levels, so no
-    #    per-level light changes are needed.
-    lo = min(max(exp_min, int(args.flat_min_ms * 1000)), exp_max)
-    hi = min(max(lo + 1, int(args.flat_max_ms * 1000)), exp_max)
+    # 3) flat/level_XX — photon-transfer curve at the operating gain. One manual
+    #    setup (uniform grey card + constant light); the wizard ramps EXPOSURE
+    #    across levels. High gain amplifies signal, so the exposure ceiling is
+    #    scaled down ∝ 1/gain to keep a sensible sweep instead of instant clipping.
+    gain_scale = min(1.0, 16.0 / max(flat_gain, 1.0))
+    lo = min(max(exp_min, int(args.flat_min_ms * 1000 * gain_scale)), exp_max)
+    hi = min(max(lo + 1, int(args.flat_max_ms * 1000 * gain_scale)), exp_max)
     n = max(2, args.flat_levels)
     for k in range(1, n + 1):
         # Geometric exposure ramp lo → hi across the levels.
@@ -468,8 +480,10 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             "• LENS CAP OFF now. This station NEEDS light — a dark room won't work.\n"
             "• Fill the frame with a UNIFORM, evenly-lit grey card / diffuser /\n"
             "  integrating sphere (no texture, no hotspots).\n"
-            "• Keep the LIGHT and GAIN constant for every level — the wizard ramps\n"
-            "  exposure automatically to walk up the signal curve.\n"
+            f"• Shot at {flat_gain:g}× gain (the operating gain). Watch the CLIPPING\n"
+            "  readout — at high gain, DIM the light until the brightest level sits\n"
+            "  just below clipping. Then keep the LIGHT and GAIN constant; the\n"
+            "  wizard ramps exposure to walk up the signal curve.\n"
             f"• Level {k}/{n}: exposure ≈ {exp/1000:.2f} ms (auto-set)."
         ) if k == 1 else None
         stations.append(Station(
@@ -480,7 +494,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             frames=2,  # a + b at each level
             dest=cal / "flat" / f"level_{lvl}",
             naming=lambda i: ("a.dng", "b.dng")[i] if i < 2 else f"c{i}.dng",
-            controls={"auto_exposure": False, "exposure": exp, "gain": float(args.flat_gain)},
+            controls={"auto_exposure": False, "exposure": exp, "gain": flat_gain},
             colour_temp=args.colour_temp,
             meta={"first_flat": k == 1},
         ))
@@ -763,13 +777,15 @@ def main() -> int:
     p.add_argument("--colour-temp", type=int, default=5000)
     p.add_argument("--lux", type=int, default=None)
     # Capture parameters
-    p.add_argument("--analogue-gain", type=float, default=16.0,
-                   help="AnalogueGain for the dark station (night gain)")
+    p.add_argument("--analogue-gain", type=float, default=0.0,
+                   help="analogue gain for bias/dark calibration; 0 = use --gain "
+                        "(calibrate at the real operating gain)")
     p.add_argument("--bias-frames", type=int, default=8)
     p.add_argument("--dark-frames", type=int, default=5)
     p.add_argument("--dark-exposure-ms", type=float, default=20.0)
     p.add_argument("--flat-levels", type=int, default=12)
-    p.add_argument("--flat-gain", type=float, default=1.0)
+    p.add_argument("--flat-gain", type=float, default=0.0,
+                   help="analogue gain for flat frames; 0 = use the calibration gain")
     p.add_argument("--flat-min-ms", type=float, default=1.0,
                    help="lowest flat exposure in ms (clamped to the sensor range)")
     p.add_argument("--flat-max-ms", type=float, default=30.0,

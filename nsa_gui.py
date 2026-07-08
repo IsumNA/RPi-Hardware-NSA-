@@ -1833,7 +1833,6 @@ class CttCaptureWizard(tk.Toplevel):
         self.project_var = tk.StringVar(value="imx662")
         self.root_var = tk.StringVar(value=str(ROOT / "datasets" / "imx662_project"))
         self.gain_var = tk.StringVar(value="256")
-        self.again_var = tk.StringVar(value="16")
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
         self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
@@ -1923,10 +1922,14 @@ class CttCaptureWizard(tk.Toplevel):
         row(0, "Host / IP", self.host_var, 0)
         row(0, "Port", self.port_var, 1)
         row(1, "CTT project", self.project_var, 0)
-        row(1, "Calib gain", self.gain_var, 1)
-        row(2, "Analogue gain", self.again_var, 0)
-        row(2, "Flat levels", self.flatlevels_var, 1)
-        row(3, "Burst frames", self.burst_var, 0)
+        row(1, "Operating gain", self.gain_var, 1)  # bias/dark/flat all shot at this
+        row(2, "Flat levels", self.flatlevels_var, 0)
+        row(2, "Burst frames", self.burst_var, 1)
+        tk.Label(grid, text="Bias, dark and flat frames are all captured at the "
+                            "operating gain, so the fitted noise model matches the "
+                            "real low-light regime.", bg=WHITE, fg=SUBTLE,
+                 font=font(8), wraplength=S(820), justify="left").grid(
+                     row=3, column=0, columnspan=4, sticky="w", pady=(S(2), S(2)))
 
         tk.Label(grid, text="NSA project root", bg=WHITE, fg=INK,
                  font=font(10, "bold")).grid(row=4, column=0, sticky="w", pady=S(4))
@@ -2056,10 +2059,12 @@ class CttCaptureWizard(tk.Toplevel):
         scenes = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
         return self._types.SimpleNamespace(
             gain=int(self.gain_var.get() or "256"),
-            analogue_gain=float(self.again_var.get() or "16"),
+            # 0 → calibrate bias/dark/flat at the target gain (the real operating
+            # gain), so the fitted noise model matches the low-light regime.
+            analogue_gain=0.0,
             bias_frames=8, dark_frames=5, dark_exposure_ms=20.0,
             flat_levels=int(self.flatlevels_var.get() or "12"),
-            flat_gain=1.0, flat_min_ms=1.0, flat_max_ms=30.0,
+            flat_gain=0.0, flat_min_ms=1.0, flat_max_ms=30.0,
             burst_frames=int(self.burst_var.get() or "48"),
             scenes=scenes, colour_temp=5000, lux=None,
         )
