@@ -63,6 +63,31 @@ from nsa.theme import banner, console, kv_table, level_rule, log
 # Capture is capped server-side at 16 frames per POST (see ctt-server capture()).
 CTT_MAX_BURST = 16
 
+# lightSTUDIO-S illuminant names (from probe).
+LIGHTBOX_ILLUMINANTS = {
+    "F12": "F12",      # F12 fluorescent
+    "F11": "F11",      # F11 fluorescent
+    "D50": "D50",      # D50 daylight
+    "D65": "D65",      # D65 daylight
+    "H": "Halogen400",  # horizon/warm → halogen 400 lux
+}
+
+
+def parse_scene_light(scene: str) -> tuple[str | None, int | None]:
+    """Parse a scene name for illuminant + lux: cabinet_D50_100 → ('D50', 100).
+    Returns (illuminant, lux) or (None, None) if not parseable."""
+    parts = scene.rsplit("_", 2)  # split from right to grab the last two parts
+    if len(parts) != 3:
+        return None, None
+    illum_str, lux_str = parts[1], parts[2]
+    try:
+        lux = int(lux_str)
+        # Map recognized names to lightbox channels.
+        illum = LIGHTBOX_ILLUMINANTS.get(illum_str, illum_str)
+        return illum, lux
+    except (ValueError, KeyError):
+        return None, None
+
 
 # --------------------------------------------------------------------------- #
 #  CTT HTTP client
@@ -131,6 +156,56 @@ class CTTClient:
     def macbeth(self) -> dict:
         r = self._get("/api/macbeth")
         return r.json() if r.status_code == 200 else {}
+
+    # --- lightbox --------------------------------------------------------- #
+    def lightbox_status(self) -> dict | None:
+        """Get lightbox state: {present, channel, illuminant, intensity}.
+        Returns None if the lightbox API is unavailable."""
+        try:
+            r = self._get("/api/lightbox", timeout=3)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def set_lightbox(self, illuminant: str, percent: float) -> dict | None:
+        """Set lightbox to the named illuminant at the given intensity (0–100%).
+        Returns the new state, or None if unavailable."""
+        try:
+            r = self._post("/api/lightbox",
+                          json={"illuminant": illuminant, "percent": float(percent)},
+                          timeout=5)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def meter_to_lux(self, target_lux: int, illuminant: str | None = None, *,
+                     percent_range: tuple[float, float] = (5, 100),
+                     max_iter: int = 8, tol: float = 0.1) -> tuple[float, float]:
+        """Binary-search the lightbox intensity to hit a target lux, reading the
+        camera's measured lux from /api/controls. Returns (percent, measured_lux).
+        If ``illuminant`` is set first, skips that step. Tolerance is a ±% window."""
+        if illuminant:
+            self.set_lightbox(illuminant, (percent_range[0] + percent_range[1]) / 2)
+
+        low, high = percent_range
+        for _ in range(max_iter):
+            mid = (low + high) / 2
+            self.set_lightbox(illuminant or "", mid)
+            time.sleep(0.5)  # settle
+            ctrl = self.get_controls()
+            measured = ctrl.get("lux", 0)
+            error_pct = abs(measured - target_lux) / target_lux if target_lux > 0 else 0
+            if error_pct < tol:
+                return mid, measured
+            if measured < target_lux:
+                low = mid
+            else:
+                high = mid
+        return mid, measured
 
     # --- projects --------------------------------------------------------- #
     def project_exists(self, name: str) -> bool:
@@ -671,6 +746,18 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
             if _prompt("[s]kip this station or [q]uit?") == "q":
                 break
             continue
+
+        # For scene bursts, set the lightbox illuminant + meter to target lux.
+        if st.meta.get("is_real_pair"):
+            scene = st.meta.get("scene")
+            illum, target_lux = parse_scene_light(scene)
+            if illum and target_lux:
+                try:
+                    pct, meas = client.meter_to_lux(target_lux, illuminant=illum)
+                    log(f"Lightbox set to {illum} at {pct:.0f}% "
+                        f"(target {target_lux} lux, measured {meas:.0f})", "ok")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
 
         # Verify / capture loop.
         action = "capture"
