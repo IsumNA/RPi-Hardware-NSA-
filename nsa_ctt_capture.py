@@ -164,6 +164,10 @@ class CTTClient:
         self.timeout = timeout
         self.s = requests.Session()
         self.s.verify = verify  # the Pi's CTT server uses a self-signed cert
+        # For the direct (no-zip) per-file transfer: any URL the capture record
+        # hands back for a file, and the route template that last worked.
+        self._file_urls: dict[str, str] = {}
+        self._file_url_template: str | None = None
         if not verify:
             # Silence the per-request InsecureRequestWarning for the local Pi cert.
             try:
@@ -289,9 +293,71 @@ class CTTClient:
             if r.status_code != 200:
                 raise CTTError(f"capture failed ({r.status_code}): {r.text[:200]}")
             payload = r.json()
-            added.extend(payload.get("added", []))
+            new = payload.get("added", [])
+            added.extend(new)
+            # Remember any direct URL/path the server returns per file, so the
+            # HTTP transfer can pull it straight to disk without guessing routes.
+            for a in new:
+                fn = a.get("filename")
+                if not fn:
+                    continue
+                for key in ("url", "href", "download_url", "path", "rel_path"):
+                    if a.get(key):
+                        self._file_urls[fn] = str(a[key])
+                        break
             remaining -= n
         return added
+
+    # Likely per-file routes on the CTT server, tried in order (the first that
+    # returns non-HTML 200 is cached for the rest of the session).
+    _FILE_URL_TEMPLATES = (
+        "/projects/{project}/{name}",
+        "/projects/{project}/captures/{name}",
+        "/projects/{project}/images/{name}",
+        "/projects/{project}/raw/{name}",
+        "/projects/{project}/files/{name}",
+        "/projects/{project}/download/{name}",
+    )
+
+    def download_file(self, project: str, filename: str, dest_path: Path) -> Path:
+        """Download ONE captured file directly over HTTP into ``dest_path`` — no
+        ZIP, no SSH. Prefers a URL from the capture record, then a route that
+        already worked, then probes the usual routes."""
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        attempts: list[tuple[bool, str]] = []
+        if filename in self._file_urls:
+            attempts.append((False, self._file_urls[filename]))
+        ordered = ([self._file_url_template] if self._file_url_template else []) + [
+            t for t in self._FILE_URL_TEMPLATES if t != self._file_url_template]
+        attempts += [(True, t) for t in ordered]
+
+        last = "no routes tried"
+        for is_template, value in attempts:
+            path = value.format(project=project, name=filename) if is_template else value
+            url = path if path.startswith("http") else self._url(
+                path if path.startswith("/") else "/" + path)
+            try:
+                r = self.s.get(url, stream=True, timeout=max(self.timeout, 120))
+            except requests.RequestException as exc:
+                last = f"{url}: {exc}"
+                continue
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if r.status_code == 200 and "html" not in ctype:
+                tmp = dest_path.with_suffix(dest_path.suffix + ".part")
+                with tmp.open("wb") as fh:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        fh.write(chunk)
+                if tmp.stat().st_size > 0:
+                    tmp.replace(dest_path)
+                    if is_template:
+                        self._file_url_template = value
+                    return dest_path
+                tmp.unlink(missing_ok=True)
+            last = f"{url} → {r.status_code} {ctype or '?'}"
+        raise CTTError(
+            f"could not download '{filename}' directly ({last}). "
+            "The CTT server may use a non-standard file route — use "
+            "--transfer archive or --transfer rsync instead.")
 
     def download_archive(self, name: str, dest_zip: Path) -> Path:
         r = self._get(f"/projects/{name}/archive", stream=True, timeout=max(self.timeout, 600))
@@ -466,6 +532,37 @@ class RsyncTransfer(Transfer):
     def finalize(self) -> dict[str, Path]:
         self._sync()
         return self._index()
+
+
+class HttpFileTransfer(Transfer):
+    """Direct per-file pull over the CTT HTTP API — no ZIP, no SSH.
+
+    Downloads each captured DNG straight into the local mirror (and from there
+    into the NSA folder), using the same port-5000 channel as capture. This is
+    the default: files land directly in the existing folder as they're shot.
+    """
+
+    def __init__(self, client: "CTTClient", project: str, mirror: Path):
+        self.client = client
+        self.project = project
+        self.mirror = mirror
+        self.mirror.mkdir(parents=True, exist_ok=True)
+
+    def fetch(self, filenames: list[str]) -> dict[str, Path]:
+        out: dict[str, Path] = {}
+        for fn in filenames:
+            dst = self.mirror / fn
+            if not (dst.exists() and dst.stat().st_size > 0):
+                try:
+                    self.client.download_file(self.project, fn, dst)
+                except CTTError as exc:
+                    log(f"Direct download failed for {fn}: {exc}", "warn")
+                    continue
+            out[fn] = dst
+        return out
+
+    def finalize(self) -> dict[str, Path]:
+        return {p.name: p for p in self.mirror.rglob("*.dng")}
 
 
 class ArchiveTransfer(Transfer):
@@ -865,7 +962,8 @@ def _prompt(msg: str) -> str:
 def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                *, dry_run: bool) -> list[Recorded]:
     recorded: list[Recorded] = []
-    incremental = isinstance(transfer, RsyncTransfer)
+    # Everything except the whole-project ZIP supports per-station fetch.
+    incremental = not isinstance(transfer, ArchiveTransfer)
 
     for n, st in enumerate(stations, 1):
         level_rule(n, st.title)
@@ -1193,8 +1291,11 @@ def main() -> int:
     p.add_argument("--burst-frames", type=int, default=48,
                    help="frames per scene burst (looped over the 16-frame cap)")
     # Transfer
-    p.add_argument("--transfer", choices=("rsync", "archive"), default=None,
-                   help="how to pull DNGs (default: rsync if --pi-ssh given, else archive)")
+    p.add_argument("--transfer", choices=("http", "rsync", "archive"), default=None,
+                   help="how to pull DNGs: http = direct per-file over the CTT API "
+                        "(no zip/ssh, default), rsync = incremental over ssh, "
+                        "archive = whole-project zip (default: rsync if --pi-ssh "
+                        "given, else http)")
     p.add_argument("--pi-ssh", default=None,
                    help="ssh target for rsync + auto-start, e.g. pi@10.3.195.212")
     p.add_argument("--pi-workspace", default="~/ctt-server-workspace",
@@ -1268,7 +1369,7 @@ def main() -> int:
 
     # Pick the transfer backend.
     mirror = project_root / ".ctt_mirror"
-    mode = args.transfer or ("rsync" if args.pi_ssh else "archive")
+    mode = args.transfer or ("rsync" if args.pi_ssh else "http")
     try:
         if mode == "rsync":
             if not args.pi_ssh:
@@ -1277,9 +1378,13 @@ def main() -> int:
             transfer: Transfer = RsyncTransfer(args.pi_ssh, args.pi_workspace,
                                                args.project, mirror)
             log(f"Transfer: rsync from {args.pi_ssh}:{args.pi_workspace}/{args.project}", "info")
-        else:
+        elif mode == "archive":
             transfer = ArchiveTransfer(client, args.project, mirror)
             log("Transfer: CTT project ZIP archive (pulled at the end).", "info")
+        else:
+            transfer = HttpFileTransfer(client, args.project, mirror)
+            log("Transfer: direct per-file over the CTT API (no zip/ssh) → "
+                "files land straight in the folder.", "info")
     except CTTError as exc:
         log(str(exc), "err")
         return 2

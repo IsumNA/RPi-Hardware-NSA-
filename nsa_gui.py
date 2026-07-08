@@ -1044,10 +1044,22 @@ class Imx662DataStudio(tk.Toplevel):
 
         self._build_chrome()
         self._refresh()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.transient(master)
         place_window(self, 980, 700, master=master, min_w=640, min_h=520)
         master._grab_when_ready(self)
+        # Poll the dataset so captures made while this window is open show up live.
+        self._auto_on = True
+        self._auto_id = self.after(4000, self._auto_tick)
+
+    def _on_close(self):
+        self._auto_on = False
+        try:
+            if getattr(self, "_auto_id", None):
+                self.after_cancel(self._auto_id)
+        except Exception:  # noqa: BLE001
+            pass
+        self.destroy()
 
     def _build_chrome(self):
         pad = S(20)
@@ -1058,9 +1070,9 @@ class Imx662DataStudio(tk.Toplevel):
         tk.Label(
             header,
             text=("Point at your PI_RAW folder (e.g. /opt/datasets/PI_RAW). "
-                  "Top section shows what your manager already captured "
-                  "(cabinet_*, colour_stripes, imx219_ag*). Lower sections show "
-                  "what you still need for IMX662 noise synthesis."),
+                  "Top section shows what's captured (cabinet_*, imx219_ag*); "
+                  "lower sections show what's still missing. Updates live as new "
+                  "pairs are captured."),
             bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(900), justify="left",
         ).pack(anchor="w", pady=(S(2), 0))
 
@@ -1173,17 +1185,63 @@ class Imx662DataStudio(tk.Toplevel):
             self.root_var.set(p)
             self._refresh()
 
-    def _refresh(self):
+    def _compute_audit(self) -> dict:
         from nsa.dataset_layout import IMX662_TARGET_AG_TAGS, audit_project
         root = Path(self.root_var.get().strip() or ".")
         try:
             gain = int(self.gain_var.get())
         except ValueError:
             gain = 256
-        self._audit = audit_project(
-            root, gain=gain, imx662_ag_tags=IMX662_TARGET_AG_TAGS,
-        )
+        return audit_project(root, gain=gain, imx662_ag_tags=IMX662_TARGET_AG_TAGS)
 
+    @staticmethod
+    def _audit_signature(audit: dict) -> str:
+        # Compact fingerprint of what's on disk so the auto-refresh poll only
+        # redraws the tree when something actually changed.
+        parts = [str(audit.get("pi_raw_root", ""))]
+        for section, slots in (audit.get("by_section") or {}).items():
+            for sl in slots:
+                parts.append(f"{section}/{sl.get('title')}={sl.get('status')}:{sl.get('found', 0)}")
+                for ch in sl.get("children") or []:
+                    parts.append(f"{ch.get('folder_name')}={ch.get('has_pair')}:"
+                                 f"{len(ch.get('files') or {})}")
+        return "|".join(parts)
+
+    def _refresh(self, *_a):
+        self._render_audit(self._compute_audit())
+
+    def _auto_tick(self):
+        # Poll the dataset in the background so newly-captured pairs show up live,
+        # redrawing only when the on-disk fingerprint changes.
+        if not getattr(self, "_auto_on", False):
+            return
+        def work():
+            try:
+                audit = self._compute_audit()
+            except Exception:  # noqa: BLE001
+                audit = None
+
+            def apply():
+                if not getattr(self, "_auto_on", False):
+                    return
+                if audit is not None and \
+                        self._audit_signature(audit) != getattr(self, "_sig", None):
+                    self._render_audit(audit)
+                self._auto_id = self.after(4000, self._auto_tick)
+            try:
+                self.after(0, apply)
+            except Exception:  # noqa: BLE001
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_audit(self, audit: dict):
+        from nsa.dataset_layout import IMX662_TARGET_AG_TAGS
+        # Remember the selected slot so an auto-refresh redraw keeps the user's place.
+        sel = self.tree.selection()
+        prev_rel = (self._tree_items.get(sel[0]) or {}).get("rel_path") if sel else None
+
+        self._audit = audit
+        self._sig = self._audit_signature(audit)
         sm = self._audit.get("summary", {})
         inv = self._audit.get("pi_raw_inventory", {})
         cal = self._audit.get("calibration_pipeline") or {}
@@ -1200,7 +1258,7 @@ class Imx662DataStudio(tk.Toplevel):
         ag_on_disk = ", ".join(inv.get("ag_tags", [])[:8]) or "—"
         self.summary_lbl.config(
             text=(
-                f"PI_RAW {exists}: {self._audit.get('pi_raw_root', root)}  ·  "
+                f"PI_RAW {exists}: {self._audit.get('pi_raw_root', self.root_var.get())}  ·  "
                 f"{sm.get('scenes_on_disk', 0)} scenes  ·  "
                 f"tags on disk: {ag_on_disk}  ·  "
                 f"noise calibration: {cal_ok}"
@@ -1260,6 +1318,14 @@ class Imx662DataStudio(tk.Toplevel):
             )
             self.tree.item(sec_id, open=(section != "on_disk" and missing > 0)
                           or section == "on_disk")
+
+        if prev_rel:
+            for iid, sl in self._tree_items.items():
+                if sl.get("rel_path") == prev_rel:
+                    self.tree.selection_set(iid)
+                    self.tree.see(iid)
+                    self._on_select()
+                    break
 
     def _on_select(self, _evt=None):
         sel = self.tree.selection()
@@ -1865,6 +1931,9 @@ class CttCaptureWizard(tk.Toplevel):
         self._plan: list = []
         self._idx = 0
         self._recorded: list = []
+        # pair_dest paths already derived+filed, so per-cabinet saving and the
+        # final reconcile don't redo work.
+        self._derived_pairs: set = set()
         self._project_root = None
         self._controls_range: dict = {}
         self._busy = False
@@ -1888,7 +1957,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
         self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
-        self.transfer_var = tk.StringVar(value="archive")
+        self.transfer_var = tk.StringVar(value="http")
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
         self.autostart_var = tk.BooleanVar(value=True)
@@ -2026,7 +2095,7 @@ class CttCaptureWizard(tk.Toplevel):
         tk.Label(tfr, text="Transfer", bg=WHITE, fg=INK,
                  font=font(10, "bold")).pack(side="left")
         ttk.Combobox(tfr, textvariable=self.transfer_var, width=10,
-                     values=["archive", "rsync"], state="readonly",
+                     values=["http", "rsync", "archive"], state="readonly",
                      style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
         tk.Label(tfr, text="SSH (rsync)", bg=WHITE, fg=INK,
                  font=font(10)).pack(side="left")
@@ -2038,8 +2107,10 @@ class CttCaptureWizard(tk.Toplevel):
             side="left", padx=(S(6), 0))
         tk.Label(
             parent,
-            text=("archive = pull the project ZIP over HTTPS (no setup). "
-                  "rsync = incremental pull over SSH (needs key access to the Pi)."),
+            text=("http = direct per-file over the CTT API — no zip, no SSH; "
+                  "images land straight in the folder (default). "
+                  "rsync = incremental pull over SSH (needs key access). "
+                  "archive = whole-project ZIP over HTTPS."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(6), 0))
 
@@ -2283,15 +2354,20 @@ class CttCaptureWizard(tk.Toplevel):
         self._plan = plan
         self._idx = 0
         self._recorded = []
+        self._derived_pairs = set()
         # Build the transfer backend.
         mirror = project_root / ".ctt_mirror"
+        mode = self.transfer_var.get()
         try:
-            if self.transfer_var.get() == "rsync":
+            if mode == "rsync":
                 self._transfer = self.backend.RsyncTransfer(
                     self.ssh_var.get().strip(), self.workspace_var.get().strip(),
                     self.project_var.get().strip(), mirror)
-            else:
+            elif mode == "archive":
                 self._transfer = self.backend.ArchiveTransfer(
+                    client, self.project_var.get().strip(), mirror)
+            else:  # "http" — direct per-file over the CTT API (no zip, no ssh)
+                self._transfer = self.backend.HttpFileTransfer(
                     client, self.project_var.get().strip(), mirror)
         except self.backend.CTTError as exc:
             messagebox.showerror("Transfer", str(exc))
@@ -2534,7 +2610,8 @@ class CttCaptureWizard(tk.Toplevel):
             return
         st = self._plan[self._idx]
         project = self.project_var.get().strip()
-        incremental = isinstance(self._transfer, self.backend.RsyncTransfer)
+        # Everything except the whole-project ZIP files DNGs per station.
+        incremental = not isinstance(self._transfer, self.backend.ArchiveTransfer)
         capture_lux = self._capture_lux if self._capture_lux else st.lux
 
         # Real-pair scenes sweep the whole gain series after this single setup.
@@ -2569,29 +2646,94 @@ class CttCaptureWizard(tk.Toplevel):
         def status(msg, kind="info"):
             self.after(0, lambda: self._set_status(msg, kind))
 
+        scene = st.meta.get("scene", "scene")
+        # Read Tk vars on the main thread before spawning the worker.
+        min_frames = min(8, int(self.burst_var.get() or "48"))
+        publish_dest = self.publish_path_var.get().strip() if self.publish_var.get() else ""
+
         def work():
             try:
                 recs = self.backend.capture_gain_sweep(
                     self._client, project, st, burst_frames=st.frames,
                     status=status, stop=self._stop.is_set)
                 self._recorded.extend(recs)
-                placed = 0
-                if incremental:
-                    for rec in recs:
-                        mirror = self._transfer.fetch(rec.ctt_filenames)
-                        placed += self.backend._place_files(mirror, rec)
-                self.after(0, lambda: self._swept(len(recs), placed, incremental))
+                # Save THIS cabinet now — transfer DNGs, derive noisy/gt pairs and
+                # publish to the AI server — so finished cabinets are on disk even
+                # if a later one fails, and Dataset Studio sees them immediately.
+                status(f"{scene}: saving {len(recs)} pair(s)…")
+                result = self._save_recs(recs, incremental, min_frames)
+                if publish_dest and result["derived"]:
+                    result["publish"] = self._publish_now(publish_dest)
+                self.after(0, lambda: self._swept(scene, recs, result))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._capture_fail(str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _swept(self, n_gains: int, placed: int, incremental: bool):
-        self._set_busy(False)
+    def _save_recs(self, recs: list, incremental: bool, min_frames: int) -> dict:
+        """Pull a cabinet's DNGs local, file them, and derive real noisy/gt pairs.
+
+        Runs on a worker thread. rsync fetches only the new frames; the archive
+        backend has no per-file endpoint, so we pull the whole project once per
+        cabinet (a handful of times) rather than only at the very end.
+        """
+        fnames = [f for rec in recs for f in rec.ctt_filenames]
         if incremental:
-            self._set_status(f"Swept {n_gains} gain(s), filed {placed} DNG(s) → advancing.", "ok")
+            mirror = self._transfer.fetch(fnames)
         else:
-            self._set_status(f"Swept {n_gains} gain(s) (pulled at finish) → advancing.", "ok")
+            mirror = self._transfer.finalize()  # archive: whole-project pull
+        placed = 0
+        for rec in recs:
+            placed += self.backend._place_files(mirror, rec)
+
+        derived, failed = [], []
+        rawpy_ok = self.backend._have_rawpy()
+        if rawpy_ok:
+            for rec in recs:
+                meta = rec.station.meta
+                pd = meta.get("pair_dest")
+                if not meta.get("is_real_pair") or not pd or pd in self._derived_pairs:
+                    continue
+                try:
+                    res = self.backend.derive_real_pair(
+                        rec.station.dest, pd, min_frames=min_frames)
+                    self.backend.write_gain_sidecar(pd, meta)
+                    self._derived_pairs.add(pd)
+                    tag = (f"ag{meta['requested_gain']}"
+                           if meta.get("requested_gain") is not None else "pair")
+                    derived.append(f"{tag}: {res['noisy']}+{res['gt']}")
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{meta.get('requested_gain', '?')}: {exc}")
+        return {"placed": placed, "derived": derived, "failed": failed,
+                "rawpy": rawpy_ok}
+
+    def _publish_now(self, dest: str) -> dict | None:
+        """Copy the current PI_RAW tree to the AI-server dataset root (idempotent —
+        skips files already there). Returns the publish summary or None."""
+        if not dest:
+            return None
+        try:
+            return self.backend.publish_pi_raw(self._project_root / "PI_RAW", dest)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc), "verified": 0, "failures": [], "dest": dest}
+
+    def _swept(self, scene: str, recs: list, result: dict):
+        self._set_busy(False)
+        n = len(recs)
+        parts = [f"{scene}: filed {result['placed']} DNG(s)"]
+        if result["rawpy"]:
+            parts.append(f"derived {len(result['derived'])}/{n} pair(s)")
+        else:
+            parts.append("pairs deferred to finish (rawpy not installed)")
+        pub = result.get("publish")
+        if pub is not None:
+            if pub.get("error"):
+                parts.append(f"AI-server copy FAILED ({pub['error']})")
+            else:
+                parts.append(f"AI server +{pub.get('copied', 0)} "
+                             f"(verified {pub.get('verified', 0)})")
+        kind = "warn" if (result["failed"] or (pub and pub.get("error"))) else "ok"
+        self._set_status("  ·  ".join(parts) + " → advancing.", kind)
         self.after(600, lambda: self._show_station(self._idx + 1))
 
     def _capture_fail(self, err: str):
@@ -2621,14 +2763,20 @@ class CttCaptureWizard(tk.Toplevel):
 
         def work():
             try:
-                mirror = self._transfer.finalize()
-                total = 0
-                for rec in self._recorded:
+                # Only pull/finalise the stations that aren't already fully on disk
+                # (per-cabinet saving files most of them during capture) — this
+                # avoids a redundant whole-project archive re-download at the end.
+                def complete(rec):
+                    n = len(rec.ctt_filenames)
                     have = len(list(rec.station.dest.glob("*.dng"))) \
                         if rec.station.dest.is_dir() else 0
-                    if have >= len(rec.ctt_filenames) and have > 0:
-                        continue
-                    total += self.backend._place_files(mirror, rec)
+                    return n > 0 and have >= n
+                need = [rec for rec in self._recorded if not complete(rec)]
+                total = 0
+                if need:
+                    mirror = self._transfer.finalize()
+                    for rec in need:
+                        total += self.backend._place_files(mirror, rec)
                 self.after(0, lambda: self._finished(total))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._set_status(f"Finalise failed: {e}", "err"))
@@ -2650,27 +2798,32 @@ class CttCaptureWizard(tk.Toplevel):
                     "The burst DNGs are captured, but averaging them into gt.png "
                     "needs rawpy:\n\n    pip install rawpy")
             self.applied_lbl.config(text=(
-                f"Filed {placed} DNG(s). Building real noisy/gt pairs "
-                "(temporal average)…"))
-            self._set_status("Deriving real pairs…")
+                f"Filed {placed} DNG(s). Reconciling any remaining pairs "
+                "(most were saved per cabinet during capture)…"))
+            self._set_status("Finalising real pairs…")
 
             def work():
                 out = []
+                min_frames = min(8, int(self.burst_var.get() or "48"))
                 for rec in self._recorded:
                     meta = rec.station.meta
                     if not meta.get("is_real_pair"):
                         continue
+                    pd = meta.get("pair_dest")
+                    tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
+                           if meta.get("requested_gain") is not None else "")
+                    if pd in self._derived_pairs:
+                        out.append(f"{meta['scene']}{tag}: saved during capture")
+                        continue
                     try:
                         res = self.backend.derive_real_pair(
-                            rec.station.dest, meta["pair_dest"],
-                            min_frames=min(8, int(self.burst_var.get() or "48")))
-                        self.backend.write_gain_sidecar(meta["pair_dest"], meta)
-                        tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
-                               if meta.get("requested_gain") is not None else "")
+                            rec.station.dest, pd, min_frames=min_frames)
+                        self.backend.write_gain_sidecar(pd, meta)
+                        self._derived_pairs.add(pd)
                         out.append(f"{meta['scene']}{tag}: {res['noisy']} + {res['gt']} "
                                    f"(gt from {res['frames_used']} frames)")
                     except Exception as exc:  # noqa: BLE001
-                        out.append(f"{meta['scene']}: FAILED — {exc}")
+                        out.append(f"{meta['scene']}{tag}: FAILED — {exc}")
                 self.after(0, lambda: self._pairs_done(out))
 
             self._set_busy(True)
