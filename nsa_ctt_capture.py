@@ -631,7 +631,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 f"• The wizard meters + locks, then shoots {args.burst_frames} frames:\n"
                 "  noisy = 1 real frame (real sensor noise); gt = temporal average\n"
                 "  of all frames (same brightness, much cleaner).\n"
-                f"• → PI_RAW/Data/{scene}/imx662_{ag_tag}_test/  (noisy.dng + gt.png)"
+                f"• → PI_RAW/Data/{scene}/imx662_{ag_tag}_test/  (noisy.png + gt.png)"
             )
             meta = {"scene": scene, "is_real_pair": True, "pair_dest": str(test_dir)}
         else:
@@ -677,22 +677,28 @@ def derive_real_pair(burst_dir: Path | str, test_dir: Path | str, *,
                      min_frames: int = 8, max_side: int = 0) -> dict:
     """Turn a captured burst into a real noisy/gt pair (denoise-hw layout).
 
-    ``noisy.dng`` is the first real frame (kept raw, genuine sensor noise);
-    ``gt.png`` is the temporal average of the burst (needs rawpy to decode DNGs).
+    Both files are written as PNG — matching every other <sensor>_ag<N>_test
+    folder already in PI_RAW (imx219_*, and the existing imx662_ag12_test
+    sample), not a DNG-for-noisy format unique to this tool. ``noisy.png`` is
+    one real frame decoded straight off the sensor (genuine sensor noise, not
+    synthesised or averaged); ``gt.png`` is the temporal average of the burst.
     Written into ``test_dir`` (e.g. PI_RAW/Data/<scene>/imx662_ag24_test/).
     """
-    from nsa.gt_capture import burst_folder_to_gt, list_burst_frames
+    from nsa.gt_capture import burst_folder_to_gt, list_burst_frames, write_gt_png
+    from nsa.raw_io import _load_any
 
     burst_dir = Path(burst_dir)
     test_dir = Path(test_dir)
     test_dir.mkdir(parents=True, exist_ok=True)
     frames = list_burst_frames(burst_dir)  # sorted; raises if empty
-    noisy = test_dir / f"noisy{frames[0].suffix.lower()}"
-    shutil.copy2(frames[0], noisy)  # real single-frame noise
+
+    noisy_rgb = _load_any(frames[0])  # decode one real frame — real sensor noise
+    write_gt_png(test_dir / "noisy.png", noisy_rgb)
+
     manifest = burst_folder_to_gt(
         str(burst_dir), str(test_dir / "gt.png"),
         min_frames=min(max(2, min_frames), len(frames)), max_side=max_side)
-    return {"scene_dir": str(test_dir), "noisy": noisy.name, "gt": "gt.png",
+    return {"scene_dir": str(test_dir), "noisy": "noisy.png", "gt": "gt.png",
             "frames_used": manifest["frames_used"]}
 
 
