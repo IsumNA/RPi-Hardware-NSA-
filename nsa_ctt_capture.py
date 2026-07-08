@@ -58,10 +58,22 @@ from nsa.dataset_layout import (
     resolve_layout,
     scaffold_imx662_project,
 )
+from nsa.denoise_hw_data import SYSTEM_PI_RAW  # canonical AI-server dataset root
 from nsa.theme import banner, console, kv_table, level_rule, log
 
 # Capture is capped server-side at 16 frames per POST (see ctt-server capture()).
 CTT_MAX_BURST = 16
+
+# Per-attempt timeout for /api/health while polling a (re)starting server. Kept
+# short so a hung-but-listening server (e.g. still holding a stale camera handle
+# after a light-box power-cycle) fails fast and we get many retries inside the
+# wait window — instead of one 30s read-timeout eating the whole budget.
+HEALTH_POLL_TIMEOUT = 5.0
+
+# Default light-box intensity (%) used when auto-lighting a scene. The light box
+# is driven purely by intensity percentage now (no target-lux metering); tweak
+# per-station with the GUI's % field / SET button or --lightbox-percent.
+DEFAULT_LIGHTBOX_PERCENT = 100.0
 
 # lightSTUDIO-S illuminant names (from probe) — direct 1:1 matches.
 LIGHTBOX_ILLUMINANTS = {
@@ -148,8 +160,8 @@ class CTTClient:
             raise CTTError(f"POST {path} failed: {exc}") from exc
 
     # --- camera ----------------------------------------------------------- #
-    def health(self) -> dict:
-        r = self._get("/api/health")
+    def health(self, *, timeout: float | None = None) -> dict:
+        r = self._get("/api/health", timeout=timeout)
         try:
             return r.json()
         except ValueError:
@@ -203,8 +215,7 @@ class CTTClient:
     def _settled_lux(self, *, settle: float = 0.6, retries: int = 4) -> float:
         """Read measured lux, retrying briefly if it comes back 0 — a transient
         right after a light/exposure change while auto-exposure re-converges.
-        Trusting a stray 0 here sends the meter_to_lux binary search the wrong
-        way for the rest of its iterations."""
+        A stray 0 would be logged as bogus capture metadata."""
         lux = 0.0
         for _ in range(retries):
             time.sleep(settle)
@@ -212,31 +223,6 @@ class CTTClient:
             if lux > 0:
                 return lux
         return lux
-
-    def meter_to_lux(self, target_lux: int, illuminant: str, *,
-                     percent_range: tuple[float, float] = (1, 100),
-                     max_iter: int = 10, tol: float = 0.12) -> tuple[float, float]:
-        """Binary-search the lightbox intensity to hit a target lux, reading the
-        camera's measured lux from /api/controls. Returns (percent, measured_lux).
-
-        ``illuminant`` is required on every intensity change — per the device's
-        API, setting an intensity is what selects the channel; there is no way
-        to nudge percent on an already-active channel without naming it again.
-        """
-        low, high = percent_range
-        mid, measured = (low + high) / 2, 0.0
-        for _ in range(max_iter):
-            mid = (low + high) / 2
-            self.set_lightbox(illuminant, mid)
-            measured = self._settled_lux()
-            error_pct = abs(measured - target_lux) / target_lux if target_lux > 0 else 0
-            if error_pct < tol:
-                break
-            if measured < target_lux:
-                low = mid
-            else:
-                high = mid
-        return mid, measured
 
     # --- projects --------------------------------------------------------- #
     def project_exists(self, name: str) -> bool:
@@ -340,7 +326,7 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
     CTTError with an actionable message otherwise.
     """
     try:
-        client.health()
+        client.health(timeout=HEALTH_POLL_TIMEOUT)
         return "running"
     except CTTError:
         pass  # not reachable yet
@@ -390,7 +376,7 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
     while time.time() < deadline:
         time.sleep(2.0)
         try:
-            client.health()
+            client.health(timeout=HEALTH_POLL_TIMEOUT)
             status("ctt-server is up.")
             return "started"
         except CTTError as exc:
@@ -781,20 +767,22 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                 f"→ {st.dest}", "info")
             continue
 
-        # For scene bursts, set the lightbox to the scene's target lux BEFORE
-        # the camera auto-meters — otherwise the locked exposure is metered
-        # against the wrong (pre-light-change) brightness.
+        # For scene bursts, set the lightbox illuminant + intensity BEFORE the
+        # camera auto-meters — otherwise the locked exposure is metered against
+        # the wrong (pre-light-change) brightness. The box is driven by intensity
+        # % only; we then read the measured lux back purely as capture metadata.
         capture_lux = st.lux
         if st.meta.get("is_real_pair"):
             scene = st.meta.get("scene")
-            illum, target_lux = parse_scene_light(scene)
-            if illum and target_lux:
+            illum, _ = parse_scene_light(scene)
+            if illum:
                 try:
-                    pct, meas = client.meter_to_lux(target_lux, illuminant=illum)
-                    log(f"Lightbox set to {illum} at {pct:.0f}% "
-                        f"(target {target_lux} lux, measured {meas:.0f})", "ok")
+                    client.set_lightbox(illum, DEFAULT_LIGHTBOX_PERCENT)
+                    meas = client._settled_lux()
+                    log(f"Lightbox set to {illum} at {DEFAULT_LIGHTBOX_PERCENT:.0f}% "
+                        f"(measured {meas:.0f} lux)", "ok")
                     if meas > 0:
-                        capture_lux = int(round(meas))  # log what was actually achieved
+                        capture_lux = int(round(meas))  # metadata only
                 except Exception as exc:  # noqa: BLE001
                     log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
 
@@ -882,6 +870,83 @@ def finalize_placement(transfer: Transfer, recorded: list[Recorded]) -> None:
             continue
         total += _place_files(mirror, rec)
     log(f"Finalised placement ({total} DNG(s) filed).", "ok")
+
+
+# --------------------------------------------------------------------------- #
+#  Publish to the AI-server dataset root (with read-back verification)
+# --------------------------------------------------------------------------- #
+def publish_pi_raw(project_pi_raw: Path | str,
+                   dest_root: Path | str = SYSTEM_PI_RAW) -> dict:
+    """Copy the produced PI_RAW tree to the AI-server dataset root and VERIFY it.
+
+    ``project_pi_raw`` is the wizard's ``<project>/PI_RAW`` folder; its contents
+    are mirrored into ``dest_root`` (default ``/opt/datasets/PI_RAW`` — the path
+    NSA training auto-detects on the AI machine). Every copied file is read back
+    and its size compared, so the returned summary is proof the images are
+    actually there, not just that a copy call returned.
+
+    Returns a dict:
+        {"dest": str, "copied": int, "verified": int, "skipped": int,
+         "failures": [str, ...], "error": str | None}
+    ``error`` is set (and copied/verified are 0) when the destination could not
+    be written at all — e.g. ``/opt`` needs root. Callers should surface it.
+    """
+    src = Path(project_pi_raw)
+    dest = Path(dest_root).expanduser()
+    summary: dict[str, Any] = {"dest": str(dest), "copied": 0, "verified": 0,
+                               "skipped": 0, "failures": [], "error": None}
+
+    files = [p for p in src.rglob("*") if p.is_file()] if src.is_dir() else []
+    if not files:
+        summary["error"] = f"nothing to publish — {src} has no files."
+        return summary
+
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        summary["error"] = (
+            f"cannot write to {dest}: {exc}. "
+            f"Create it once with:  sudo mkdir -p {dest} && "
+            f"sudo chown $USER {dest}")
+        return summary
+
+    for f in files:
+        rel = f.relative_to(src)
+        target = dest / rel
+        try:
+            # Skip files already present and identical (fast re-runs).
+            if target.exists() and target.stat().st_size == f.stat().st_size:
+                summary["skipped"] += 1
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+                summary["copied"] += 1
+            # Read-back verification: it must exist AND match the source size.
+            if target.exists() and target.stat().st_size == f.stat().st_size:
+                summary["verified"] += 1
+            else:
+                summary["failures"].append(str(rel))
+        except OSError as exc:
+            summary["failures"].append(f"{rel}: {exc}")
+
+    return summary
+
+
+def _log_publish(summary: dict) -> None:
+    """Log a human-readable confirmation of a publish_pi_raw() result."""
+    dest = summary["dest"]
+    if summary["error"]:
+        log(f"NOT published to AI server ({dest}): {summary['error']}", "err")
+        return
+    verified = summary["verified"]
+    total = verified + len(summary["failures"])
+    if summary["failures"]:
+        log(f"Published to AI server {dest}: verified {verified}/{total} file(s); "
+            f"FAILED: {', '.join(summary['failures'][:5])}"
+            + (" …" if len(summary["failures"]) > 5 else ""), "warn")
+    else:
+        log(f"Confirmed on AI server {dest}: {verified} file(s) present "
+            f"(copied {summary['copied']}, already-there {summary['skipped']}).", "ok")
 
 
 # --------------------------------------------------------------------------- #
@@ -1007,6 +1072,11 @@ def main() -> int:
     # Behaviour
     p.add_argument("--run-post", action="store_true",
                    help="also run calibrate_noise / capture_gt / simulate_dataset")
+    p.add_argument("--publish-to", default=str(SYSTEM_PI_RAW),
+                   help="AI-server dataset root to copy the finished PI_RAW pairs "
+                        f"into and verify (default: {SYSTEM_PI_RAW})")
+    p.add_argument("--no-publish", action="store_true",
+                   help="do not copy the finished pairs to the AI-server dataset root")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     args = p.parse_args()
 
@@ -1103,6 +1173,14 @@ def main() -> int:
                 log(f"{meta['scene']}: could not derive pair: {exc}", "err")
     else:
         post_process(project_root, args, list(args.scenes))
+
+    # Publish the finished PI_RAW pairs to the AI-server dataset root so training
+    # picks them up, and read them back to confirm they actually landed.
+    if not args.no_publish:
+        console.print()
+        level_rule(99, "Publishing to the AI-server dataset")
+        summary = publish_pi_raw(project_root / "PI_RAW", args.publish_to)
+        _log_publish(summary)
 
     console.print()
     log("Done. Point Dataset Studio's PI_RAW root at "

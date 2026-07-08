@@ -1844,6 +1844,10 @@ class CttCaptureWizard(tk.Toplevel):
         self.autostart_var = tk.BooleanVar(value=True)
         self.cttcmd_var = tk.StringVar(value="ctt-server")
         self.autolight_var = tk.BooleanVar(value=True)
+        # Copy the finished PI_RAW pairs to the AI-server dataset root (and verify)
+        # so training picks them up. Default = the path NSA auto-detects.
+        self.publish_var = tk.BooleanVar(value=True)
+        self.publish_path_var = tk.StringVar(value=str(backend.SYSTEM_PI_RAW))
         self._lightbox_present = False
         self._lightbox_illums = []      # driver's channel names, for the override combo
         self._light_manual_override = False  # user hand-set the light for this station
@@ -2001,20 +2005,43 @@ class CttCaptureWizard(tk.Toplevel):
         ttk.Entry(asr, textvariable=self.cttcmd_var, width=24, font=font(10)).pack(
             side="left")
 
-        # Lightbox: if a lightSTUDIO-S is attached to the Pi, auto-set the
-        # illuminant + intensity from each scene's name (cabinet_D50_100 → D50, 100 lux).
+        # Lightbox: if a lightSTUDIO-S is attached to the Pi, auto-select the
+        # illuminant from each scene's name (cabinet_D50_100 → D50) at a default
+        # intensity. Intensity is set as a % — no target-lux metering.
         lbr = tk.Frame(parent, bg=WHITE)
         lbr.pack(fill="x", pady=(S(6), 0))
         tk.Checkbutton(
-            lbr, text="  Auto-set lightbox from scene name (illuminant + lux)",
+            lbr, text="  Auto-select lightbox illuminant from scene name",
             variable=self.autolight_var, bg=WHITE, fg=INK, selectcolor=WHITE,
             activebackground=WHITE, font=font(10)).pack(side="left")
         tk.Label(
             parent,
             text=("Needs a lightSTUDIO-S plugged into the Pi. Scenes named "
-                  "<name>_<illuminant>_<lux> (e.g. cabinet_D50_100) get the light "
-                  "switched and metered to that target automatically; other scene "
-                  "names are left to manual lighting."),
+                  "<name>_<illuminant>_<lux> (e.g. cabinet_D50_100) get that "
+                  "illuminant switched on at the default intensity; set the exact "
+                  "intensity % per station with the SET button. Other scene names "
+                  "are left to manual lighting."),
+            bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
+            justify="left").pack(anchor="w", pady=(S(2), 0))
+
+        # Publish: copy the finished PI_RAW pairs onto the AI-server dataset root
+        # and read them back to confirm they landed (so training sees them).
+        pub = tk.Frame(parent, bg=WHITE)
+        pub.pack(fill="x", pady=(S(8), 0))
+        tk.Checkbutton(
+            pub, text="  Copy finished pairs to AI-server dataset",
+            variable=self.publish_var, bg=WHITE, fg=INK, selectcolor=WHITE,
+            activebackground=WHITE, font=font(10)).pack(side="left")
+        tk.Label(pub, text="dataset root", bg=WHITE, fg=INK,
+                 font=font(10)).pack(side="left", padx=(S(12), S(6)))
+        ttk.Entry(pub, textvariable=self.publish_path_var, width=30,
+                  font=font(10)).pack(side="left", fill="x", expand=True)
+        tk.Label(
+            parent,
+            text=("After the pairs are built they're copied here and verified "
+                  "(size-checked read-back). This is the path NSA training "
+                  "auto-detects on the AI machine — leave it as /opt/datasets/PI_RAW "
+                  "unless your dataset lives elsewhere."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2071,19 +2098,13 @@ class CttCaptureWizard(tk.Toplevel):
             override, textvariable=self.light_illum_var, width=10, state="readonly",
             style="Rpi.TCombobox")
         self.light_illum_combo.pack(side="left", padx=(S(4), S(10)))
-        tk.Label(override, text="%", bg=WHITE, fg=INK, font=font(9)).pack(side="left")
-        self.light_pct_var = tk.StringVar(value="50")
+        tk.Label(override, text="intensity %", bg=WHITE, fg=INK,
+                 font=font(9)).pack(side="left")
+        self.light_pct_var = tk.StringVar(value="100")
         ttk.Entry(override, textvariable=self.light_pct_var, width=5,
                  font=font(9)).pack(side="left", padx=(S(4), S(8)))
         RoundButton(override, "SET", self._set_light_manual, kind="secondary",
                    width=64, height=26).pack(side="left")
-        tk.Label(override, text="target lux", bg=WHITE, fg=INK,
-                 font=font(9)).pack(side="left", padx=(S(10), S(4)))
-        self.light_lux_var = tk.StringVar(value="")
-        ttk.Entry(override, textvariable=self.light_lux_var, width=6,
-                 font=font(9)).pack(side="left", padx=(0, S(8)))
-        RoundButton(override, "METER", self._meter_light_manual, kind="secondary",
-                   width=70, height=26).pack(side="left")
 
         self.progress_lbl = tk.Label(right, text="", bg=WHITE, fg=SUBTLE,
                                      font=font(9), anchor="w")
@@ -2322,10 +2343,9 @@ class CttCaptureWizard(tk.Toplevel):
         self._capture_lux = st.lux  # CTT requires a positive lux for macbeth captures
         is_scene = bool(st.meta.get("is_real_pair"))
         if is_scene and self._lightbox_present:
-            illum, lux = self.backend.parse_scene_light(st.meta.get("scene", ""))
+            illum, _ = self.backend.parse_scene_light(st.meta.get("scene", ""))
             self.light_illum_var.set(illum or (self._lightbox_illums[0]
                                                 if self._lightbox_illums else ""))
-            self.light_lux_var.set(str(lux) if lux else "")
             self.light_lbl.config(text="Lightbox ready.", fg=SUBTLE)
             self.light_fr.pack(anchor="w", fill="x", pady=(S(10), 0))
         else:
@@ -2350,17 +2370,23 @@ class CttCaptureWizard(tk.Toplevel):
                      and bool(self.autolight_var.get())
                      and not self._light_manual_override)
 
+        try:
+            pct = float(self.light_pct_var.get())
+        except (ValueError, tk.TclError):
+            pct = self.backend.DEFAULT_LIGHTBOX_PERCENT
+
         def work():
             try:
                 light_info = None
                 # Light the scene BEFORE the camera auto-meters, otherwise the
-                # locked exposure is metered against the wrong brightness.
+                # locked exposure is metered against the wrong brightness. The
+                # box is driven purely by intensity % (no target-lux search).
                 if auto_light:
-                    illum, target_lux = self.backend.parse_scene_light(
-                        st.meta.get("scene", ""))
-                    if illum and target_lux:
-                        pct, meas = self._client.meter_to_lux(target_lux, illuminant=illum)
-                        light_info = (illum, pct, target_lux, meas)
+                    illum, _ = self.backend.parse_scene_light(st.meta.get("scene", ""))
+                    if illum:
+                        self._client.set_lightbox(illum, pct)
+                        meas = self._client._settled_lux()
+                        light_info = (illum, pct, meas)
                 applied = self.backend._apply_controls(self._client, st)
                 self.after(0, lambda: self._applied(applied, light_info))
             except Exception as exc:  # noqa: BLE001
@@ -2368,7 +2394,7 @@ class CttCaptureWizard(tk.Toplevel):
 
         self._set_busy(True)
         self._set_status("Applying camera settings…" if not auto_light
-                         else "Metering lightbox, then applying camera settings…")
+                         else "Setting lightbox, then applying camera settings…")
         threading.Thread(target=work, daemon=True).start()
 
     def _applied(self, applied: dict, light_info: tuple | None = None):
@@ -2387,16 +2413,15 @@ class CttCaptureWizard(tk.Toplevel):
             f"Set up the rig as above, then press CAPTURE "
             f"({st.frames} frame(s))." + dark_note))
         if light_info:
-            illum, pct, target_lux, meas = light_info
+            illum, pct, meas = light_info
             self.light_illum_var.set(illum)
             self.light_pct_var.set(f"{pct:.0f}")
             if meas > 0:
-                self._capture_lux = int(round(meas))  # log what was actually achieved
-            ok = abs(meas - target_lux) / max(target_lux, 1) < 0.15
+                self._capture_lux = int(round(meas))  # measured lux, metadata only
             self.light_lbl.config(
-                text=(f"Auto-set {illum} to {pct:.0f}% → measured {meas:.0f} lux "
-                     f"(target {target_lux}). Override below if needed."),
-                fg=SUBTLE if ok else AMBER)
+                text=(f"Set {illum} to {pct:.0f}% → measured {meas:.0f} lux. "
+                     "Adjust the intensity % and press SET if needed."),
+                fg=SUBTLE)
         elif st.meta.get("is_real_pair") and self._lightbox_present:
             self.light_lbl.config(
                 text="Auto-light off or scene name unparseable — set manually below.",
@@ -2421,48 +2446,17 @@ class CttCaptureWizard(tk.Toplevel):
         def work():
             try:
                 self._client.set_lightbox(illum, pct)
+                meas = self._client._settled_lux()
+                if meas > 0:
+                    self._capture_lux = int(round(meas))  # metadata only
                 self.after(0, lambda: self._set_status(
-                    f"Lightbox set to {illum} at {pct:.0f}%.", "ok"))
+                    f"Lightbox set to {illum} at {pct:.0f}% (measured {meas:.0f} lux). "
+                    "Press RE-APPLY to re-lock exposure to this light.", "ok"))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._set_status(
                     f"Lightbox set failed: {e}", "err"))
 
         threading.Thread(target=work, daemon=True).start()
-
-    def _meter_light_manual(self):
-        if self._busy or self._client is None:
-            return
-        illum = self.light_illum_var.get().strip()
-        if not illum:
-            messagebox.showerror("Lightbox", "Pick an illuminant first.")
-            return
-        try:
-            target_lux = int(self.light_lux_var.get())
-        except ValueError:
-            messagebox.showerror("Lightbox", "Target lux must be a number.")
-            return
-        self._light_manual_override = True
-
-        def work():
-            try:
-                pct, meas = self._client.meter_to_lux(target_lux, illuminant=illum)
-                self.after(0, lambda: self._light_metered(pct, meas, target_lux))
-            except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda e=exc: self._set_status(f"Meter failed: {e}", "err"))
-
-        self._set_status(f"Metering {illum} to {target_lux} lux…")
-        threading.Thread(target=work, daemon=True).start()
-
-    def _light_metered(self, pct: float, meas: float, target_lux: int):
-        self.light_pct_var.set(f"{pct:.0f}")
-        if meas > 0:
-            self._capture_lux = int(round(meas))
-        ok = abs(meas - target_lux) / max(target_lux, 1) < 0.15
-        self.light_lbl.config(
-            text=f"Metered to {meas:.0f} lux (target {target_lux}) at {pct:.0f}%.",
-            fg=SUBTLE if ok else AMBER)
-        self._set_status("Lightbox metered. Re-apply (RE-APPLY) to lock exposure "
-                         "to the new light level.", "ok")
 
     def _capture(self):
         if self._busy or not self._plan:
@@ -2630,6 +2624,52 @@ class CttCaptureWizard(tk.Toplevel):
             "Real noisy/gt pairs written under\n"
             f"{pi_raw}\n\n" + "\n".join(lines)))
         self._set_status(f"Done — {len(lines)} real pair(s) in PI_RAW.", "ok")
+        self._publish_pairs()
+
+    def _publish_pairs(self):
+        """Copy the finished PI_RAW pairs to the AI-server dataset root and
+        confirm (read-back) that they actually landed there."""
+        if not self.publish_var.get():
+            return
+        dest = self.publish_path_var.get().strip()
+        if not dest:
+            return
+        src = self._project_root / "PI_RAW"
+        self._set_status(f"Publishing to AI server ({dest})…")
+        self._set_busy(True)
+
+        def work():
+            summary = self.backend.publish_pi_raw(src, dest)
+            self.after(0, lambda: self._published(summary))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _published(self, summary: dict):
+        self._set_busy(False)
+        dest = summary["dest"]
+        prior = self.applied_lbl.cget("text")
+        if summary["error"]:
+            self.applied_lbl.config(text=prior + f"\n\nAI-server copy FAILED:\n{summary['error']}")
+            self._set_status(f"NOT saved to AI server: {summary['error']}", "err")
+            messagebox.showerror(
+                "AI-server copy failed",
+                f"The pairs are saved locally, but could NOT be copied to\n{dest}\n\n"
+                f"{summary['error']}")
+            return
+        verified = summary["verified"]
+        total = verified + len(summary["failures"])
+        if summary["failures"]:
+            self.applied_lbl.config(text=(
+                prior + f"\n\nAI server ({dest}): verified {verified}/{total}; "
+                f"FAILED: {', '.join(summary['failures'][:4])}"))
+            self._set_status(f"Partly saved to AI server: {verified}/{total} verified.", "warn")
+        else:
+            self.applied_lbl.config(text=(
+                prior + f"\n\nConfirmed on AI server:\n{dest}\n"
+                f"{verified} file(s) present (copied {summary['copied']}, "
+                f"already-there {summary['skipped']})."))
+            self._set_status(
+                f"Confirmed — {verified} file(s) saved on AI server ({dest}).", "ok")
 
     def _open_builder(self):
         # Hand off to the existing noise dataset wizard, prefilled.
