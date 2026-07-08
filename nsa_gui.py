@@ -1847,6 +1847,7 @@ class CttCaptureWizard(tk.Toplevel):
         self._lightbox_present = False
         self._lightbox_illums = []      # driver's channel names, for the override combo
         self._light_manual_override = False  # user hand-set the light for this station
+        self._capture_lux = None  # actual lux to send with capture() — CTT requires >0 for macbeth
 
         self._build_chrome()
         self._show_connect()
@@ -2318,6 +2319,7 @@ class CttCaptureWizard(tk.Toplevel):
 
         # Lightbox panel only makes sense for scene stations with a device attached.
         self._light_manual_override = False
+        self._capture_lux = st.lux  # CTT requires a positive lux for macbeth captures
         is_scene = bool(st.meta.get("is_real_pair"))
         if is_scene and self._lightbox_present:
             illum, lux = self.backend.parse_scene_light(st.meta.get("scene", ""))
@@ -2388,6 +2390,8 @@ class CttCaptureWizard(tk.Toplevel):
             illum, pct, target_lux, meas = light_info
             self.light_illum_var.set(illum)
             self.light_pct_var.set(f"{pct:.0f}")
+            if meas > 0:
+                self._capture_lux = int(round(meas))  # log what was actually achieved
             ok = abs(meas - target_lux) / max(target_lux, 1) < 0.15
             self.light_lbl.config(
                 text=(f"Auto-set {illum} to {pct:.0f}% → measured {meas:.0f} lux "
@@ -2451,6 +2455,8 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _light_metered(self, pct: float, meas: float, target_lux: int):
         self.light_pct_var.set(f"{pct:.0f}")
+        if meas > 0:
+            self._capture_lux = int(round(meas))
         ok = abs(meas - target_lux) / max(target_lux, 1) < 0.15
         self.light_lbl.config(
             text=f"Metered to {meas:.0f} lux (target {target_lux}) at {pct:.0f}%.",
@@ -2464,12 +2470,13 @@ class CttCaptureWizard(tk.Toplevel):
         st = self._plan[self._idx]
         project = self.project_var.get().strip()
         incremental = isinstance(self._transfer, self.backend.RsyncTransfer)
+        capture_lux = self._capture_lux if self._capture_lux else st.lux
 
         def work():
             try:
                 added = self._client.capture(
                     project, image_type=st.image_type, frames=st.frames,
-                    colour_temp=st.colour_temp, lux=st.lux)
+                    colour_temp=st.colour_temp, lux=capture_lux)
                 fnames = [a["filename"] for a in added
                           if a.get("filename", "").lower().endswith(".dng")]
                 rec = self.backend.Recorded(station=st, ctt_filenames=fnames)

@@ -646,6 +646,12 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 "• Nothing in the frame may move until capture finishes."
             )
             meta = {"scene": scene}
+        # CTT rejects "macbeth"-type captures with no (or non-positive) lux.
+        # Use the scene's own target lux when the name encodes one (real mode);
+        # otherwise fall back to the CLI value or a generic "well lit" default
+        # — it's just a metadata field CTT logs alongside the capture.
+        _, parsed_lux = parse_scene_light(scene)
+        station_lux = parsed_lux or args.lux or 500
         stations.append(Station(
             station_id=f"burst_{scene}",
             title=title,
@@ -656,7 +662,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             naming=lambda i: f"burst_{i:03d}.dng",
             controls=None,  # auto-meter then lock
             colour_temp=args.colour_temp,
-            lux=args.lux,
+            lux=station_lux,
             check_chart=False,
             meta=meta,
         ))
@@ -772,6 +778,7 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         # For scene bursts, set the lightbox to the scene's target lux BEFORE
         # the camera auto-meters — otherwise the locked exposure is metered
         # against the wrong (pre-light-change) brightness.
+        capture_lux = st.lux
         if st.meta.get("is_real_pair"):
             scene = st.meta.get("scene")
             illum, target_lux = parse_scene_light(scene)
@@ -780,6 +787,8 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                     pct, meas = client.meter_to_lux(target_lux, illuminant=illum)
                     log(f"Lightbox set to {illum} at {pct:.0f}% "
                         f"(target {target_lux} lux, measured {meas:.0f})", "ok")
+                    if meas > 0:
+                        capture_lux = int(round(meas))  # log what was actually achieved
                 except Exception as exc:  # noqa: BLE001
                     log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
 
@@ -825,7 +834,7 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         try:
             added = client.capture(
                 PROJECT_NAME, image_type=st.image_type, frames=st.frames,
-                colour_temp=st.colour_temp, lux=st.lux,
+                colour_temp=st.colour_temp, lux=capture_lux,
             )
         except CTTError as exc:
             log(f"Capture failed: {exc}", "err")
