@@ -390,6 +390,39 @@ def _ssh_cmd(ssh: str, inner: str) -> list[str]:
     return ["ssh", *SSH_OPTS, ssh, f"bash -c {shlex.quote(inner)}"]
 
 
+def _ssh_hint(stderr: str) -> str | None:
+    """Turn a raw ssh stderr line into an actionable hint, or None."""
+    low = stderr.lower()
+    if "no route to host" in low:
+        return ("Cannot reach the Pi over the network (no route to host). "
+                "Check it is powered on, on the same network, and the IP "
+                f"({stderr.split()[-1] if stderr.split() else 'see SSH target'}) "
+                "is correct.")
+    if "connection timed out" in low or "operation timed out" in low:
+        return ("SSH to the Pi timed out. Check the IP address, Wi‑Fi/Ethernet, "
+                "and that nothing is blocking port 22.")
+    if "connection refused" in low:
+        return ("SSH on the Pi refused the connection (port 22). "
+                "Enable SSH on the Pi (raspi-config) or check sshd is running.")
+    if "permission denied" in low:
+        return ("SSH login failed (permission denied). Set up key-based login "
+                "to the Pi, or check the username in the SSH target.")
+    if "name or service not known" in low or "could not resolve hostname" in low:
+        return "SSH hostname could not be resolved — check the SSH target."
+    return None
+
+
+def _probe_ssh(ssh: str) -> tuple[bool, str]:
+    """Quick reachability check before blaming ctt-server paths."""
+    res = subprocess.run(_ssh_cmd(ssh, "echo OK"), capture_output=True, text=True,
+                         timeout=15)
+    if res.returncode == 0 and "OK" in res.stdout:
+        return True, ""
+    err = (res.stderr or res.stdout or "unknown ssh error").strip()
+    hint = _ssh_hint(err)
+    return False, hint or f"SSH to {ssh} failed: {err}"
+
+
 def _discover_ctt_server(ssh: str) -> str | None:
     """Locate the ctt-server executable on the Pi (usually a venv console script).
 
@@ -423,24 +456,44 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
     try:
         client.health(timeout=HEALTH_POLL_TIMEOUT)
         return "running"
-    except CTTError:
-        pass  # not reachable yet
+    except CTTError as exc:
+        ctt_err = str(exc)  # not reachable yet — may try SSH auto-start below
 
     if not autostart:
-        raise CTTError(f"CTT server at {client.base} is not responding "
-                       "(auto-start is off).")
+        raise CTTError(
+            f"CTT server at {client.base} is not responding (auto-start is off).\n"
+            f"Last error: {ctt_err}\n"
+            "Start ctt-server on the Pi manually, or re-enable auto-start.")
+
     if not ssh:
-        raise CTTError("CTT server is not reachable and no SSH target is set to "
-                       "start it. Set the Pi SSH target (e.g. pi@10.3.195.212).")
+        raise CTTError(
+            f"CTT server at {client.base} is not responding.\n"
+            f"Last error: {ctt_err}\n"
+            "Set the Pi SSH target (e.g. pi@10.3.195.212) so the wizard can "
+            "auto-start ctt-server, or start it on the Pi yourself.")
     if shutil.which("ssh") is None:
         raise CTTError("ssh was not found on PATH on this machine.")
+
+    ok, ssh_err = _probe_ssh(ssh)
+    if not ok:
+        raise CTTError(
+            f"CTT server at {client.base} is not responding, and SSH could not "
+            f"reach the Pi to start it.\n\n{ssh_err}")
 
     # If the given command isn't directly runnable (common when it's a venv
     # console script off the login PATH), auto-discover its real location.
     # Skipped for compound commands like 'source …/activate && ctt-server'.
     if all(tok not in ctt_cmd for tok in ("&&", ";", "|", " ")):
-        chk = subprocess.run(_ssh_cmd(ssh, f"command -v {shlex.quote(ctt_cmd)}"),
-                             capture_output=True, text=True)
+        # A path form (~/ctt-venv/bin/ctt-server) is checked for existence; a
+        # bare name (ctt-server) is looked up on PATH. Keep a leading ~/ unquoted
+        # so the Pi's shell still expands it (quoting the whole path would not).
+        if "/" in ctt_cmd:
+            target = ("~/" + shlex.quote(ctt_cmd[2:])) if ctt_cmd.startswith("~/") \
+                else shlex.quote(ctt_cmd)
+            probe = f"test -x {target}"
+        else:
+            probe = f"command -v {shlex.quote(ctt_cmd)}"
+        chk = subprocess.run(_ssh_cmd(ssh, probe), capture_output=True, text=True)
         if chk.returncode != 0:
             discovered = _discover_ctt_server(ssh)
             if discovered:
@@ -451,8 +504,7 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
                     f"'{ctt_cmd}' is not on the Pi and could not be found in the "
                     "usual venv locations. Give the full path (e.g. "
                     "~/ctt-venv/bin/ctt-server) or a command like "
-                    "'source ~/ctt-venv/bin/activate && ctt-server'."
-                    + (f"\n(ssh error: {chk.stderr.strip()})" if chk.stderr.strip() else ""))
+                    "'source ~/ctt-venv/bin/activate && ctt-server'.")
 
     status(f"Starting {ctt_cmd} on {ssh} …")
     full = f"{ctt_cmd} --host 0.0.0.0 --port {int(port)}"
@@ -463,8 +515,10 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
     launch = f"setsid nohup {full} > ~/ctt-server.log 2>&1 < /dev/null & echo LAUNCHED"
     res = subprocess.run(_ssh_cmd(ssh, launch), capture_output=True, text=True, timeout=25)
     if res.returncode != 0 or "LAUNCHED" not in res.stdout:
-        raise CTTError("Could not start ctt-server over SSH: "
-                       + (res.stderr.strip() or res.stdout.strip() or "unknown error"))
+        err = (res.stderr or res.stdout or "unknown error").strip()
+        hint = _ssh_hint(err)
+        raise CTTError("Could not start ctt-server over SSH"
+                       + (f":\n{hint}" if hint else f": {err}"))
 
     deadline = time.time() + wait_s
     last = ""
@@ -1300,9 +1354,9 @@ def main() -> int:
                    help="ssh target for rsync + auto-start, e.g. pi@10.3.195.212")
     p.add_argument("--pi-workspace", default="~/ctt-server-workspace",
                    help="CTT workspace root on the Pi (CTT_CAPTURE_WORKSPACE)")
-    p.add_argument("--pi-ctt-cmd", default="ctt-server",
+    p.add_argument("--pi-ctt-cmd", default="~/ctt-venv/bin/ctt-server",
                    help="command to launch the CTT server on the Pi "
-                        "(auto-discovered in common venvs if not on PATH)")
+                        "(auto-discovered in common venvs if not found)")
     p.add_argument("--no-autostart", action="store_true",
                    help="do not SSH in to start ctt-server if it isn't already running")
     p.add_argument("--autostart-wait", type=float, default=45.0,

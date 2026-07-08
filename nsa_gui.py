@@ -1961,7 +1961,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
         self.autostart_var = tk.BooleanVar(value=True)
-        self.cttcmd_var = tk.StringVar(value="ctt-server")
+        self.cttcmd_var = tk.StringVar(value="~/ctt-venv/bin/ctt-server")
         self.autolight_var = tk.BooleanVar(value=True)
         # Copy the finished PI_RAW pairs to the AI-server dataset root (and verify)
         # so training picks them up. Default = the path NSA auto-detects.
