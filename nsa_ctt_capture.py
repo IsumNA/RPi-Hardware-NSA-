@@ -75,6 +75,35 @@ HEALTH_POLL_TIMEOUT = 5.0
 # per-station with the GUI's % field / SET button or --lightbox-percent.
 DEFAULT_LIGHTBOX_PERCENT = 100.0
 
+# Real-pair capture sweeps the analogue gain across this series per scene: one
+# noisy/gt pair per gain, filed into imx662_ag<gain>_test. The IMX662 analogue
+# gain register spans 72 dB (up to ~3980×), so these are all reachable in
+# hardware — but the libcamera tuning/mode may clamp a requested value, in which
+# case the achieved gain is recorded alongside the pair.
+DEFAULT_GAIN_SWEEP = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+
+def parse_gain_sweep(spec: str | list | tuple | None) -> list[int]:
+    """Parse a gain-sweep spec ("1,2,4,...,512" or a list) into sorted ints."""
+    if spec is None or spec == "":
+        return list(DEFAULT_GAIN_SWEEP)
+    if isinstance(spec, (list, tuple)):
+        raw = spec
+    else:
+        raw = str(spec).replace("×", "").replace("x", "").split(",")
+    gains: list[int] = []
+    for tok in raw:
+        tok = str(tok).strip()
+        if not tok:
+            continue
+        try:
+            g = int(round(float(tok)))
+        except ValueError as exc:
+            raise ValueError(f"invalid gain in sweep: {tok!r}") from exc
+        if g >= 1:
+            gains.append(g)
+    return sorted(dict.fromkeys(gains)) or list(DEFAULT_GAIN_SWEEP)
+
 # lightSTUDIO-S illuminant names (from probe) — direct 1:1 matches.
 LIGHTBOX_ILLUMINANTS = {
     "F12": "F12",  # F12 fluorescent
@@ -605,21 +634,28 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     # 4) scene bursts. The burst frames land in bursts/<scene>/take01/ either way;
     #    the mode changes only what we derive from them afterwards.
     pi_raw = project_root / "PI_RAW"
+    gain_sweep = parse_gain_sweep(getattr(args, "gain_sweep", None) or DEFAULT_GAIN_SWEEP)
     for scene in args.scenes:
         if mode == "real":
-            test_dir = pi_raw / "Data" / scene / f"imx662_{ag_tag}_test"
-            title = f"REAL PAIR  ·  {scene}"
+            gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
+            title = f"REAL PAIR SWEEP  ·  {scene}"
             setup = (
                 f"• LENS CAP OFF. Set up the REAL scene '{scene}' exactly as you want\n"
-                "  to denoise it — dim it to your target LOW-LIGHT level (that dim\n"
-                "  scene at high gain is where the real noise comes from).\n"
-                "• Rigid tripod — it must be perfectly STATIC during the burst.\n"
-                f"• The wizard meters + locks, then shoots {args.burst_frames} frames:\n"
-                "  noisy = 1 real frame (real sensor noise); gt = temporal average\n"
-                "  of all frames (same brightness, much cleaner).\n"
-                f"• → PI_RAW/Data/{scene}/imx662_{ag_tag}_test/  (noisy.png + gt.png)"
+                "  to denoise it — dim it to your target LOW-LIGHT level, then DON'T\n"
+                "  touch it: the wizard sweeps the whole gain series in one go.\n"
+                "• Rigid tripod — perfectly STATIC for the ENTIRE sweep.\n"
+                f"• One CAPTURE meters the scene, then shoots {args.burst_frames} frames\n"
+                f"  at EACH gain ({gains_txt}), holding brightness constant\n"
+                "  (exposure scaled ∝ 1/gain). noisy = 1 real frame; gt = temporal\n"
+                "  average of the burst.\n"
+                f"• → PI_RAW/Data/{scene}/imx662_ag<GAIN>_test/  (noisy.png + gt.png)"
             )
-            meta = {"scene": scene, "is_real_pair": True, "pair_dest": str(test_dir)}
+            meta = {
+                "scene": scene, "is_real_pair": True, "gain_sweep": list(gain_sweep),
+                "burst_root": str(project_root / "bursts" / scene),
+                "pair_root": str(pi_raw / "Data" / scene),
+                "exp_min": exp_min, "exp_max": exp_max,
+            }
         else:
             title = f"SCENE BURST  ·  {scene}"
             setup = (
@@ -686,6 +722,95 @@ def derive_real_pair(burst_dir: Path | str, test_dir: Path | str, *,
         min_frames=min(max(2, min_frames), len(frames)), max_side=max_side)
     return {"scene_dir": str(test_dir), "noisy": "noisy.png", "gt": "gt.png",
             "frames_used": manifest["frames_used"]}
+
+
+# --------------------------------------------------------------------------- #
+#  Gain sweep — one rig setup, many gains
+# --------------------------------------------------------------------------- #
+def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
+                       burst_frames: int,
+                       status: Callable[..., None] = lambda *_a, **_k: None,
+                       stop: Callable[[], bool] = lambda: False) -> list[Recorded]:
+    """Sweep the analogue gain for a real-pair scene after a single rig setup.
+
+    Meters the scene ONCE (auto-exposure) to fix the target brightness = exposure
+    × gain, then for each gain in ``station.meta['gain_sweep']`` sets a
+    constant-brightness exposure (∝ 1/gain), captures a burst, and returns one
+    ``Recorded`` per gain — each filed to ``bursts/<scene>/ag<g>`` and paired into
+    ``imx662_ag<g>_test``. Folder tags use the REQUESTED gain; the actual gain the
+    sensor reports (it can clamp at the tuning/mode limit) is kept in the meta so
+    a sidecar can record the ground truth.
+    """
+    meta = station.meta
+    scene = meta["scene"]
+    gains = list(meta["gain_sweep"])
+    burst_root = Path(meta["burst_root"])
+    pair_root = Path(meta["pair_root"])
+    exp_min = int(meta.get("exp_min", 13))
+    exp_max = int(meta.get("exp_max", 33_000))
+
+    # Meter once (auto-exposure) to establish the target brightness. Using the
+    # exposure×gain product means we can rebuild a matching exposure at any gain.
+    client.set_controls({"auto_exposure": True})
+    time.sleep(1.5)
+    cur = client.get_controls()
+    product = max(float(exp_min),
+                  float(cur.get("exposure", 10_000)) * float(cur.get("gain", 1.0)))
+    status(f"Metered {scene}: brightness target ≈ {product/1000:.1f} ms·× — "
+           f"sweeping {len(gains)} gain(s).", "ok")
+
+    recs: list[Recorded] = []
+    for g in gains:
+        if stop():
+            break
+        exposure = int(min(max(round(product / g), exp_min), exp_max))
+        client.set_controls({"auto_exposure": False, "gain": float(g),
+                             "exposure": exposure})
+        time.sleep(0.4)  # gain/exposure latch a frame or two later
+        actual = float(client.get_controls().get("gain", g))
+        clamped = abs(actual - g) / g > 0.10
+        if clamped:
+            status(f"ag{g}: sensor clamped gain to {actual:g}× (tuning/mode limit); "
+                   f"folder still tagged ag{g}, actual gain recorded.", "warn")
+        added = client.capture(project, image_type=station.image_type,
+                               frames=burst_frames, colour_temp=station.colour_temp,
+                               lux=station.lux)
+        fnames = [a["filename"] for a in added
+                  if a.get("filename", "").lower().endswith(".dng")]
+        gstation = Station(
+            station_id=f"burst_{scene}_ag{g}",
+            title=f"{scene} · ag{g}",
+            setup="",
+            image_type=station.image_type,
+            frames=burst_frames,
+            dest=burst_root / f"ag{g}",
+            naming=lambda i: f"burst_{i:03d}.dng",
+            colour_temp=station.colour_temp,
+            lux=station.lux,
+            meta={"scene": scene, "is_real_pair": True,
+                  "pair_dest": str(pair_root / f"imx662_ag{g}_test"),
+                  "requested_gain": g, "actual_gain": actual,
+                  "clamped": clamped, "exposure_us": exposure},
+        )
+        recs.append(Recorded(station=gstation, ctt_filenames=fnames))
+        status(f"ag{g}: {len(fnames)} DNG(s) at {actual:g}× "
+               f"(exp {exposure/1000:.2f} ms).", "ok")
+    return recs
+
+
+def write_gain_sidecar(pair_dir: Path | str, rec_meta: dict) -> None:
+    """Record the TRUE captured gain next to a derived pair. Folder tags use the
+    requested gain; this ``gain.json`` is the ground truth of what the sensor did
+    (and flags when the requested gain was clamped)."""
+    import json
+    pair_dir = Path(pair_dir)
+    pair_dir.mkdir(parents=True, exist_ok=True)
+    (pair_dir / "gain.json").write_text(json.dumps({
+        "requested_gain": rec_meta.get("requested_gain"),
+        "actual_gain": rec_meta.get("actual_gain"),
+        "clamped": bool(rec_meta.get("clamped", False)),
+        "exposure_us": rec_meta.get("exposure_us"),
+    }, indent=2), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -823,6 +948,29 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         if action == "quit":
             log("Quitting the wizard.", "warn")
             return recorded
+
+        # Real-pair scenes sweep the gain series in one go; everything else fires
+        # a single burst.
+        if st.meta.get("gain_sweep"):
+            try:
+                recs = capture_gain_sweep(
+                    client, PROJECT_NAME, st, burst_frames=st.frames,
+                    status=lambda m, k="info": log(m, k))
+            except CTTError as exc:
+                log(f"Gain sweep failed: {exc}", "err")
+                if _prompt("[q]uit · [Enter] continue:") == "q":
+                    break
+                continue
+            recorded.extend(recs)
+            if incremental:
+                for rec in recs:
+                    try:
+                        mirror = transfer.fetch(rec.ctt_filenames)
+                        placed = _place_files(mirror, rec)
+                        log(f"Filed {placed} DNG(s) → {rec.station.dest}", "ok")
+                    except CTTError as exc:
+                        log(f"Transfer failed (will retry at finalize): {exc}", "warn")
+            continue
 
         # Fire the burst.
         try:
@@ -1032,8 +1180,12 @@ def main() -> int:
                    help="'real' = capture genuine noisy/gt scene pairs (real noise); "
                         "'calib' = bias/dark/flat noise-model calibration + synthesis")
     p.add_argument("--ag-tag", default="ag24",
-                   help="analogue-gain folder tag for real pairs "
-                        "(PI_RAW/Data/<scene>/imx662_<tag>_test)")
+                   help="(legacy) single analogue-gain folder tag; ignored in real "
+                        "mode, which now sweeps --gain-sweep")
+    p.add_argument("--gain-sweep", type=parse_gain_sweep, default=list(DEFAULT_GAIN_SWEEP),
+                   help="comma list of analogue gains to sweep per scene in real "
+                        "mode (default: 1,2,4,8,16,32,64,128,256,512). Each lands in "
+                        "PI_RAW/Data/<scene>/imx662_ag<gain>_test.")
     p.add_argument("--gain", type=int, default=256,
                    help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=list(MANAGER_SCENES))
@@ -1167,7 +1319,11 @@ def main() -> int:
             try:
                 res = derive_real_pair(rec.station.dest, meta["pair_dest"],
                                        min_frames=min(8, args.burst_frames))
-                log(f"{meta['scene']}: {res['noisy']} + {res['gt']} "
+                write_gain_sidecar(meta["pair_dest"], meta)
+                tag = ""
+                if meta.get("requested_gain") is not None:
+                    tag = f" [ag{meta['requested_gain']} → {meta.get('actual_gain', '?')}×]"
+                log(f"{meta['scene']}{tag}: {res['noisy']} + {res['gt']} "
                     f"(gt from {res['frames_used']} frames) → {res['scene_dir']}", "ok")
             except Exception as exc:  # noqa: BLE001
                 log(f"{meta['scene']}: could not derive pair: {exc}", "err")

@@ -1835,6 +1835,10 @@ class CttCaptureWizard(tk.Toplevel):
         self.gain_var = tk.StringVar(value="256")
         self.mode_var = tk.StringVar(value="real pairs")   # 'real pairs' | 'calibration'
         self.agtag_var = tk.StringVar(value="ag24")
+        # Real mode sweeps this analogue-gain series per scene (one pair per gain,
+        # filed into imx662_ag<gain>_test).
+        self.gains_var = tk.StringVar(
+            value=", ".join(str(g) for g in backend.DEFAULT_GAIN_SWEEP))
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
         self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
@@ -1945,13 +1949,15 @@ class CttCaptureWizard(tk.Toplevel):
         ttk.Combobox(moderow, textvariable=self.mode_var, width=14, state="readonly",
                      values=["real pairs", "calibration"],
                      style="Rpi.TCombobox").pack(side="left")
-        tk.Label(moderow, text="AG tag", bg=WHITE, fg=INK, font=font(10)).pack(
+        tk.Label(moderow, text="Gains", bg=WHITE, fg=INK, font=font(10)).pack(
             side="left", padx=(S(12), S(6)))
-        ttk.Entry(moderow, textvariable=self.agtag_var, width=8, font=font(10)).pack(
+        ttk.Entry(moderow, textvariable=self.gains_var, width=28, font=font(10)).pack(
             side="left")
-        tk.Label(grid, text="real pairs = capture genuine noisy+gt scene pairs into "
-                            "PI_RAW/Data/<scene>/imx662_<AG tag>_test.  calibration = "
-                            "bias/dark/flat noise model + synthesis.", bg=WHITE,
+        tk.Label(grid, text="real pairs = for EACH scene, sweep the Gains series (one "
+                            "genuine noisy+gt pair per gain) into PI_RAW/Data/<scene>/"
+                            "imx662_ag<gain>_test — one rig setup, all gains captured "
+                            "back-to-back.  calibration = bias/dark/flat noise model + "
+                            "synthesis.", bg=WHITE,
                  fg=SUBTLE, font=font(8), wraplength=S(820), justify="left").grid(
                      row=4, column=0, columnspan=4, sticky="w", pady=(S(2), S(2)))
 
@@ -2158,6 +2164,7 @@ class CttCaptureWizard(tk.Toplevel):
             scenes=scenes, colour_temp=5000, lux=None,
             mode="real" if self.mode_var.get().startswith("real") else "calib",
             ag_tag=(self.agtag_var.get().strip() or "ag24"),
+            gain_sweep=self.backend.parse_gain_sweep(self.gains_var.get()),
         )
 
     # -- connect -------------------------------------------------------------
@@ -2333,8 +2340,13 @@ class CttCaptureWizard(tk.Toplevel):
         self.step_lbl.config(text=f"Station {self._idx+1} of {len(self._plan)}")
         self.station_title.config(text=st.title)
         self.setup_lbl.config(text=st.setup)
-        self.progress_lbl.config(
-            text=f"→ files land in  {st.dest}")
+        if st.meta.get("gain_sweep"):
+            gains = st.meta["gain_sweep"]
+            self.progress_lbl.config(
+                text=(f"→ sweeps gains {', '.join(str(g) for g in gains)} into  "
+                      f"{st.meta['pair_root']}/imx662_ag<gain>_test"))
+        else:
+            self.progress_lbl.config(text=f"→ files land in  {st.dest}")
         self.back_btn.set_enabled(self._idx > 0)
         self.skip_btn.set_enabled(True)
 
@@ -2466,6 +2478,13 @@ class CttCaptureWizard(tk.Toplevel):
         incremental = isinstance(self._transfer, self.backend.RsyncTransfer)
         capture_lux = self._capture_lux if self._capture_lux else st.lux
 
+        # Real-pair scenes sweep the whole gain series after this single setup.
+        if st.meta.get("gain_sweep"):
+            self._set_busy(True)
+            self._set_status("Metering, then sweeping the gain series…")
+            self._capture_sweep(st, project, incremental)
+            return
+
         def work():
             try:
                 added = self._client.capture(
@@ -2486,6 +2505,35 @@ class CttCaptureWizard(tk.Toplevel):
         self._set_busy(True)
         self._set_status(f"Capturing {st.frames} frame(s)…")
         threading.Thread(target=work, daemon=True).start()
+
+    def _capture_sweep(self, st, project: str, incremental: bool):
+        def status(msg, kind="info"):
+            self.after(0, lambda: self._set_status(msg, kind))
+
+        def work():
+            try:
+                recs = self.backend.capture_gain_sweep(
+                    self._client, project, st, burst_frames=st.frames,
+                    status=status, stop=self._stop.is_set)
+                self._recorded.extend(recs)
+                placed = 0
+                if incremental:
+                    for rec in recs:
+                        mirror = self._transfer.fetch(rec.ctt_filenames)
+                        placed += self.backend._place_files(mirror, rec)
+                self.after(0, lambda: self._swept(len(recs), placed, incremental))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda e=exc: self._capture_fail(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _swept(self, n_gains: int, placed: int, incremental: bool):
+        self._set_busy(False)
+        if incremental:
+            self._set_status(f"Swept {n_gains} gain(s), filed {placed} DNG(s) → advancing.", "ok")
+        else:
+            self._set_status(f"Swept {n_gains} gain(s) (pulled at finish) → advancing.", "ok")
+        self.after(600, lambda: self._show_station(self._idx + 1))
 
     def _capture_fail(self, err: str):
         self._set_busy(False)
@@ -2557,7 +2605,10 @@ class CttCaptureWizard(tk.Toplevel):
                         res = self.backend.derive_real_pair(
                             rec.station.dest, meta["pair_dest"],
                             min_frames=min(8, int(self.burst_var.get() or "48")))
-                        out.append(f"{meta['scene']}: {res['noisy']} + {res['gt']} "
+                        self.backend.write_gain_sidecar(meta["pair_dest"], meta)
+                        tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
+                               if meta.get("requested_gain") is not None else "")
+                        out.append(f"{meta['scene']}{tag}: {res['noisy']} + {res['gt']} "
                                    f"(gt from {res['frames_used']} frames)")
                     except Exception as exc:  # noqa: BLE001
                         out.append(f"{meta['scene']}: FAILED — {exc}")
