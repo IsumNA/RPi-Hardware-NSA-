@@ -2258,11 +2258,17 @@ class CttCaptureWizard(tk.Toplevel):
         self._set_busy(False)
         st = self._plan[self._idx]
         mode = "auto-metered then locked" if st.controls is None else "locked"
+        # Bias/dark stations run at minimal/zero light, so the preview is black
+        # by design — call that out so it doesn't read as a broken feed.
+        dark_note = ""
+        if st.image_type == "dark":
+            dark_note = ("\nThe live preview is BLACK here on purpose — this station "
+                         "measures the sensor with the lens capped / minimal exposure.")
         self.applied_lbl.config(text=(
             f"Applied ({mode}):  exposure {applied.get('exposure', 0)/1000:.2f} ms  ·  "
             f"gain {applied.get('gain', 0):g}×\n"
             f"Set up the rig as above, then press CAPTURE "
-            f"({st.frames} frame(s))."))
+            f"({st.frames} frame(s))." + dark_note))
         self._set_status("Ready to capture.", "ok")
 
     def _capture(self):
