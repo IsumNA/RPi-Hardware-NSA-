@@ -640,14 +640,18 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
             title = f"REAL PAIR SWEEP  ·  {scene}"
             setup = (
-                f"• LENS CAP OFF. Set up the REAL scene '{scene}' exactly as you want\n"
-                "  to denoise it — dim it to your target LOW-LIGHT level, then DON'T\n"
-                "  touch it: the wizard sweeps the whole gain series in one go.\n"
-                "• Rigid tripod — perfectly STATIC for the ENTIRE sweep.\n"
-                f"• One CAPTURE meters the scene, then shoots {args.burst_frames} frames\n"
-                f"  at EACH gain ({gains_txt}), holding brightness constant\n"
-                "  (exposure scaled ∝ 1/gain). noisy = 1 real frame; gt = temporal\n"
-                "  average of the burst.\n"
+                f"• LENS CAP OFF. Frame '{scene}' on a rigid tripod and keep it\n"
+                "  perfectly STATIC — nothing may move for the whole sweep.\n"
+                "• LIGHT IT WELL, then leave the light alone. Use the Illuminant +\n"
+                "  intensity % control below: aim for a bright, clearly-lit preview\n"
+                "  with NO clipping (watch the CLIPPING readout on the left). Start\n"
+                "  around 100% and lower only if the highlights clip. You do NOT need\n"
+                "  to pick a lux value — leave it lit; the wizard measures it and adds\n"
+                "  the low-light noise itself by RAISING the gain, not by dimming.\n"
+                f"• Press CAPTURE once: it locks this brightness, then shoots\n"
+                f"  {args.burst_frames} frames at EACH gain ({gains_txt}) — lowering\n"
+                "  exposure as gain rises, so higher gain = more noise. noisy = 1 real\n"
+                "  frame per gain; gt = the averaged burst (clean).\n"
                 f"• → PI_RAW/Data/{scene}/imx662_ag<GAIN>_test/  (noisy.png + gt.png)"
             )
             meta = {

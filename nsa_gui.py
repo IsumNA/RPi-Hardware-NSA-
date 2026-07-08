@@ -2460,11 +2460,21 @@ class CttCaptureWizard(tk.Toplevel):
         if st.image_type == "dark":
             dark_note = ("\nThe live preview is BLACK here on purpose — this station "
                          "measures the sensor with the lens capped / minimal exposure.")
-        self.applied_lbl.config(text=(
-            f"Applied ({mode}):  exposure {applied.get('exposure', 0)/1000:.2f} ms  ·  "
-            f"gain {applied.get('gain', 0):g}×\n"
-            f"Set up the rig as above, then press CAPTURE "
-            f"({st.frames} frame(s))." + dark_note))
+        if st.meta.get("gain_sweep"):
+            gains = st.meta["gain_sweep"]
+            self.applied_lbl.config(text=(
+                f"Metered at gain 1× (exposure {applied.get('exposure', 0)/1000:.2f} ms) "
+                f"= this scene's brightness. When you press CAPTURE the wizard sweeps "
+                f"{len(gains)} gains ({', '.join(str(g) for g in gains)}), "
+                f"{st.frames} frames each, holding this brightness (exposure drops as "
+                "gain rises). No need to dim anything — just make sure it's well-lit "
+                "with no clipping." + dark_note))
+        else:
+            self.applied_lbl.config(text=(
+                f"Applied ({mode}):  exposure {applied.get('exposure', 0)/1000:.2f} ms  ·  "
+                f"gain {applied.get('gain', 0):g}×\n"
+                f"Set up the rig as above, then press CAPTURE "
+                f"({st.frames} frame(s))." + dark_note))
         if light_info:
             illum, pct, meas = light_info
             self.light_illum_var.set(illum)
