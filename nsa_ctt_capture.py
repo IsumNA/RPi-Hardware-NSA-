@@ -404,7 +404,16 @@ class Recorded:
 
 def build_plan(project_root: Path, args: argparse.Namespace,
                controls_range: dict) -> list[Station]:
-    """Assemble the ordered station plan from the dataset layout + CLI options."""
+    """Assemble the ordered station plan from the dataset layout + CLI options.
+
+    Two modes (``args.mode``):
+      * ``real``  — capture genuine noisy/gt scene pairs (real sensor noise) into
+                    PI_RAW/Data/<scene>/imx662_<ag>_test/. No calibration.
+      * ``calib`` — bias/dark/flat noise-model calibration + clean scene bursts
+                    for the synthesis pipeline.
+    """
+    mode = getattr(args, "mode", "real")
+    ag_tag = getattr(args, "ag_tag", "ag24")
     gain = args.gain
     cal = project_root / f"calibration/imx662_gain{gain}"
     # The advertised exposure_max is the sensor's absolute ceiling (hundreds of
@@ -423,6 +432,8 @@ def build_plan(project_root: Path, args: argparse.Namespace,
 
     stations: list[Station] = []
 
+    # bias/dark/flat are built here but only kept for mode == "calib" (filtered
+    # out at the end for "real" mode, which captures scene pairs only).
     # 1) bias — read noise at the operating gain: lens cap, minimum exposure.
     stations.append(Station(
         station_id="bias",
@@ -499,12 +510,27 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             meta={"first_flat": k == 1},
         ))
 
-    # 4) scene bursts — clean GT via temporal averaging.
+    # 4) scene bursts. The burst frames land in bursts/<scene>/take01/ either way;
+    #    the mode changes only what we derive from them afterwards.
+    pi_raw = project_root / "PI_RAW"
     for scene in args.scenes:
-        stations.append(Station(
-            station_id=f"burst_{scene}",
-            title=f"SCENE BURST  ·  {scene}",
-            setup=(
+        if mode == "real":
+            test_dir = pi_raw / "Data" / scene / f"imx662_{ag_tag}_test"
+            title = f"REAL PAIR  ·  {scene}"
+            setup = (
+                f"• LENS CAP OFF. Set up the REAL scene '{scene}' exactly as you want\n"
+                "  to denoise it — dim it to your target LOW-LIGHT level (that dim\n"
+                "  scene at high gain is where the real noise comes from).\n"
+                "• Rigid tripod — it must be perfectly STATIC during the burst.\n"
+                f"• The wizard meters + locks, then shoots {args.burst_frames} frames:\n"
+                "  noisy = 1 real frame (real sensor noise); gt = temporal average\n"
+                "  of all frames (same brightness, much cleaner).\n"
+                f"• → PI_RAW/Data/{scene}/imx662_{ag_tag}_test/  (noisy.dng + gt.png)"
+            )
+            meta = {"scene": scene, "is_real_pair": True, "pair_dest": str(test_dir)}
+        else:
+            title = f"SCENE BURST  ·  {scene}"
+            setup = (
                 f"• LENS CAP OFF. Frame the scene '{scene}' on a rigid tripod — it\n"
                 "  must be perfectly STATIC during the burst.\n"
                 "• Light it WELL (this is the CLEAN reference — don't shoot it dark;\n"
@@ -512,7 +538,12 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 "• The wizard meters once, locks exposure/gain, then shoots\n"
                 f"  {args.burst_frames} identical frames for temporal averaging.\n"
                 "• Nothing in the frame may move until capture finishes."
-            ),
+            )
+            meta = {"scene": scene}
+        stations.append(Station(
+            station_id=f"burst_{scene}",
+            title=title,
+            setup=setup,
             image_type="macbeth",
             frames=args.burst_frames,
             dest=project_root / "bursts" / scene / "take01",
@@ -521,10 +552,36 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             colour_temp=args.colour_temp,
             lux=args.lux,
             check_chart=False,
-            meta={"scene": scene},
+            meta=meta,
         ))
 
+    # Real mode captures scene pairs only — drop the calibration stations.
+    if mode == "real":
+        stations = [s for s in stations if s.station_id.startswith("burst_")]
     return stations
+
+
+def derive_real_pair(burst_dir: Path | str, test_dir: Path | str, *,
+                     min_frames: int = 8, max_side: int = 0) -> dict:
+    """Turn a captured burst into a real noisy/gt pair (denoise-hw layout).
+
+    ``noisy.dng`` is the first real frame (kept raw, genuine sensor noise);
+    ``gt.png`` is the temporal average of the burst (needs rawpy to decode DNGs).
+    Written into ``test_dir`` (e.g. PI_RAW/Data/<scene>/imx662_ag24_test/).
+    """
+    from nsa.gt_capture import burst_folder_to_gt, list_burst_frames
+
+    burst_dir = Path(burst_dir)
+    test_dir = Path(test_dir)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    frames = list_burst_frames(burst_dir)  # sorted; raises if empty
+    noisy = test_dir / f"noisy{frames[0].suffix.lower()}"
+    shutil.copy2(frames[0], noisy)  # real single-frame noise
+    manifest = burst_folder_to_gt(
+        str(burst_dir), str(test_dir / "gt.png"),
+        min_frames=min(max(2, min_frames), len(frames)), max_side=max_side)
+    return {"scene_dir": str(test_dir), "noisy": noisy.name, "gt": "gt.png",
+            "frames_used": manifest["frames_used"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -771,8 +828,14 @@ def main() -> int:
     # NSA layout
     p.add_argument("--root", "-o", default="datasets/imx662_project",
                    help="NSA project root (holds PI_RAW/, calibration/, bursts/)")
+    p.add_argument("--mode", choices=("real", "calib"), default="real",
+                   help="'real' = capture genuine noisy/gt scene pairs (real noise); "
+                        "'calib' = bias/dark/flat noise-model calibration + synthesis")
+    p.add_argument("--ag-tag", default="ag24",
+                   help="analogue-gain folder tag for real pairs "
+                        "(PI_RAW/Data/<scene>/imx662_<tag>_test)")
     p.add_argument("--gain", type=int, default=256,
-                   help="calibration gain label (folder imx662_gain<N>)")
+                   help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=list(MANAGER_SCENES))
     p.add_argument("--colour-temp", type=int, default=5000)
     p.add_argument("--lux", type=int, default=None)
@@ -885,7 +948,26 @@ def main() -> int:
         return 0
 
     finalize_placement(transfer, recorded)
-    post_process(project_root, args, list(args.scenes))
+
+    if args.mode == "real":
+        console.print()
+        level_rule(99, "Deriving real noisy/gt pairs")
+        if not _have_rawpy():
+            log("rawpy is required to average the burst into gt.png — install it: "
+                f"{sys.executable} -m pip install rawpy", "err")
+        for rec in recorded:
+            meta = rec.station.meta
+            if not meta.get("is_real_pair"):
+                continue
+            try:
+                res = derive_real_pair(rec.station.dest, meta["pair_dest"],
+                                       min_frames=min(8, args.burst_frames))
+                log(f"{meta['scene']}: {res['noisy']} + {res['gt']} "
+                    f"(gt from {res['frames_used']} frames) → {res['scene_dir']}", "ok")
+            except Exception as exc:  # noqa: BLE001
+                log(f"{meta['scene']}: could not derive pair: {exc}", "err")
+    else:
+        post_process(project_root, args, list(args.scenes))
 
     console.print()
     log("Done. Point Dataset Studio's PI_RAW root at "

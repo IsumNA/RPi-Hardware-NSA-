@@ -1833,6 +1833,8 @@ class CttCaptureWizard(tk.Toplevel):
         self.project_var = tk.StringVar(value="imx662")
         self.root_var = tk.StringVar(value=str(ROOT / "datasets" / "imx662_project"))
         self.gain_var = tk.StringVar(value="256")
+        self.mode_var = tk.StringVar(value="real pairs")   # 'real pairs' | 'calibration'
+        self.agtag_var = tk.StringVar(value="ag24")
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
         self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
@@ -1925,16 +1927,29 @@ class CttCaptureWizard(tk.Toplevel):
         row(1, "Operating gain", self.gain_var, 1)  # bias/dark/flat all shot at this
         row(2, "Flat levels", self.flatlevels_var, 0)
         row(2, "Burst frames", self.burst_var, 1)
-        tk.Label(grid, text="Bias, dark and flat frames are all captured at the "
-                            "operating gain, so the fitted noise model matches the "
-                            "real low-light regime.", bg=WHITE, fg=SUBTLE,
-                 font=font(8), wraplength=S(820), justify="left").grid(
-                     row=3, column=0, columnspan=4, sticky="w", pady=(S(2), S(2)))
+
+        # Capture mode + real-pairs folder tag.
+        tk.Label(grid, text="Mode", bg=WHITE, fg=INK, font=font(10, "bold")).grid(
+            row=3, column=0, sticky="w", pady=S(4))
+        moderow = tk.Frame(grid, bg=WHITE)
+        moderow.grid(row=3, column=1, columnspan=3, sticky="w")
+        ttk.Combobox(moderow, textvariable=self.mode_var, width=14, state="readonly",
+                     values=["real pairs", "calibration"],
+                     style="Rpi.TCombobox").pack(side="left")
+        tk.Label(moderow, text="AG tag", bg=WHITE, fg=INK, font=font(10)).pack(
+            side="left", padx=(S(12), S(6)))
+        ttk.Entry(moderow, textvariable=self.agtag_var, width=8, font=font(10)).pack(
+            side="left")
+        tk.Label(grid, text="real pairs = capture genuine noisy+gt scene pairs into "
+                            "PI_RAW/Data/<scene>/imx662_<AG tag>_test.  calibration = "
+                            "bias/dark/flat noise model + synthesis.", bg=WHITE,
+                 fg=SUBTLE, font=font(8), wraplength=S(820), justify="left").grid(
+                     row=4, column=0, columnspan=4, sticky="w", pady=(S(2), S(2)))
 
         tk.Label(grid, text="NSA project root", bg=WHITE, fg=INK,
-                 font=font(10, "bold")).grid(row=4, column=0, sticky="w", pady=S(4))
+                 font=font(10, "bold")).grid(row=5, column=0, sticky="w", pady=S(4))
         rootrow = tk.Frame(grid, bg=WHITE)
-        rootrow.grid(row=4, column=1, columnspan=3, sticky="ew")
+        rootrow.grid(row=5, column=1, columnspan=3, sticky="ew")
         rootrow.columnconfigure(0, weight=1)
         ttk.Entry(rootrow, textvariable=self.root_var, font=font(10)).grid(
             row=0, column=0, sticky="ew")
@@ -1942,9 +1957,9 @@ class CttCaptureWizard(tk.Toplevel):
                     width=44, height=30).grid(row=0, column=1, padx=(S(4), 0))
 
         tk.Label(grid, text="Scenes", bg=WHITE, fg=INK,
-                 font=font(10, "bold")).grid(row=5, column=0, sticky="w", pady=S(4))
+                 font=font(10, "bold")).grid(row=6, column=0, sticky="w", pady=S(4))
         ttk.Entry(grid, textvariable=self.scenes_var, font=font(10)).grid(
-            row=5, column=1, columnspan=3, sticky="ew")
+            row=6, column=1, columnspan=3, sticky="ew")
 
         # Transfer method.
         tfr = tk.Frame(parent, bg=WHITE)
@@ -2067,6 +2082,8 @@ class CttCaptureWizard(tk.Toplevel):
             flat_gain=0.0, flat_min_ms=1.0, flat_max_ms=30.0,
             burst_frames=int(self.burst_var.get() or "48"),
             scenes=scenes, colour_temp=5000, lux=None,
+            mode="real" if self.mode_var.get().startswith("real") else "calib",
+            ag_tag=(self.agtag_var.get().strip() or "ag24"),
         )
 
     # -- connect -------------------------------------------------------------
@@ -2348,6 +2365,43 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _finished(self, placed: int):
         self._set_busy(False)
+        self.back_btn.set_enabled(False)
+        rawpy_ok = self.backend._have_rawpy()
+        real = any(r.station.meta.get("is_real_pair") for r in self._recorded)
+
+        if real:
+            # Derive real noisy/gt pairs (temporal average) into PI_RAW.
+            if not rawpy_ok:
+                messagebox.showwarning(
+                    "rawpy not installed",
+                    "The burst DNGs are captured, but averaging them into gt.png "
+                    "needs rawpy:\n\n    pip install rawpy")
+            self.applied_lbl.config(text=(
+                f"Filed {placed} DNG(s). Building real noisy/gt pairs "
+                "(temporal average)…"))
+            self._set_status("Deriving real pairs…")
+
+            def work():
+                out = []
+                for rec in self._recorded:
+                    meta = rec.station.meta
+                    if not meta.get("is_real_pair"):
+                        continue
+                    try:
+                        res = self.backend.derive_real_pair(
+                            rec.station.dest, meta["pair_dest"],
+                            min_frames=min(8, int(self.burst_var.get() or "48")))
+                        out.append(f"{meta['scene']}: {res['noisy']} + {res['gt']} "
+                                   f"(gt from {res['frames_used']} frames)")
+                    except Exception as exc:  # noqa: BLE001
+                        out.append(f"{meta['scene']}: FAILED — {exc}")
+                self.after(0, lambda: self._pairs_done(out))
+
+            self._set_busy(True)
+            threading.Thread(target=work, daemon=True).start()
+            return
+
+        # Calibration mode → hand off to the noise dataset builder.
         gain = self.gain_var.get()
         cal_dir = self._project_root / f"calibration/imx662_gain{gain}"
         clean_dir = self._project_root / "clean_scenes"
@@ -2356,16 +2410,23 @@ class CttCaptureWizard(tk.Toplevel):
             f"Calibration → {cal_dir}\n"
             f"Scene bursts → {self._project_root / 'bursts'}"))
         self._set_status("Capture done. Build the noise model + dataset next.", "ok")
-        if not self.backend._have_rawpy():
+        if not rawpy_ok:
             messagebox.showwarning(
                 "rawpy not installed",
                 "The DNGs are captured and filed, but building the noise model and "
                 "ground truth needs rawpy to decode raw DNGs:\n\n    pip install rawpy")
-        self.back_btn.set_enabled(False)
         build = RoundButton(self, "BUILD NOISE DATASET", self._open_builder,
                             kind="primary", width=240, height=42)
         build.pack(pady=(0, S(10)))
         self._builder_prefill = (str(cal_dir), str(clean_dir))
+
+    def _pairs_done(self, lines: list):
+        self._set_busy(False)
+        pi_raw = self._project_root / "PI_RAW" / "Data"
+        self.applied_lbl.config(text=(
+            "Real noisy/gt pairs written under\n"
+            f"{pi_raw}\n\n" + "\n".join(lines)))
+        self._set_status(f"Done — {len(lines)} real pair(s) in PI_RAW.", "ok")
 
     def _open_builder(self):
         # Hand off to the existing noise dataset wizard, prefilled.
