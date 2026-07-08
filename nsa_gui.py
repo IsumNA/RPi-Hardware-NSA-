@@ -114,6 +114,66 @@ def font(size: float, weight: str = "normal", family: str | None = None):
     return (family, FT(size), weight)
 
 
+# Chrome allowances (title bar + desktop panel/taskbar) when clamping to screen.
+_SCREEN_MARGIN_W = 40
+_SCREEN_MARGIN_H = 96
+
+
+def fit_scale_to_screen(win, *, ref_w: int = 1180, ref_h: int = 820) -> None:
+    """Shrink the global UI SCALE so the largest window still fits the display.
+
+    The default scale is tuned for readability, not for small laptop panels
+    (common on Linux). If the biggest window (the CTT wizard, ~ref_w×ref_h
+    logical px) wouldn't fit at the current scale, drop the scale just enough
+    that it does — so windows open on-screen and stay resizable. Never scales
+    UP, and never below 0.8×."""
+    global SCALE
+    try:
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    except Exception:  # noqa: BLE001
+        return
+    fit = min((sw - _SCREEN_MARGIN_W) / ref_w, (sh - _SCREEN_MARGIN_H) / ref_h)
+    if fit < SCALE:
+        SCALE = max(0.8, fit)
+
+
+def place_window(win, w_logical: float, h_logical: float, *, master=None,
+                 min_w: float | None = None, min_h: float | None = None,
+                 resizable: bool = True) -> None:
+    """Size, position and constrain a window so it ALWAYS fits the screen.
+
+    Scales the requested logical size by S(), clamps it (and the minsize) to the
+    visible screen area, keeps the whole window on-screen, and makes it
+    resizable. Using this everywhere means no window can open bigger than the
+    display or with a minsize the screen can't satisfy — the root cause of the
+    'can't resize / window off-screen' behaviour on Linux."""
+    try:
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    except Exception:  # noqa: BLE001
+        sw, sh = 1920, 1080
+    avail_w, avail_h = sw - S(_SCREEN_MARGIN_W), sh - S(_SCREEN_MARGIN_H)
+    w = max(240, min(S(w_logical), avail_w))
+    h = max(180, min(S(h_logical), avail_h))
+    if master is not None:
+        try:
+            x = master.winfo_rootx() + S(24)
+            y = master.winfo_rooty() + S(20)
+        except Exception:  # noqa: BLE001
+            x, y = (sw - w) // 2, (sh - h) // 3
+    else:
+        x, y = (sw - w) // 2, (sh - h) // 3
+    x = max(0, min(x, sw - w))          # keep fully on-screen
+    y = max(0, min(y, sh - h))
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    mw = min(S(min_w) if min_w else w, avail_w)
+    mh = min(S(min_h) if min_h else h, avail_h)
+    win.minsize(max(240, mw), max(180, mh))
+    try:
+        win.resizable(bool(resizable), bool(resizable))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "rpi_logo.png"
 
@@ -589,13 +649,7 @@ class LiveView(tk.Toplevel):
         self.bind("<Escape>", lambda _e: self._on_close())
 
         self.update_idletasks()
-        w, h = S(840), S(700)
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w, h = min(w, sw - 40), min(h, sh - 80)
-        x = max(0, (sw - w) // 2)
-        y = max(0, (sh - h) // 3)
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(S(620), S(540))
+        place_window(self, 840, 700, master=master, min_w=560, min_h=460)
         try:
             self.transient(master)
         except Exception:  # noqa: BLE001
@@ -992,11 +1046,7 @@ class Imx662DataStudio(tk.Toplevel):
         self._refresh()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.transient(master)
-        try:
-            self.geometry(f"{S(980)}x{S(700)}+{master.winfo_rootx()+S(20)}"
-                          f"+{master.winfo_rooty()+S(20)}")
-        except Exception:  # noqa: BLE001
-            pass
+        place_window(self, 980, 700, master=master, min_w=640, min_h=520)
         master._grab_when_ready(self)
 
     def _build_chrome(self):
@@ -1396,11 +1446,7 @@ class NoiseDatasetWizard(tk.Toplevel):
         self._show_step(0)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.transient(master)
-        try:
-            self.geometry(f"{S(720)}x{S(640)}+{master.winfo_rootx()+S(40)}"
-                          f"+{master.winfo_rooty()+S(30)}")
-        except Exception:  # noqa: BLE001
-            pass
+        place_window(self, 720, 640, master=master, min_w=560, min_h=480)
         master._grab_when_ready(self)
 
     def _build_chrome(self):
@@ -1861,12 +1907,7 @@ class CttCaptureWizard(tk.Toplevel):
         self._show_connect()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.transient(master)
-        try:
-            self.geometry(f"{S(1180)}x{S(760)}+{master.winfo_rootx()+S(30)}"
-                          f"+{master.winfo_rooty()+S(20)}")
-        except Exception:  # noqa: BLE001
-            pass
-        self.minsize(S(1020), S(660))
+        place_window(self, 1180, 760, master=master, min_w=760, min_h=560)
         master._grab_when_ready(self)
         self.after(100, self._paint)
 
@@ -2747,6 +2788,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         _resolve_font_family()
+        # Shrink the default scale to the actual display before building anything,
+        # so windows fit and stay resizable on small Linux panels.
+        if not os.environ.get("NSA_UI_SCALE"):
+            fit_scale_to_screen(self)
         self.title("NAS — Neural Architecture Search")
         self.configure(bg=WHITE)
         self._apply_geometry()
@@ -4593,11 +4638,7 @@ class App(tk.Tk):
         dlg.title("Hugging Face — model sourcing")
         dlg.configure(bg=WHITE)
         dlg.transient(self)
-        try:
-            dlg.geometry(f"{S(740)}x{S(640)}+{self.winfo_rootx()+S(60)}"
-                         f"+{self.winfo_rooty()+S(30)}")
-        except Exception:
-            pass
+        place_window(dlg, 740, 640, master=self, min_w=520, min_h=440)
         self._grab_when_ready(dlg)
         self._hf_dlg = dlg
         self._hf_q = queue.Queue()
@@ -5618,11 +5659,7 @@ class App(tk.Tk):
         dlg.title("Run this model")
         dlg.configure(bg=WHITE)
         dlg.transient(self)
-        try:
-            dlg.geometry(f"{S(500)}x{S(500)}+{self.winfo_rootx()+S(120)}"
-                         f"+{self.winfo_rooty()+S(90)}")
-        except Exception:
-            pass
+        place_window(dlg, 500, 500, master=self, min_w=420, min_h=400)
         self._grab_when_ready(dlg)
 
         pad = tk.Frame(dlg, bg=WHITE)
@@ -5724,11 +5761,7 @@ class App(tk.Tk):
         win.title(title)
         win.configure(bg=WHITE)
         win.transient(self)
-        try:
-            win.geometry(f"{S(720)}x{S(520)}+{self.winfo_rootx()+S(40)}"
-                         f"+{self.winfo_rooty()+S(40)}")
-        except Exception:
-            pass
+        place_window(win, 720, 520, master=self, min_w=520, min_h=400)
         pad = tk.Frame(win, bg=WHITE)
         pad.pack(fill="both", expand=True, padx=S(16), pady=S(14))
         tk.Label(pad, text=title, bg=WHITE, fg=INK,
@@ -5758,7 +5791,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("NAS — Full compilation log")
         win.configure(bg=WHITE)
-        win.geometry(f"{S(820)}x{S(560)}")
+        place_window(win, 820, 560, master=self, min_w=520, min_h=380)
         con = tk.Frame(win, bg=FIELD)
         con.pack(fill="both", expand=True, padx=S(12), pady=S(12))
         mono = "Cascadia Mono" if "Cascadia Mono" in tkfont.families() else \
