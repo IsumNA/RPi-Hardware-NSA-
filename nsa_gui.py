@@ -2100,7 +2100,7 @@ class CttCaptureWizard(tk.Toplevel):
         row(1, "CTT project", self.project_var, 0)
         row(1, "Operating gain", self.gain_var, 1)  # bias/dark/flat all shot at this
         row(2, "Flat levels", self.flatlevels_var, 0)
-        row(2, "Burst frames", self.burst_var, 1)
+        row(2, "GT burst @ 1×", self.burst_var, 1)
 
         # Capture mode + real-pairs folder tag.
         tk.Label(grid, text="Mode", bg=WHITE, fg=INK, font=font(10, "bold")).grid(
@@ -2114,12 +2114,13 @@ class CttCaptureWizard(tk.Toplevel):
             side="left", padx=(S(12), S(6)))
         ttk.Entry(moderow, textvariable=self.gains_var, width=28, font=font(10)).pack(
             side="left")
-        tk.Label(grid, text="real pairs = for EACH scene, sweep the Gains series (one "
-                            "genuine noisy+gt pair per gain) into PI_RAW/Data/<scene>/"
-                            "imx662_ag<gain>_test — one rig setup, all gains captured "
-                            "back-to-back.  calibration = bias/dark/flat noise model + "
-                            "synthesis.", bg=WHITE,
-                 fg=SUBTLE, font=font(8), wraplength=S(820), justify="left").grid(
+        tk.Label(grid, text=("real pairs = for EACH scene, sweep the Gains series (one "
+                             "genuine noisy+gt pair per gain) into PI_RAW/Data/<scene>/"
+                             "imx662_ag<gain>_test — one rig setup, all gains captured "
+                             "back-to-back. GT burst @ 1× is frames at minimum gain; "
+                             "high gains capture more for cleaner GT averaging.  "
+                             "calibration = bias/dark/flat noise model + synthesis."),
+                 bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(820), justify="left").grid(
                      row=4, column=0, columnspan=4, sticky="w", pady=(S(2), S(2)))
 
         tk.Label(grid, text="NSA project root", bg=WHITE, fg=INK,
@@ -2658,11 +2659,14 @@ class CttCaptureWizard(tk.Toplevel):
             dark_note = "  ·  preview is BLACK on purpose (lens capped)."
         if st.meta.get("gain_sweep"):
             gains = st.meta["gain_sweep"]
+            base = int(self.burst_var.get() or "48")
+            hi = self.backend.burst_frames_for_gain(max(gains), base)
             self.applied_lbl.config(text=(
                 f"Metered at 1× → {applied.get('exposure', 0)/1000:.2f} ms.  "
                 f"CAPTURE sweeps {len(gains)} gains "
-                f"({', '.join(str(g) for g in gains)}), {st.frames} frames each, "
-                "holding this brightness." + dark_note))
+                f"({', '.join(str(g) for g in gains)}), "
+                f"{base}–{hi} frames each (more at high gain for clean GT). "
+                "Holding this brightness." + dark_note))
         else:
             self.applied_lbl.config(text=(
                 f"Applied ({mode}):  {applied.get('exposure', 0)/1000:.2f} ms  ·  "
@@ -2758,7 +2762,7 @@ class CttCaptureWizard(tk.Toplevel):
 
         scene = st.meta.get("scene", "scene")
         # Read Tk vars on the main thread before spawning the worker.
-        min_frames = min(8, int(self.burst_var.get() or "48"))
+        min_frames = max(2, int(self.burst_var.get() or "48") // 4)
         publish_dest = ""
         if self.publish_var.get():
             publish_dest = self.backend.normalize_publish_dest(
@@ -3078,7 +3082,7 @@ class CttCaptureWizard(tk.Toplevel):
 
             def work():
                 out = []
-                min_frames = min(8, int(self.burst_var.get() or "48"))
+                min_frames = max(2, int(self.burst_var.get() or "48") // 4)
                 for rec in self._recorded:
                     meta = rec.station.meta
                     if not meta.get("is_real_pair"):
@@ -3134,7 +3138,7 @@ class CttCaptureWizard(tk.Toplevel):
                 try:
                     manifest = burst_folder_to_gt(
                         str(rec.station.dest), str(gt_path),
-                        min_frames=min(8, int(self.burst_var.get() or "48")))
+                        min_frames=max(2, int(self.burst_var.get() or "48") // 4))
                     out.append(f"{scene}: gt_01.png ({manifest['frames_used']} frames)")
                 except Exception as exc:  # noqa: BLE001
                     out.append(f"{scene}: FAILED — {exc}")

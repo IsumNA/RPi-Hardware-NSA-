@@ -87,6 +87,24 @@ DEFAULT_LIGHTBOX_PERCENT = 100.0
 # case the achieved gain is recorded alongside the pair.
 DEFAULT_GAIN_SWEEP = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
+# Temporal GT averaging: read noise in the average scales ~ gain/√N, so high gains
+# need more frames for the same residual.  Override cap with NSA_GT_BURST_MAX.
+GT_BURST_MAX_FRAMES = int(os.environ.get("NSA_GT_BURST_MAX", "512"))
+
+
+def burst_frames_for_gain(gain: int, base: int, *,
+                          max_frames: int | None = None) -> int:
+    """Frames to capture for temporal GT at *gain* (base count is at 1×).
+
+    Uses N ≈ base × gain (capped) so residual read noise stays similar across
+    the sweep.  At 1× with base=48 → 48 frames; at 64× → 512 (cap); etc.
+    """
+    g = max(1, int(gain))
+    base = max(4, int(base))
+    cap = max_frames if max_frames is not None else GT_BURST_MAX_FRAMES
+    scaled = int(round(base * g))
+    return min(max(base, scaled), max(cap, base))
+
 
 def parse_gain_sweep(spec: str | list | tuple | None) -> list[int]:
     """Parse a gain-sweep spec ("1,2,4,...,512" or a list) into sorted ints."""
@@ -935,8 +953,9 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             setup = (
                 f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
                 "• Light it well (~100%, back off only if CLIPPING flags highlights).\n"
-                f"• CAPTURE shoots {args.burst_frames} frames at each gain "
-                f"({gains_txt}), dropping exposure as gain rises.\n"
+                f"• CAPTURE averages more frames at higher gain for cleaner GT "
+                f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
+                f"gains {gains_txt}), dropping exposure as gain rises.\n"
                 f"• → PI_RAW/Data/{scene}/imx662_ag<GAIN>_test/"
             )
             meta = {
@@ -1048,6 +1067,7 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
     for g in gains:
         if stop():
             break
+        n_frames = burst_frames_for_gain(g, burst_frames)
         exposure = int(min(max(round(product / g), exp_min), exp_max))
         client.set_controls({"auto_exposure": False, "gain": float(g),
                              "exposure": exposure})
@@ -1058,7 +1078,7 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
             status(f"ag{g}: sensor clamped gain to {actual:g}× (tuning/mode limit); "
                    f"folder still tagged ag{g}, actual gain recorded.", "warn")
         added = client.capture(project, image_type=station.image_type,
-                               frames=burst_frames, colour_temp=station.colour_temp,
+                               frames=n_frames, colour_temp=station.colour_temp,
                                lux=station.lux)
         fnames = [a["filename"] for a in added
                   if a.get("filename", "").lower().endswith(".dng")]
@@ -1067,7 +1087,7 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
             title=f"{scene} · ag{g}",
             setup="",
             image_type=station.image_type,
-            frames=burst_frames,
+            frames=n_frames,
             dest=burst_root / f"ag{g}",
             naming=lambda i: f"burst_{i:03d}.dng",
             colour_temp=station.colour_temp,
@@ -1075,11 +1095,12 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
             meta={"scene": scene, "is_real_pair": True,
                   "pair_dest": str(pair_root / f"imx662_ag{g}_test"),
                   "requested_gain": g, "actual_gain": actual,
-                  "clamped": clamped, "exposure_us": exposure},
+                  "clamped": clamped, "exposure_us": exposure,
+                  "burst_frames": n_frames},
         )
         recs.append(Recorded(station=gstation, ctt_filenames=fnames))
-        status(f"ag{g}: {len(fnames)} DNG(s) at {actual:g}× "
-               f"(exp {exposure/1000:.2f} ms).", "ok")
+        status(f"ag{g}: {len(fnames)}/{n_frames} DNG(s) at {actual:g}× "
+               f"(exp {exposure/1000:.2f} ms, GT avg).", "ok")
     return recs
 
 
