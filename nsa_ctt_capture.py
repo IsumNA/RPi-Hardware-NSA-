@@ -1346,14 +1346,27 @@ def check_publish_dest(dest_root: Path | str) -> str | None:
             return None
     elif os.access(dest, os.W_OK):
         return None
+    owner = "another user"
+    try:
+        import pwd
+        st = (data if data.is_dir() else dest).stat()
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except (ImportError, KeyError, OSError):
+        pass
+    data_path = data if data.is_dir() else dest / "Data"
     return (
         f"Your account cannot write new imx662 pair folders under {dest}.\n\n"
-        "The shared PI_RAW dataset is already there — do NOT chown or recreate "
-        "the whole tree (that would affect existing imx219/sensor data).\n\n"
-        "Ask your admin to grant you write access under Data/, for example:\n"
-        f"  sudo chgrp $USER {data if data.is_dir() else dest / 'Data'}\n"
-        f"  sudo chmod g+w {data if data.is_dir() else dest / 'Data'}\n\n"
-        "Publish only adds Data/<scene>/imx662_ag<GAIN>_test/ folders.")
+        f"Owner is «{owner}» (see ls -la). The shared PI_RAW dataset is already "
+        "there — do NOT chown or recreate the whole tree.\n\n"
+        "Ask the owner or admin to grant write under Data/ only, e.g.:\n"
+        f"  sudo usermod -aG {owner} $USER   # then log out/in\n"
+        f"  sudo chmod g+w {data_path}\n"
+        f"  sudo chmod g+w {data_path}/*/    # scene folders (for new imx662_* dirs)\n\n"
+        "Or ACLs (adds access without changing existing file ownership):\n"
+        f"  sudo setfacl -R -m u:$USER:rwx {data_path}\n"
+        f"  sudo setfacl -R -d -m u:$USER:rwx {data_path}\n\n"
+        "Publish only adds Data/<scene>/imx662_ag<GAIN>_test/ — existing "
+        "imx219/sensor data is not deleted or overwritten elsewhere.")
 
 
 def _rsync_ssh_arg_publish() -> str:
