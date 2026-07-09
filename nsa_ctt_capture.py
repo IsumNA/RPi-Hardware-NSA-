@@ -36,13 +36,16 @@ Example
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -58,7 +61,7 @@ from nsa.dataset_layout import (
     resolve_layout,
     scaffold_imx662_project,
 )
-from nsa.denoise_hw_data import SYSTEM_PI_RAW  # canonical AI-server dataset root
+from nsa.denoise_hw_data import SYSTEM_PI_RAW, default_publish_dest
 from nsa.theme import banner, console, kv_table, level_rule, log
 
 # Capture is capped server-side at 16 frames per POST (see ctt-server capture()).
@@ -113,39 +116,58 @@ LIGHTBOX_ILLUMINANTS = {
 }
 
 
-def _resolve_illuminant(illum_code: str, target_lux: int | None) -> str:
+def _resolve_illuminant(illum_code: str, brightness: int | None) -> str:
     """Map a scene's illuminant code to a lightSTUDIO-S channel name.
 
     'H' (horizon/warm) has no single matching channel — the box instead
-    exposes three separate halogen channels rated for different brightness
-    regimes (Halogen10/100/400, ~10/100/400 lux at their default intensity).
-    Pick whichever is closest to the scene's target lux rather than always
-    using the brightest one.
+    exposes three separate halogen channels (Halogen10/100/400).  The
+    brightness field from the scene name (e.g. ``cabinet_H_10`` → 10) picks
+    the closest halogen channel.
     """
     if illum_code in LIGHTBOX_ILLUMINANTS:
         return LIGHTBOX_ILLUMINANTS[illum_code]
     if illum_code == "H":
-        lux = target_lux or 100
-        if lux <= 20:
+        b = brightness if brightness is not None else 100
+        if b <= 15:
             return "Halogen10"
-        if lux <= 150:
+        if b <= 200:
             return "Halogen100"
         return "Halogen400"
     return illum_code
 
 
 def parse_scene_light(scene: str) -> tuple[str | None, int | None]:
-    """Parse a scene name for illuminant + lux: cabinet_D50_100 → ('D50', 100).
-    Returns (illuminant, lux) or (None, None) if not parseable."""
+    """Parse ``<label>_<illuminant>_<percent>`` scene names.
+
+    Examples::
+
+        cabinet_D50_100  → ('D50', 100)       # D50 at 100 %
+        cabinet_F11_25   → ('F11', 25)        # F11 at 25 %
+        cabinet_H_10     → ('Halogen10', 10)  # halogen channel + 10 %
+
+    The third field is the light-box **intensity percent** (0–100), not a
+    target-lux setpoint.  Returns ``(None, None)`` when the name does not match.
+    """
     parts = scene.rsplit("_", 2)  # split from right to grab the last two parts
     if len(parts) != 3:
         return None, None
-    illum_str, lux_str = parts[1], parts[2]
+    illum_str, pct_str = parts[1], parts[2]
     try:
-        lux = int(lux_str)
+        pct = int(pct_str)
     except ValueError:
         return None, None
-    return _resolve_illuminant(illum_str, lux), lux
+    pct = max(0, min(100, pct))
+    return _resolve_illuminant(illum_str, pct), pct
+
+
+def scene_lightbox_percent(scene: str, *, override: float | None = None) -> float:
+    """Intensity % for ``set_lightbox`` — scene name, else CLI override, else default."""
+    if override is not None:
+        return max(0.0, min(100.0, float(override)))
+    _, pct = parse_scene_light(scene)
+    if pct is not None:
+        return float(pct)
+    return DEFAULT_LIGHTBOX_PERCENT
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +399,58 @@ class CTTClient:
 # BatchMode fails fast instead of hanging on a password prompt (use key auth).
 SSH_OPTS = ["-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+# Publish/rsync to the AI server — interactive (password OK). ControlMaster keeps
+# one SSH session so you are only prompted once per host.
+SSH_CONTROL_PATH = os.path.join(tempfile.gettempdir(), "nsa-ssh-%r@%h:%p")
+SSH_OPTS_PUBLISH = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=30",
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={SSH_CONTROL_PATH}",
+    "-o", "ControlPersist=300",
+]
+
+
+def _ssh_cmd_publish(ssh: str, inner: str) -> list[str]:
+    return ["ssh", *SSH_OPTS_PUBLISH, ssh, f"bash -c {shlex.quote(inner)}"]
+
+
+def probe_ssh_key_auth(ssh_target: str) -> bool:
+    """True when ``ssh_target`` accepts key-based login without a password."""
+    if shutil.which("ssh") is None:
+        return False
+    try:
+        res = subprocess.run(
+            ["ssh", *SSH_OPTS, ssh_target, "true"],
+            capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return res.returncode == 0
+
+
+@contextmanager
+def ssh_askpass_env(password: str | None):
+    """Provide ``SSH_ASKPASS`` so OpenSSH can read a password without a TTY."""
+    if not password:
+        yield os.environ.copy()
+        return
+    script = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False)
+    try:
+        safe = password.replace("'", "'\"'\"'")
+        script.write(f"#!/bin/sh\nprintf '%s' '{safe}'\n")
+        script.close()
+        os.chmod(script.name, stat.S_IRWXU)
+        env = os.environ.copy()
+        env["SSH_ASKPASS"] = script.name
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env.setdefault("DISPLAY", ":0")
+        yield env
+    finally:
+        try:
+            os.unlink(script.name)
+        except OSError:
+            pass
 
 
 def _ssh_cmd(ssh: str, inner: str) -> list[str]:
@@ -849,11 +923,9 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             )
             meta = {"scene": scene}
         # CTT rejects "macbeth"-type captures with no (or non-positive) lux.
-        # Use the scene's own target lux when the name encodes one (real mode);
-        # otherwise fall back to the CLI value or a generic "well lit" default
-        # — it's just a metadata field CTT logs alongside the capture.
-        _, parsed_lux = parse_scene_light(scene)
-        station_lux = parsed_lux or args.lux or 500
+        # The scene-name suffix is intensity %, not lux — use CLI/default here;
+        # the measured lux is filled in after the lightbox is set at capture time.
+        station_lux = args.lux or 500
         stations.append(Station(
             station_id=f"burst_{scene}",
             title=title,
@@ -1058,7 +1130,7 @@ def _prompt(msg: str) -> str:
 
 
 def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
-               *, dry_run: bool) -> list[Recorded]:
+               *, dry_run: bool, lightbox_percent: float | None = None) -> list[Recorded]:
     recorded: list[Recorded] = []
 
     for n, st in enumerate(stations, 1):
@@ -1067,8 +1139,18 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         console.print()
 
         if dry_run:
+            extra = ""
+            if st.meta.get("is_real_pair"):
+                scene = st.meta.get("scene", "")
+                illum, _ = parse_scene_light(scene)
+                if illum:
+                    pct = scene_lightbox_percent(scene, override=lightbox_percent)
+                    extra += f" · lightbox {illum} at {pct:.0f}%"
+                pair_root = st.meta.get("pair_root")
+                if pair_root:
+                    extra += f" → pairs under {pair_root}/imx662_ag<gain>_test/"
             log(f"[dry-run] would apply controls={st.controls} · {st.frames} frame(s) "
-                f"→ {st.dest}", "info")
+                f"→ {st.dest}{extra}", "info")
             continue
 
         # For scene bursts, set the lightbox illuminant + intensity BEFORE the
@@ -1081,9 +1163,10 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
             illum, _ = parse_scene_light(scene)
             if illum:
                 try:
-                    client.set_lightbox(illum, DEFAULT_LIGHTBOX_PERCENT)
+                    pct = scene_lightbox_percent(scene, override=lightbox_percent)
+                    client.set_lightbox(illum, pct)
                     meas = client._settled_lux()
-                    log(f"Lightbox set to {illum} at {DEFAULT_LIGHTBOX_PERCENT:.0f}% "
+                    log(f"Lightbox set to {illum} at {pct:.0f}% "
                         f"(measured {meas:.0f} lux)", "ok")
                     if meas > 0:
                         capture_lux = int(round(meas))  # metadata only
@@ -1203,26 +1286,153 @@ def finalize_placement(transfer: Transfer, recorded: list[Recorded]) -> None:
 # --------------------------------------------------------------------------- #
 #  Publish to the AI-server dataset root (with read-back verification)
 # --------------------------------------------------------------------------- #
+def is_remote_publish_dest(dest: str) -> bool:
+    """True for ``user@host:/path`` rsync destinations."""
+    dest = dest.strip()
+    if ":" not in dest:
+        return False
+    host = dest.rsplit(":", 1)[0]
+    return "@" in host
+
+
+def check_publish_dest(dest_root: Path | str) -> str | None:
+    """Return a human-readable problem with *dest_root*, or None if it looks OK."""
+    dest_s = str(dest_root).strip()
+    if is_remote_publish_dest(dest_s):
+        if shutil.which("rsync") is None:
+            return "rsync is not on PATH — install rsync for remote publish."
+        return None
+    dest = Path(dest_s).expanduser()
+    if not dest.exists():
+        return (
+            f"{dest} does not exist on THIS computer.\n\n"
+            "If the AI training server is a different machine, set the dataset "
+            "root to  user@ai-host:/opt/datasets/PI_RAW  (rsync over SSH)."
+        )
+    if not os.access(dest, os.W_OK):
+        return (
+            f"No write permission to {dest}.\n\n"
+            f"On the AI server run once:\n"
+            f"  sudo mkdir -p {dest} && sudo chown $USER {dest}\n\n"
+            "Or publish remotely:  user@ai-host:/opt/datasets/PI_RAW"
+        )
+    return None
+
+
+def _rsync_ssh_arg_publish() -> str:
+    return "ssh " + " ".join(SSH_OPTS_PUBLISH)
+
+
+def _publish_pi_raw_rsync(src: Path, dest: str, *,
+                          ssh_password: str | None = None) -> dict:
+    """``rsync`` the PI_RAW tree to ``user@host:/path`` and verify sizes."""
+    summary: dict[str, Any] = {"dest": dest, "copied": 0, "verified": 0,
+                               "skipped": 0, "failures": [], "error": None,
+                               "remote": True, "src": str(src)}
+    try:
+        files = [p for p in src.rglob("*") if p.is_file()]
+        if not files:
+            summary["error"] = f"nothing to publish — {src} has no files."
+            return summary
+        if shutil.which("rsync") is None:
+            summary["error"] = "rsync not found on PATH — install rsync for remote publish."
+            return summary
+
+        host, _, remote_path = dest.partition(":")
+        remote_path = remote_path.rstrip("/") or "/"
+
+        with ssh_askpass_env(ssh_password) as env:
+            mkdir = subprocess.run(
+                _ssh_cmd_publish(host, f"mkdir -p {shlex.quote(remote_path)}"),
+                capture_output=True, text=True, env=env, timeout=120)
+            if mkdir.returncode != 0:
+                err = (mkdir.stderr or mkdir.stdout or "").strip()
+                hint = _ssh_hint(err)
+                summary["error"] = (
+                    f"cannot create remote folder {dest}: {err}"
+                    + (f"\n\n{hint}" if hint else ""))
+                return summary
+
+            rsync_ssh = _rsync_ssh_arg_publish()
+            dry = subprocess.run(
+                ["rsync", "-az", "--dry-run", "--itemize-changes",
+                 "-e", rsync_ssh, f"{src}/", f"{dest}/"],
+                capture_output=True, text=True, env=env, timeout=600)
+            if dry.returncode != 0:
+                err = (dry.stderr or dry.stdout or "").strip()
+                hint = _ssh_hint(err)
+                summary["error"] = (
+                    f"rsync dry-run failed: {err}"
+                    + (f"\n\n{hint}" if hint else ""))
+                return summary
+            pending = [ln for ln in dry.stdout.splitlines()
+                       if ln and ln[0] in "<>ch"]
+            summary["skipped"] = len(files) - len(pending)
+
+            res = subprocess.run(
+                ["rsync", "-az", "-e", rsync_ssh, f"{src}/", f"{dest}/"],
+                capture_output=True, text=True, env=env, timeout=3600)
+            if res.returncode != 0:
+                summary["error"] = f"rsync failed: {(res.stderr or res.stdout).strip()}"
+                return summary
+            summary["copied"] = len(pending)
+
+            for f in files:
+                rel = f.relative_to(src).as_posix()
+                remote_file = f"{remote_path}/{rel}"
+                stat_res = subprocess.run(
+                    _ssh_cmd_publish(
+                        host,
+                        f"test -f {shlex.quote(remote_file)} && "
+                        f"stat -c %s {shlex.quote(remote_file)}"),
+                    capture_output=True, text=True, env=env, timeout=60)
+                if stat_res.returncode != 0:
+                    summary["failures"].append(f"{rel}: missing on remote")
+                    continue
+                try:
+                    remote_size = int(stat_res.stdout.strip())
+                except ValueError:
+                    summary["failures"].append(f"{rel}: bad remote stat")
+                    continue
+                if remote_size == f.stat().st_size:
+                    summary["verified"] += 1
+                else:
+                    summary["failures"].append(
+                        f"{rel}: size mismatch "
+                        f"(local {f.stat().st_size} vs remote {remote_size})")
+    except subprocess.TimeoutExpired:
+        summary["error"] = "publish timed out — check the network and retry."
+    except OSError as exc:
+        summary["error"] = f"publish failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        summary["error"] = f"unexpected publish error: {exc}"
+
+    return summary
+
+
 def publish_pi_raw(project_pi_raw: Path | str,
-                   dest_root: Path | str = SYSTEM_PI_RAW) -> dict:
+                   dest_root: Path | str | None = None,
+                   *, ssh_password: str | None = None) -> dict:
     """Copy the produced PI_RAW tree to the AI-server dataset root and VERIFY it.
 
     ``project_pi_raw`` is the wizard's ``<project>/PI_RAW`` folder; its contents
-    are mirrored into ``dest_root`` (default ``/opt/datasets/PI_RAW`` — the path
-    NSA training auto-detects on the AI machine). Every copied file is read back
-    and its size compared, so the returned summary is proof the images are
-    actually there, not just that a copy call returned.
+    are mirrored into ``dest_root``.  Use a local path when the wizard runs ON
+    the AI server (default ``/opt/datasets/PI_RAW``), or a remote rsync target
+    when it runs on a laptop: ``user@ai-host:/opt/datasets/PI_RAW``.
 
     Returns a dict:
-        {"dest": str, "copied": int, "verified": int, "skipped": int,
-         "failures": [str, ...], "error": str | None}
-    ``error`` is set (and copied/verified are 0) when the destination could not
-    be written at all — e.g. ``/opt`` needs root. Callers should surface it.
-    """
-    src = Path(project_pi_raw)
-    dest = Path(dest_root).expanduser()
-    summary: dict[str, Any] = {"dest": str(dest), "copied": 0, "verified": 0,
-                               "skipped": 0, "failures": [], "error": None}
+        {"dest": str, "src": str, "copied": int, "verified": int, "skipped": int,
+         "failures": [str, ...], "error": str | None, "remote": bool}
+  """
+    src = Path(project_pi_raw).expanduser().resolve()
+    dest_s = str(dest_root if dest_root is not None else default_publish_dest()).strip()
+    if is_remote_publish_dest(dest_s):
+        return _publish_pi_raw_rsync(src, dest_s, ssh_password=ssh_password)
+
+    dest = Path(dest_s).expanduser()
+    summary: dict[str, Any] = {"dest": str(dest), "src": str(src), "copied": 0,
+                               "verified": 0, "skipped": 0, "failures": [],
+                               "error": None, "remote": False}
 
     files = [p for p in src.rglob("*") if p.is_file()] if src.is_dir() else []
     if not files:
@@ -1327,12 +1537,21 @@ def post_process(project_root: Path, args: argparse.Namespace,
         log("Re-run with --run-post to execute these automatically.", "info")
 
 
-def _have_rawpy() -> bool:
+def _rawpy_status() -> tuple[bool, str]:
+    """(installed?, reason). Catches ANY import failure — rawpy can fail beyond
+    a plain ImportError (missing libraw .so, NumPy ABI mismatch, etc.) — and
+    reports the interpreter so 'install rawpy' points at the RIGHT Python."""
     try:
         import rawpy  # noqa: F401
-        return True
-    except ImportError:
-        return False
+        return True, getattr(rawpy, "__version__", "installed")
+    except BaseException as exc:  # noqa: BLE001 - report, don't crash the wizard
+        return False, (f"{type(exc).__name__}: {exc}\n"
+                       f"Install it into THIS Python:\n"
+                       f"    {sys.executable} -m pip install rawpy")
+
+
+def _have_rawpy() -> bool:
+    return _rawpy_status()[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -1370,7 +1589,11 @@ def main() -> int:
                    help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=list(MANAGER_SCENES))
     p.add_argument("--colour-temp", type=int, default=5000)
-    p.add_argument("--lux", type=int, default=None)
+    p.add_argument("--lux", type=int, default=None,
+                   help="fallback lux metadata for CTT (measured lux used when available)")
+    p.add_argument("--lightbox-percent", type=float, default=None,
+                   help="override scene-name intensity %% for all stations (default: "
+                        "parse from scene, e.g. cabinet_F11_25 → 25%%)")
     # Capture parameters
     p.add_argument("--analogue-gain", type=float, default=0.0,
                    help="analogue gain for bias/dark calibration; 0 = use --gain "
@@ -1409,9 +1632,10 @@ def main() -> int:
     # Behaviour
     p.add_argument("--run-post", action="store_true",
                    help="also run calibrate_noise / capture_gt / simulate_dataset")
-    p.add_argument("--publish-to", default=str(SYSTEM_PI_RAW),
-                   help="AI-server dataset root to copy the finished PI_RAW pairs "
-                        f"into and verify (default: {SYSTEM_PI_RAW})")
+    p.add_argument("--publish-to", default=None,
+                   help="dataset root to copy finished PI_RAW pairs into and verify "
+                        f"(default: {default_publish_dest()} — USER@ai:{SYSTEM_PI_RAW} "
+                        "from a laptop, or local /opt when on the AI server).")
     p.add_argument("--no-publish", action="store_true",
                    help="do not copy the finished pairs to the AI-server dataset root")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
@@ -1463,7 +1687,8 @@ def main() -> int:
         f"{len(args.scenes)} scene burst(s).", "info")
 
     if args.dry_run:
-        run_wizard(client, Transfer(), stations, dry_run=True)
+        run_wizard(client, Transfer(), stations, dry_run=True,
+                   lightbox_percent=args.lightbox_percent)
         return 0
 
     # Pick the transfer backend.
@@ -1490,7 +1715,8 @@ def main() -> int:
         log(str(exc), "err")
         return 2
 
-    recorded = run_wizard(client, transfer, stations, dry_run=False)
+    recorded = run_wizard(client, transfer, stations, dry_run=False,
+                          lightbox_percent=args.lightbox_percent)
     if not recorded:
         log("No captures recorded — nothing to place.", "warn")
         return 0
@@ -1526,7 +1752,9 @@ def main() -> int:
     if not args.no_publish:
         console.print()
         level_rule(99, "Publishing to the AI-server dataset")
-        summary = publish_pi_raw(project_root / "PI_RAW", args.publish_to)
+        summary = publish_pi_raw(
+            project_root / "PI_RAW",
+            args.publish_to if args.publish_to is not None else default_publish_dest())
         _log_publish(summary)
 
     console.print()

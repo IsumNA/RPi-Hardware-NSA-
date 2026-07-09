@@ -90,6 +90,24 @@ def _is_default_dataset_path(path: Path, project_root: Path) -> bool:
 
 
 SYSTEM_PI_RAW = Path("/opt/datasets/PI_RAW")
+# Hostname of the AI training machine on the lab network (override with NSA_AI_HOST).
+DEFAULT_AI_HOST = os.environ.get("NSA_AI_HOST", "ai")
+
+
+def default_publish_dest() -> str:
+    """Where finished PI_RAW pairs should land after capture.
+
+  * ``NSA_PUBLISH_DEST`` env — explicit override.
+  * Local ``/opt/datasets/PI_RAW`` when it already exists and is writable
+    (wizard running on the AI server itself).
+  * Otherwise ``{USER}@ai:/opt/datasets/PI_RAW`` — rsync from a laptop.
+    """
+    if dest := os.environ.get("NSA_PUBLISH_DEST", "").strip():
+        return dest
+    if SYSTEM_PI_RAW.exists() and os.access(SYSTEM_PI_RAW, os.W_OK):
+        return str(SYSTEM_PI_RAW)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
+    return f"{user}@{DEFAULT_AI_HOST}:{SYSTEM_PI_RAW}"
 
 
 def prefer_system_pi_raw() -> Path | None:

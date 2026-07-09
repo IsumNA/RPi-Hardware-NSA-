@@ -20,7 +20,7 @@ import threading
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 try:
     from PIL import Image, ImageTk
@@ -1020,10 +1020,15 @@ class Imx662DataStudio(tk.Toplevel):
         "partial": "◐",
         "missing": "○",
     }
+    _STATUS_WORD = {
+        "complete": "✓ READY",
+        "partial": "◐ PARTIAL",
+        "missing": "○ MISSING",
+    }
     _STATUS_FG = {
         "complete": GREEN,
         "partial": AMBER,
-        "missing": SUBTLE,
+        "missing": RASPBERRY,
     }
 
     def __init__(self, master):
@@ -1088,9 +1093,16 @@ class Imx662DataStudio(tk.Toplevel):
         RoundButton(path_row, "REFRESH", self._refresh, kind="secondary",
                     width=90, height=30).grid(row=0, column=3, padx=(S(6), 0))
 
-        self.summary_lbl = tk.Label(self, text="", bg=WHITE, fg=INK, font=font(10),
-                                    justify="left", wraplength=S(900))
-        self.summary_lbl.pack(anchor="w", padx=pad, pady=(S(6), 0))
+        sum_row = tk.Frame(self, bg=WHITE)
+        sum_row.pack(fill="x", padx=pad, pady=(S(6), 0))
+        self.summary_lbl = tk.Label(sum_row, text="", bg=WHITE, fg=INK, font=font(10),
+                                    justify="left", wraplength=S(680))
+        self.summary_lbl.pack(side="left", anchor="w")
+        self.missing_only_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            sum_row, text="Show only what's missing", variable=self.missing_only_var,
+            command=self._refresh, bg=WHITE, fg=INK, selectcolor=WHITE,
+            activebackground=WHITE, font=font(9)).pack(side="right", anchor="e")
 
         prog_fr = tk.Frame(self, bg=FIELD)
         prog_fr.pack(fill="x", padx=pad, pady=(S(6), 0))
@@ -1114,11 +1126,16 @@ class Imx662DataStudio(tk.Toplevel):
         self.tree = ttk.Treeview(tree_fr, columns=("status", "count"), show="tree headings",
                                  height=16)
         self.tree.heading("#0", text="Scene / test folder")
-        self.tree.heading("status", text="")
-        self.tree.heading("count", text="Files")
-        self.tree.column("#0", width=S(220), stretch=True)
-        self.tree.column("status", width=S(28), stretch=False)
-        self.tree.column("count", width=S(72), stretch=False)
+        self.tree.heading("status", text="Status")
+        self.tree.heading("count", text="Have / need")
+        self.tree.column("#0", width=S(230), stretch=True)
+        self.tree.column("status", width=S(96), stretch=False, anchor="w")
+        self.tree.column("count", width=S(84), stretch=False, anchor="center")
+        # Row colours by status so ready/missing read at a glance.
+        self.tree.tag_configure("complete", foreground=GREEN)
+        self.tree.tag_configure("partial", foreground=AMBER)
+        self.tree.tag_configure("missing", foreground=RASPBERRY)
+        self.tree.tag_configure("section", foreground=INK, font=font(10, "bold"))
         sy = ttk.Scrollbar(tree_fr, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sy.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -1251,55 +1268,79 @@ class Imx662DataStudio(tk.Toplevel):
             100.0 * sm.get("imx662_pairs_on_disk", 0)
             / max(1, len(IMX662_TARGET_AG_TAGS) * max(1, sm.get("scenes_on_disk", 1))),
         )
+        # Overall tally across the two "to-do" sections (targets + calibration).
+        todo_sections = ("noise_pipeline", "imx662_targets")
+        by_sec = self._audit.get("by_section", {})
+        ready = miss = part = 0
+        for sec in todo_sections:
+            for s in by_sec.get(sec, []):
+                if s.get("status") == "complete":
+                    ready += 1
+                elif s.get("status") == "partial":
+                    part += 1
+                elif not s.get("optional"):
+                    miss += 1
+        total = ready + part + miss
+        self.prog["value"] = 100.0 * ready / max(1, total)
         self.prog_lbl.config(
-            text=(f"{sm.get('paired_on_disk', 0)} paired folders on disk  ·  "
-                  f"IMX662 targets missing: {sm.get('imx662_targets_missing', 0)}"))
-        exists = "found" if self._audit.get("exists") else "not found"
-        ag_on_disk = ", ".join(inv.get("ag_tags", [])[:8]) or "—"
+            text=(f"{ready}/{total} ready" + (f"  ·  {part} partial" if part else "")
+                  + f"  ·  {miss} still to do"))
+        exists = "found" if self._audit.get("exists") else "NOT FOUND"
         self.summary_lbl.config(
             text=(
-                f"PI_RAW {exists}: {self._audit.get('pi_raw_root', self.root_var.get())}  ·  "
-                f"{sm.get('scenes_on_disk', 0)} scenes  ·  "
-                f"tags on disk: {ag_on_disk}  ·  "
-                f"noise calibration: {cal_ok}"
+                f"{ready} ready · {part} partial · {miss} missing    "
+                f"(calibration: {cal_ok})\n"
+                f"PI_RAW {exists}: {self._audit.get('pi_raw_root', self.root_var.get())}"
             ),
-            fg=GREEN if cal.get("ready") else AMBER,
+            fg=GREEN if miss == 0 else (AMBER if ready else RASPBERRY),
         )
 
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._tree_items: dict[str, dict] = {}
+        only_missing = bool(getattr(self, "missing_only_var", None)
+                            and self.missing_only_var.get())
         by_section = self._audit.get("by_section", {})
         for section, slots in by_section.items():
+            ready = sum(1 for s in slots if s.get("status") == "complete")
+            miss = sum(1 for s in slots
+                       if s.get("status") != "complete" and not s.get("optional"))
+            # Section header spells out the tally so you don't have to count rows.
+            head = f"{self._SECTION_LABELS.get(section, section)}   [{ready} ready"
+            head += f", {miss} missing]" if miss else ", all done]"
             sec_id = self.tree.insert(
-                "", "end", text=self._SECTION_LABELS.get(section, section),
-                values=("", ""),
+                "", "end", text=head, values=("", ""), tags=("section",),
             )
+            shown = 0
             for sl in slots:
-                icon = self._STATUS_ICON.get(sl["status"], "?")
-                count = f"{sl.get('found', 0)}"
-                if sl.get("required"):
-                    count = f"{sl.get('found', 0)}/{sl['required']}"
+                is_ready = sl.get("status") == "complete"
+                if only_missing and is_ready and section != "on_disk":
+                    continue
+                shown += 1
+                word = self._STATUS_WORD.get(sl["status"], "?")
+                req = sl.get("required") or 0
+                count = f"{sl.get('found', 0)}/{req}" if req else f"{sl.get('found', 0)}"
                 iid = self.tree.insert(
                     sec_id, "end", text=sl["title"],
-                    values=(icon, count),
+                    values=(word, count), tags=(sl["status"],),
                 )
                 self._tree_items[iid] = sl
                 for child in sl.get("children") or []:
                     files = child.get("files") or {}
-                    nfiles = len(files)
-                    cicon = "✓" if child.get("has_pair") else "○"
+                    has = bool(child.get("has_pair"))
+                    cstatus = "complete" if has else "missing"
                     label = child.get("folder_name", "?")
                     cid = self.tree.insert(
                         iid, "end", text=label,
-                        values=(cicon, str(nfiles)),
+                        values=(self._STATUS_WORD[cstatus], f"{len(files)}"),
+                        tags=(cstatus,),
                     )
                     self._tree_items[cid] = {
                         **child,
                         "title": label,
                         "rel_path": child.get("rel_path", ""),
                         "section": "on_disk",
-                        "status": "complete" if child.get("has_pair") else "missing",
+                        "status": cstatus,
                         "purpose": (
                             f"{child.get('sensor', '?')} @ {child.get('ag_tag', '?')} — "
                             f"manager capture. Files: "
@@ -1312,12 +1353,13 @@ class Imx662DataStudio(tk.Toplevel):
                         ),
                         "files": list(files.values()),
                     }
-            missing = sum(
-                1 for s in slots
-                if s.get("status") != "complete" and not s.get("optional")
-            )
-            self.tree.item(sec_id, open=(section != "on_disk" and missing > 0)
-                          or section == "on_disk")
+            # Open sections that still need work (or the on-disk overview); if the
+            # filter hid everything in a section, show a friendly placeholder.
+            self.tree.item(sec_id, open=(section == "on_disk") or miss > 0)
+            if only_missing and shown == 0 and section != "on_disk":
+                self.tree.insert(sec_id, "end",
+                                 text="  ✓ all done — nothing missing here",
+                                 values=("", ""), tags=("complete",))
 
         if prev_rel:
             for iid, sl in self._tree_items.items():
@@ -1934,6 +1976,7 @@ class CttCaptureWizard(tk.Toplevel):
         # pair_dest paths already derived+filed, so per-cabinet saving and the
         # final reconcile don't redo work.
         self._derived_pairs: set = set()
+        self._ssh_password_cache: dict[str, str] = {}
         self._project_root = None
         self._controls_range: dict = {}
         self._busy = False
@@ -1964,9 +2007,9 @@ class CttCaptureWizard(tk.Toplevel):
         self.cttcmd_var = tk.StringVar(value="~/ctt-venv/bin/ctt-server")
         self.autolight_var = tk.BooleanVar(value=True)
         # Copy the finished PI_RAW pairs to the AI-server dataset root (and verify)
-        # so training picks them up. Default = the path NSA auto-detects.
+        # so training picks them up. Default: {USER}@ai:/opt/datasets/PI_RAW.
         self.publish_var = tk.BooleanVar(value=True)
-        self.publish_path_var = tk.StringVar(value=str(backend.SYSTEM_PI_RAW))
+        self.publish_path_var = tk.StringVar(value=backend.default_publish_dest())
         self._lightbox_present = False
         self._lightbox_illums = []      # driver's channel names, for the override combo
         self._light_manual_override = False  # user hand-set the light for this station
@@ -2128,19 +2171,20 @@ class CttCaptureWizard(tk.Toplevel):
             side="left")
 
         # Lightbox: if a lightSTUDIO-S is attached to the Pi, auto-select the
-        # illuminant from each scene's name (cabinet_D50_100 → D50) at a default
-        # intensity. Intensity is set as a % — no target-lux metering.
+        # illuminant and intensity % from each scene's name
+        # (cabinet_F11_25 → F11 at 25 %).
         lbr = tk.Frame(parent, bg=WHITE)
         lbr.pack(fill="x", pady=(S(6), 0))
         tk.Checkbutton(
-            lbr, text="  Auto-select lightbox illuminant from scene name",
+            lbr, text="  Auto light from scene name (illuminant + intensity %)",
             variable=self.autolight_var, bg=WHITE, fg=INK, selectcolor=WHITE,
             activebackground=WHITE, font=font(10)).pack(side="left")
         tk.Label(
             parent,
             text=("Needs a lightSTUDIO-S on the Pi. Scenes named "
-                  "<name>_<illuminant>_<lux> (e.g. cabinet_D50_100) switch that "
-                  "illuminant on; tune the % per station with SET."),
+                  "<name>_<illuminant>_<percent> (e.g. cabinet_F11_25 → F11 at 25 %, "
+                  "cabinet_D50_100 → D50 at 100 %) set the box automatically. "
+                  "Tune with the % field + SET if needed."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2158,9 +2202,10 @@ class CttCaptureWizard(tk.Toplevel):
                   font=font(10)).pack(side="left", fill="x", expand=True)
         tk.Label(
             parent,
-            text=("Finished pairs are copied here and verified. This is the path NSA "
-                  "training auto-detects — leave as /opt/datasets/PI_RAW unless your "
-                  "dataset lives elsewhere."),
+            text=("Copies finished pairs from the project PI_RAW folder on THIS "
+                  "computer to the AI training dataset via rsync/SSH. Default: "
+                  f"{backend.default_publish_dest()}.  If key login fails, a "
+                  "password dialog appears (asked once per session)."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2387,6 +2432,7 @@ class CttCaptureWizard(tk.Toplevel):
         status = f"Connected — camera ready. {len(plan)} stations planned."
         if self._lightbox_present:
             status += f"  Lightbox: {lb.get('model', 'detected')}."
+        self._warn_publish_dest()
         self._set_status(status, "ok")
         self._show_station_page()
         self._start_preview()
@@ -2486,10 +2532,17 @@ class CttCaptureWizard(tk.Toplevel):
         self._capture_lux = st.lux  # CTT requires a positive lux for macbeth captures
         is_scene = bool(st.meta.get("is_real_pair"))
         if is_scene and self._lightbox_present:
-            illum, _ = self.backend.parse_scene_light(st.meta.get("scene", ""))
+            scene = st.meta.get("scene", "")
+            illum, scene_pct = self.backend.parse_scene_light(scene)
             self.light_illum_var.set(illum or (self._lightbox_illums[0]
                                                 if self._lightbox_illums else ""))
-            self.light_lbl.config(text="Lightbox ready.", fg=SUBTLE)
+            if scene_pct is not None and not self._light_manual_override:
+                self.light_pct_var.set(str(scene_pct))
+            self.light_lbl.config(
+                text=(f"Scene {scene}: {illum or '?'} at "
+                      f"{scene_pct if scene_pct is not None else self.light_pct_var.get()} %."
+                      if illum else "Lightbox ready."),
+                fg=SUBTLE)
             self.light_fr.pack(anchor="w", fill="x", pady=(S(10), 0))
         else:
             self.light_fr.pack_forget()
@@ -2523,13 +2576,21 @@ class CttCaptureWizard(tk.Toplevel):
                 light_info = None
                 # Light the scene BEFORE the camera auto-meters, otherwise the
                 # locked exposure is metered against the wrong brightness. The
-                # box is driven purely by intensity % (no target-lux search).
+                # box is driven purely by intensity % (parsed from the scene
+                # name when auto-light is on, e.g. cabinet_F11_25 → 25 %).
                 if auto_light:
-                    illum, _ = self.backend.parse_scene_light(st.meta.get("scene", ""))
+                    scene = st.meta.get("scene", "")
+                    illum, scene_pct = self.backend.parse_scene_light(scene)
                     if illum:
-                        self._client.set_lightbox(illum, pct)
+                        if self._light_manual_override:
+                            use_pct = pct
+                        elif scene_pct is not None:
+                            use_pct = float(scene_pct)
+                        else:
+                            use_pct = self.backend.DEFAULT_LIGHTBOX_PERCENT
+                        self._client.set_lightbox(illum, use_pct)
                         meas = self._client._settled_lux()
-                        light_info = (illum, pct, meas)
+                        light_info = (illum, use_pct, meas)
                 applied = self.backend._apply_controls(self._client, st)
                 self.after(0, lambda: self._applied(applied, light_info))
             except Exception as exc:  # noqa: BLE001
@@ -2572,7 +2633,8 @@ class CttCaptureWizard(tk.Toplevel):
                 fg=SUBTLE)
         elif st.meta.get("is_real_pair") and self._lightbox_present:
             self.light_lbl.config(
-                text="Auto-light off or scene name unparseable — set manually below.",
+                text="Auto-light off or scene name unparseable "
+                     "(use <name>_<illuminant>_<percent>) — set manually below.",
                 fg=SUBTLE)
         self._set_status("Ready to capture.", "ok")
 
@@ -2652,6 +2714,14 @@ class CttCaptureWizard(tk.Toplevel):
         # Read Tk vars on the main thread before spawning the worker.
         min_frames = min(8, int(self.burst_var.get() or "48"))
         publish_dest = self.publish_path_var.get().strip() if self.publish_var.get() else ""
+        pub_password = None
+        skip_publish = False
+        if publish_dest:
+            pub_password = self._resolve_publish_password(publish_dest)
+            if pub_password is False:
+                skip_publish = True
+                self._set_status(
+                    f"{scene}: capturing — publish skipped (no SSH password).", "warn")
 
         def work():
             try:
@@ -2659,27 +2729,30 @@ class CttCaptureWizard(tk.Toplevel):
                     self._client, project, st, burst_frames=st.frames,
                     status=status, stop=self._stop.is_set)
                 self._recorded.extend(recs)
-                # Save THIS cabinet now — transfer DNGs, derive noisy/gt pairs and
-                # publish to the AI server — so finished cabinets are on disk even
-                # if a later one fails, and Dataset Studio sees them immediately.
                 status(f"{scene}: saving {len(recs)} pair(s)…")
-                result = self._save_recs(recs, incremental, min_frames)
-                if publish_dest and result["derived"]:
-                    result["publish"] = self._publish_now(publish_dest)
+                result = self._save_recs(recs, incremental, min_frames, status)
+                if publish_dest and not skip_publish and result["derived"]:
+                    status(f"{scene}: publishing to AI server…")
+                    result["publish"] = self._publish_now(
+                        publish_dest, ssh_password=pub_password)
                 self.after(0, lambda: self._swept(scene, recs, result))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._capture_fail(str(e)))
 
+        self._set_busy(True)
         threading.Thread(target=work, daemon=True).start()
 
-    def _save_recs(self, recs: list, incremental: bool, min_frames: int) -> dict:
+    def _save_recs(self, recs: list, incremental: bool, min_frames: int,
+                   status=lambda *_a, **_k: None) -> dict:
         """Pull a cabinet's DNGs local, file them, and derive real noisy/gt pairs.
 
         Runs on a worker thread. rsync fetches only the new frames; the archive
         backend has no per-file endpoint, so we pull the whole project once per
-        cabinet (a handful of times) rather than only at the very end.
+        cabinet (a handful of times) rather than only at the very end. Reports
+        progress via ``status`` so a big transfer/derive doesn't look frozen.
         """
         fnames = [f for rec in recs for f in rec.ctt_filenames]
+        status(f"Pulling {len(fnames)} DNG(s) from the Pi…")
         if incremental:
             mirror = self._transfer.fetch(fnames)
         else:
@@ -2687,35 +2760,103 @@ class CttCaptureWizard(tk.Toplevel):
         placed = 0
         for rec in recs:
             placed += self.backend._place_files(mirror, rec)
+        status(f"Filed {placed} DNG(s).")
 
         derived, failed = [], []
-        rawpy_ok = self.backend._have_rawpy()
+        rawpy_ok, rawpy_reason = self.backend._rawpy_status()
         if rawpy_ok:
-            for rec in recs:
+            todo = [r for r in recs if r.station.meta.get("is_real_pair")
+                    and r.station.meta.get("pair_dest")
+                    and r.station.meta["pair_dest"] not in self._derived_pairs]
+            for i, rec in enumerate(todo, 1):
                 meta = rec.station.meta
-                pd = meta.get("pair_dest")
-                if not meta.get("is_real_pair") or not pd or pd in self._derived_pairs:
-                    continue
+                pd = meta["pair_dest"]
+                tag = (f"ag{meta['requested_gain']}"
+                       if meta.get("requested_gain") is not None else "pair")
+                status(f"Averaging burst → {tag} ({i}/{len(todo)})…")
                 try:
                     res = self.backend.derive_real_pair(
                         rec.station.dest, pd, min_frames=min_frames)
                     self.backend.write_gain_sidecar(pd, meta)
                     self._derived_pairs.add(pd)
-                    tag = (f"ag{meta['requested_gain']}"
-                           if meta.get("requested_gain") is not None else "pair")
                     derived.append(f"{tag}: {res['noisy']}+{res['gt']}")
                 except Exception as exc:  # noqa: BLE001
                     failed.append(f"{meta.get('requested_gain', '?')}: {exc}")
+        else:
+            status("rawpy unavailable — pairs will be built once it's installed.",
+                   "warn")
         return {"placed": placed, "derived": derived, "failed": failed,
-                "rawpy": rawpy_ok}
+                "rawpy": rawpy_ok, "rawpy_reason": rawpy_reason}
 
-    def _publish_now(self, dest: str) -> dict | None:
+    def _local_pi_raw(self) -> Path:
+        return self._project_root / "PI_RAW"
+
+    def _warn_publish_dest(self):
+        if not self.publish_var.get():
+            return
+        dest = self.publish_path_var.get().strip()
+        if not dest:
+            return
+        hint = self.backend.check_publish_dest(dest)
+        if hint:
+            messagebox.showwarning(
+                "AI-server dataset path",
+                f"Publish is enabled but the destination may not work:\n\n{hint}")
+
+    def _format_publish_help(self, summary: dict) -> str:
+        src = summary.get("src") or str(self._local_pi_raw())
+        dest = summary.get("dest", "?")
+        lines = [f"Local project PI_RAW:\n{src}"]
+        if summary.get("error"):
+            lines.append(f"\nAI server copy FAILED → {dest}\n{summary['error']}")
+        else:
+            verified = summary.get("verified", 0)
+            total = verified + len(summary.get("failures") or [])
+            lines.append(
+                f"\nAI server ({dest}): verified {verified}/{total} file(s).")
+            if summary.get("failures"):
+                lines.append("First failures:\n  " +
+                             "\n  ".join(summary["failures"][:5]))
+        if not summary.get("remote") and not self.backend.is_remote_publish_dest(dest):
+            lines.append(
+                "\n\nPublish target is a local folder on this computer. "
+                f"The default is {self.backend.default_publish_dest()}.")
+        return "\n".join(lines)
+
+    def _resolve_publish_password(self, dest: str) -> str | None | bool:
+        """SSH password for remote publish, or None when keys work / local dest.
+
+        Returns False when the user cancels the password dialog.
+        """
+        if not dest or not self.backend.is_remote_publish_dest(dest):
+            return None
+        host = dest.rsplit(":", 1)[0]
+        if host in self._ssh_password_cache:
+            return self._ssh_password_cache[host]
+        if self.backend.probe_ssh_key_auth(host):
+            return None
+        pw = simpledialog.askstring(
+            "SSH password for AI server",
+            f"SSH key login to {host} did not work.\n\n"
+            "Enter your password — it is used for this publish only and "
+            "reused for the rest of this capture session (one SSH session).",
+            show="*", parent=self)
+        if pw is None:
+            return False
+        if not pw:
+            messagebox.showerror("SSH password", "Password cannot be empty.")
+            return False
+        self._ssh_password_cache[host] = pw
+        return pw
+
+    def _publish_now(self, dest: str, *, ssh_password: str | None = None) -> dict | None:
         """Copy the current PI_RAW tree to the AI-server dataset root (idempotent —
         skips files already there). Returns the publish summary or None."""
         if not dest:
             return None
         try:
-            return self.backend.publish_pi_raw(self._project_root / "PI_RAW", dest)
+            return self.backend.publish_pi_raw(
+                self._local_pi_raw(), dest, ssh_password=ssh_password)
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc), "verified": 0, "failures": [], "dest": dest}
 
@@ -2726,16 +2867,31 @@ class CttCaptureWizard(tk.Toplevel):
         if result["rawpy"]:
             parts.append(f"derived {len(result['derived'])}/{n} pair(s)")
         else:
-            parts.append("pairs deferred to finish (rawpy not installed)")
+            parts.append("pairs deferred — rawpy not importable in this Python")
+            if not getattr(self, "_warned_rawpy", False):
+                self._warned_rawpy = True
+                messagebox.showwarning(
+                    "rawpy not available in this Python",
+                    "DNGs are being saved, but noisy/gt pairs can't be built "
+                    "until rawpy imports here:\n\n"
+                    + result.get("rawpy_reason", "install rawpy"))
         pub = result.get("publish")
         if pub is not None:
             if pub.get("error"):
-                parts.append(f"AI-server copy FAILED ({pub['error']})")
+                parts.append(f"AI-server copy FAILED")
+            elif pub.get("verified", 0) == 0 and pub.get("failures"):
+                parts.append("AI-server copy FAILED (0 verified)")
             else:
                 parts.append(f"AI server +{pub.get('copied', 0)} "
                              f"(verified {pub.get('verified', 0)})")
-        kind = "warn" if (result["failed"] or (pub and pub.get("error"))) else "ok"
+        kind = "warn" if (result["failed"] or (pub and (pub.get("error")
+                         or pub.get("verified", 0) == 0))) else "ok"
         self._set_status("  ·  ".join(parts) + " → advancing.", kind)
+        if pub and (pub.get("error") or pub.get("verified", 0) == 0):
+            messagebox.showwarning(
+                "AI-server copy failed",
+                self._format_publish_help(pub) +
+                "\n\nCaptures are safe in the local project PI_RAW folder.")
         self.after(600, lambda: self._show_station(self._idx + 1))
 
     def _capture_fail(self, err: str):
@@ -2789,16 +2945,16 @@ class CttCaptureWizard(tk.Toplevel):
     def _finished(self, placed: int):
         self._set_busy(False)
         self.back_btn.set_enabled(False)
-        rawpy_ok = self.backend._have_rawpy()
+        rawpy_ok, rawpy_reason = self.backend._rawpy_status()
         real = any(r.station.meta.get("is_real_pair") for r in self._recorded)
 
         if real:
             # Derive real noisy/gt pairs (temporal average) into PI_RAW.
             if not rawpy_ok:
                 messagebox.showwarning(
-                    "rawpy not installed",
+                    "rawpy not available in this Python",
                     "The burst DNGs are captured, but averaging them into gt.png "
-                    "needs rawpy:\n\n    pip install rawpy")
+                    f"needs rawpy — and it could not be imported here:\n\n{rawpy_reason}")
             self.applied_lbl.config(text=(
                 f"Filed {placed} DNG(s). Reconciling any remaining pairs "
                 "(most were saved per cabinet during capture)…"))
@@ -2815,7 +2971,7 @@ class CttCaptureWizard(tk.Toplevel):
                     tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
                            if meta.get("requested_gain") is not None else "")
                     if pd in self._derived_pairs:
-                        out.append(f"{meta['scene']}{tag}: saved during capture")
+                        out.append(f"{meta['scene']}{tag}: in project PI_RAW (local)")
                         continue
                     try:
                         res = self.backend.derive_real_pair(
@@ -2841,10 +2997,10 @@ class CttCaptureWizard(tk.Toplevel):
         clean_dir = self._project_root / "clean_scenes"
         if not rawpy_ok:
             messagebox.showwarning(
-                "rawpy not installed",
+                "rawpy not available in this Python",
                 "The DNGs are captured and filed, but building the clean GT "
-                "references and noise model needs rawpy to decode raw "
-                "DNGs:\n\n    pip install rawpy")
+                "references and noise model needs rawpy to decode raw DNGs — "
+                f"and it could not be imported here:\n\n{rawpy_reason}")
         self.applied_lbl.config(text=(
             f"Filed {placed} DNG(s).\n"
             f"Calibration → {cal_dir}\n"
@@ -2884,11 +3040,13 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _pairs_done(self, lines: list):
         self._set_busy(False)
-        pi_raw = self._project_root / "PI_RAW" / "Data"
+        pi_raw = self._local_pi_raw() / "Data"
         self.applied_lbl.config(text=(
-            "Real noisy/gt pairs written under\n"
-            f"{pi_raw}\n\n" + "\n".join(lines)))
-        self._set_status(f"Done — {len(lines)} real pair(s) in PI_RAW.", "ok")
+            "Real noisy/gt pairs written locally under\n"
+            f"{pi_raw}\n"
+            "(imx662_ag<gain>_test/noisy.png + gt.png per scene)\n\n"
+            + "\n".join(lines)))
+        self._set_status(f"Done — {len(lines)} pair(s) in local project PI_RAW.", "ok")
         self._publish_pairs()
 
     def _publish_pairs(self):
@@ -2899,12 +3057,21 @@ class CttCaptureWizard(tk.Toplevel):
         dest = self.publish_path_var.get().strip()
         if not dest:
             return
-        src = self._project_root / "PI_RAW"
-        self._set_status(f"Publishing to AI server ({dest})…")
+        password = self._resolve_publish_password(dest)
+        if password is False:
+            self._set_status("Publish cancelled — SSH password required.", "warn")
+            return
+        src = self._local_pi_raw()
+        self._set_status(f"Publishing local PI_RAW → {dest}…")
         self._set_busy(True)
 
         def work():
-            summary = self.backend.publish_pi_raw(src, dest)
+            try:
+                summary = self.backend.publish_pi_raw(
+                    src, dest, ssh_password=password)
+            except Exception as exc:  # noqa: BLE001
+                summary = {"error": str(exc), "verified": 0, "failures": [],
+                             "dest": dest, "src": str(src)}
             self.after(0, lambda: self._published(summary))
 
         threading.Thread(target=work, daemon=True).start()
@@ -2913,28 +3080,38 @@ class CttCaptureWizard(tk.Toplevel):
         self._set_busy(False)
         dest = summary["dest"]
         prior = self.applied_lbl.cget("text")
+        help_txt = self._format_publish_help(summary)
         if summary["error"]:
-            self.applied_lbl.config(text=prior + f"\n\nAI-server copy FAILED:\n{summary['error']}")
-            self._set_status(f"NOT saved to AI server: {summary['error']}", "err")
-            messagebox.showerror(
-                "AI-server copy failed",
-                f"The pairs are saved locally, but could NOT be copied to\n{dest}\n\n"
-                f"{summary['error']}")
+            self.applied_lbl.config(text=prior + f"\n\n{help_txt}")
+            self._set_status(f"NOT on AI server — see message.", "err")
+            messagebox.showerror("AI-server copy failed", help_txt)
+            self._offer_retry_publish()
             return
         verified = summary["verified"]
         total = verified + len(summary["failures"])
-        if summary["failures"]:
-            self.applied_lbl.config(text=(
-                prior + f"\n\nAI server ({dest}): verified {verified}/{total}; "
-                f"FAILED: {', '.join(summary['failures'][:4])}"))
-            self._set_status(f"Partly saved to AI server: {verified}/{total} verified.", "warn")
+        if summary["failures"] or verified == 0:
+            self.applied_lbl.config(text=prior + f"\n\n{help_txt}")
+            self._set_status(
+                f"NOT on AI server — {verified}/{total} verified.", "err")
+            messagebox.showerror("AI-server copy failed", help_txt)
+            self._offer_retry_publish()
         else:
             self.applied_lbl.config(text=(
-                prior + f"\n\nConfirmed on AI server:\n{dest}\n"
+                prior + f"\n\nConfirmed on AI server:\n"
+                f"{dest}/Data/<scene>/imx662_ag<gain>_test/\n"
                 f"{verified} file(s) present (copied {summary['copied']}, "
                 f"already-there {summary['skipped']})."))
             self._set_status(
-                f"Confirmed — {verified} file(s) saved on AI server ({dest}).", "ok")
+                f"Confirmed — {verified} file(s) on AI server ({dest}).", "ok")
+
+    def _offer_retry_publish(self):
+        """Show a retry button when publish failed (pairs are safe locally)."""
+        if getattr(self, "_retry_pub_btn", None):
+            self._retry_pub_btn.destroy()
+        self._retry_pub_btn = RoundButton(
+            self, "RETRY AI-SERVER COPY", self._publish_pairs,
+            kind="primary", width=220, height=42)
+        self._retry_pub_btn.pack(pady=(0, S(10)))
 
     def _open_builder(self):
         # Hand off to the existing noise dataset wizard, prefilled.
