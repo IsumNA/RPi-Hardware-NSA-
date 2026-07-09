@@ -2228,12 +2228,12 @@ class CttCaptureWizard(tk.Toplevel):
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
-        # Publish: copy the finished PI_RAW pairs onto the AI-server dataset root
-        # and read them back to confirm they landed (so training sees them).
+        # Save pairs straight to the training dataset (e.g. /opt/datasets/PI_RAW)
+        # instead of the project PI_RAW folder first.
         pub = tk.Frame(parent, bg=WHITE)
         pub.pack(fill="x", pady=(S(8), 0))
         tk.Checkbutton(
-            pub, text="  Copy finished pairs to AI-server dataset",
+            pub, text="  Save pairs to dataset root",
             variable=self.publish_var, bg=WHITE, fg=INK, selectcolor=WHITE,
             activebackground=WHITE, font=font(10)).pack(side="left")
         tk.Label(pub, text="dataset root", bg=WHITE, fg=INK,
@@ -2242,10 +2242,10 @@ class CttCaptureWizard(tk.Toplevel):
                   font=font(10)).pack(side="left", fill="x", expand=True)
         tk.Label(
             parent,
-            text=("Copies only new imx662/imx662h_ag<GAIN>_test pair folders into the "
-                  "training dataset. Existing imx219/other sensor data is never "
-                  "deleted or overwritten outside those new folders. Default: "
-                  f"{self.backend.default_publish_dest()}."),
+            text=("Writes imx662/imx662h_ag<GAIN>_test pairs directly under the "
+                  "dataset root (default /opt/datasets/PI_RAW on the AI server) — "
+                  "not into your project PI_RAW folder first. Uncheck to keep pairs "
+                  "only in the project. Remote paths rsync after each scene."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2901,10 +2901,8 @@ class CttCaptureWizard(tk.Toplevel):
         scene = st.meta.get("scene", "scene")
         # Read Tk vars on the main thread before spawning the worker.
         min_frames = max(2, int(self.burst_var.get() or "48") // 4)
-        publish_dest = ""
-        if self.publish_var.get():
-            publish_dest = self.backend.normalize_publish_dest(
-                self.publish_path_var.get().strip())
+        to_dataset, publish_dest, _project_pi_raw, pair_out_pi_raw, needs_remote_pub = (
+            self._dataset_output())
 
         def work():
             try:
@@ -2922,23 +2920,30 @@ class CttCaptureWizard(tk.Toplevel):
                     self._client, project, st, burst_frames=st.frames,
                     status=status, stop=self._stop.is_set, progress=cap_prog)
                 self._recorded.extend(recs)
-                status(f"{scene}: saving {len(recs)} pair(s)…")
+                if to_dataset:
+                    status(f"{scene}: writing {len(recs)} pair(s) to dataset…")
+                else:
+                    status(f"{scene}: saving {len(recs)} pair(s)…")
 
                 def save_prog(step, lbl):
                     self._progress_update(frame_total + step, total, lbl)
 
                 result = self._save_recs(
-                    recs, incremental, min_frames, status, progress=save_prog)
-                if publish_dest and result["derived"]:
-                    status(f"{scene}: publishing new pair folders…")
-                    pair_dirs = [r.station.meta["pair_dest"] for r in recs
-                                 if r.station.meta.get("pair_dest")]
-                    pw = self._password_for_publish_blocking(publish_dest)
-                    if pw is not False:
-                        result["publish"] = self._publish_with_auth(
-                            publish_dest, ssh_password=pw, only_under=pair_dirs)
-                    else:
-                        status(f"{scene}: publish skipped (no password).", "warn")
+                    recs, incremental, min_frames, status, progress=save_prog,
+                    pair_output_pi_raw=pair_out_pi_raw)
+                if to_dataset and result["derived"]:
+                    if needs_remote_pub and publish_dest:
+                        status(f"{scene}: rsync to {publish_dest}…")
+                        pw = self._password_for_publish_blocking(publish_dest)
+                        if pw is not False:
+                            result["publish"] = self._publish_with_auth(
+                                publish_dest, ssh_password=pw,
+                                only_under=result.get("written_dirs"),
+                                src_pi_raw=pair_out_pi_raw)
+                        else:
+                            status(f"{scene}: rsync skipped (no password).", "warn")
+                    elif publish_dest:
+                        status(f"{scene}: pairs at {pair_out_pi_raw}", "ok")
                 self._progress_update(total, total, "Done")
                 self._progress_end()
                 self._ui_call(self._swept, scene, recs, result)
@@ -2950,30 +2955,30 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _save_recs(self, recs: list, incremental: bool, min_frames: int,
                    status=lambda *_a, **_k: None,
-                   progress: Callable[[int, str], None] | None = None) -> dict:
-        """Pull a cabinet's DNGs local, file them, and derive real noisy/gt pairs.
-
-        Runs on a worker thread. rsync fetches only the new frames; the archive
-        backend has no per-file endpoint, so we pull the whole project once per
-        cabinet (a handful of times) rather than only at the very end. Reports
-        progress via ``status`` so a big transfer/derive doesn't look frozen.
-        """
-        fnames = [f for rec in recs for f in rec.ctt_filenames]
+                   progress: Callable[[int, str], None] | None = None,
+                   pair_output_pi_raw: Path | None = None) -> dict:
+        """Pull a subset of DNGs, derive noisy/gt pairs — skip saving full bursts."""
+        project_pi_raw = self._local_pi_raw()
+        output_pi_raw = pair_output_pi_raw or project_pi_raw
+        pull_names = self.backend.derive_filenames_needed(recs)
+        calib_recs = [r for r in recs if not r.station.meta.get("is_real_pair")]
         if progress:
-            progress(0, f"Pulling {len(fnames)} DNG(s) from the Pi…")
+            progress(0, f"Pulling {len(pull_names)} DNG(s) for pairs (not every frame)…")
         else:
-            status(f"Pulling {len(fnames)} DNG(s) from the Pi…")
+            status(f"Pulling {len(pull_names)} DNG(s) for pairs (not every frame)…")
         if incremental:
-            mirror = self._transfer.fetch(fnames)
+            mirror = self._transfer.fetch(pull_names) if pull_names else {}
         else:
-            mirror = self._transfer.finalize()  # archive: whole-project pull
+            mirror = self._transfer.finalize()
         placed = 0
-        for rec in recs:
+        for rec in calib_recs:
             placed += self.backend._place_files(mirror, rec)
-        if progress:
-            progress(1, f"Filed {placed} DNG(s)")
-        else:
-            status(f"Filed {placed} DNG(s).")
+        if calib_recs:
+            msg = f"Filed {placed} calibration DNG(s)."
+            if progress:
+                progress(1, msg)
+            else:
+                status(msg)
 
         derived, failed = [], []
         rawpy_ok, rawpy_reason = self.backend._rawpy_status()
@@ -2983,27 +2988,38 @@ class CttCaptureWizard(tk.Toplevel):
                     and r.station.meta["pair_dest"] not in self._derived_pairs]
             for i, rec in enumerate(todo, 1):
                 meta = rec.station.meta
-                pd = meta["pair_dest"]
                 tag = (f"ag{meta['requested_gain']}"
                        if meta.get("requested_gain") is not None else "pair")
-                msg = f"Averaging burst → {tag} ({i}/{len(todo)})…"
+                msg = f"Building pair {tag} ({i}/{len(todo)})…"
                 if progress:
                     progress(1 + i, msg)
                 else:
                     status(msg)
-                try:
-                    res = self.backend.derive_real_pair(
-                        rec.station.dest, pd, min_frames=min_frames)
-                    self.backend.write_gain_sidecar(pd, meta)
-                    self._derived_pairs.add(pd)
-                    derived.append(f"{tag}: {res['noisy']}+{res['gt']}")
-                except Exception as exc:  # noqa: BLE001
-                    failed.append(f"{meta.get('requested_gain', '?')}: {exc}")
+            d, f, written = self.backend.derive_recorded_pairs(
+                mirror, todo, min_frames=min_frames, mark_derived=self._derived_pairs,
+                project_pi_raw=project_pi_raw, output_pi_raw=output_pi_raw)
+            derived.extend(d)
+            failed.extend(f)
         else:
             status("rawpy unavailable — pairs will be built once it's installed.",
                    "warn")
+            written = []
         return {"placed": placed, "derived": derived, "failed": failed,
-                "rawpy": rawpy_ok, "rawpy_reason": rawpy_reason}
+                "rawpy": rawpy_ok, "rawpy_reason": rawpy_reason,
+                "written_dirs": written}
+
+    def _dataset_output(self) -> tuple[bool, str, Path, Path, bool]:
+        """When publish is on, pairs go straight to the dataset (not project PI_RAW)."""
+        project_pi_raw = self._local_pi_raw()
+        if not self.publish_var.get():
+            return False, "", project_pi_raw, project_pi_raw, False
+        dest = self.backend.normalize_publish_dest(
+            self.publish_path_var.get().strip())
+        if not dest:
+            return False, "", project_pi_raw, project_pi_raw, False
+        _, output_pi_raw, needs_remote = self.backend.resolve_pair_output_pi_raw(
+            self._project_root, dest, to_dataset=True)
+        return True, dest, project_pi_raw, output_pi_raw, needs_remote
 
     def _local_pi_raw(self) -> Path:
         return self._project_root / "PI_RAW"
@@ -3100,11 +3116,13 @@ class CttCaptureWizard(tk.Toplevel):
         return box.get("pw", False)
 
     def _publish_with_auth(self, dest: str, ssh_password: str | None = None,
-                           *, only_under: list | None = None) -> dict | None:
+                           *, only_under: list | None = None,
+                           src_pi_raw: Path | str | None = None) -> dict | None:
         """Publish to the AI server; prompt for password only when keys fail."""
         try:
             summary = self._publish_now(dest, ssh_password=ssh_password,
-                                        only_under=only_under) or {}
+                                        only_under=only_under,
+                                        src_pi_raw=src_pi_raw) or {}
             if summary.get("auth_failed"):
                 if ssh_password and not shutil.which("sshpass"):
                     return summary
@@ -3113,29 +3131,33 @@ class CttCaptureWizard(tk.Toplevel):
                 pw = self._password_for_publish_blocking(dest, force=True)
                 if pw is not False:
                     summary = self._publish_now(dest, ssh_password=pw,
-                                                only_under=only_under) or {}
+                                                only_under=only_under,
+                                                src_pi_raw=src_pi_raw) or {}
             elif summary.get("needs_password"):
                 host = dest.rsplit(":", 1)[0]
                 self._ssh_password_cache.pop(host, None)
                 pw = self._password_for_publish_blocking(dest, force=True)
                 if pw is not False:
                     summary = self._publish_now(dest, ssh_password=pw,
-                                                only_under=only_under) or {}
+                                                only_under=only_under,
+                                                src_pi_raw=src_pi_raw) or {}
             return summary
         except Exception as exc:  # noqa: BLE001
+            src = src_pi_raw or self._local_pi_raw()
             return {"error": str(exc), "verified": 0, "failures": [],
-                    "dest": dest, "src": str(self._local_pi_raw())}
+                    "dest": dest, "src": str(src)}
 
     def _publish_now(self, dest: str, *, ssh_password: str | None = None,
-                     only_under: list | None = None) -> dict | None:
-        """Copy new imx662 pair folders to the training dataset (idempotent)."""
+                     only_under: list | None = None,
+                     src_pi_raw: Path | str | None = None) -> dict | None:
+        """Rsync/copy pair folders from *src_pi_raw* into the training dataset."""
         dest = self.backend.normalize_publish_dest(dest)
         if not dest:
             return None
+        src = Path(src_pi_raw).expanduser() if src_pi_raw else self._local_pi_raw()
         try:
             return self.backend.publish_pi_raw(
-                self._local_pi_raw(), dest, ssh_password=ssh_password,
-                only_under=only_under)
+                src, dest, ssh_password=ssh_password, only_under=only_under)
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc), "verified": 0, "failures": [], "dest": dest}
 
@@ -3160,10 +3182,10 @@ class CttCaptureWizard(tk.Toplevel):
         pub = result.get("publish")
         if pub is not None:
             if pub.get("error") or (pub.get("verified", 0) == 0 and pub.get("failures")):
-                parts.append("AI-server copy failed (saved locally)")
+                parts.append("dataset rsync failed")
                 self._publish_any_failed = True
             else:
-                parts.append(f"AI server +{pub.get('copied', 0)} "
+                parts.append(f"dataset +{pub.get('copied', 0)} "
                              f"(verified {pub.get('verified', 0)})")
         kind = "warn" if (result["failed"] or (pub and pub.get("error"))) else "ok"
         self._set_status("  ·  ".join(parts) + " → advancing.", kind)
@@ -3263,37 +3285,61 @@ class CttCaptureWizard(tk.Toplevel):
             def work():
                 out = []
                 min_frames = max(2, int(self.burst_var.get() or "48") // 4)
+                to_dataset, publish_dest, project_pi_raw, output_pi_raw, needs_remote = (
+                    self._dataset_output())
                 todo = []
                 for rec in self._recorded:
                     meta = rec.station.meta
                     if not meta.get("is_real_pair"):
                         continue
                     pd = meta.get("pair_dest")
+                    out_pd = self.backend.remap_pair_dest(
+                        pd, project_pi_raw, output_pi_raw)
                     tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
                            if meta.get("requested_gain") is not None else "")
-                    if pd in self._derived_pairs:
-                        out.append(f"{meta['scene']}{tag}: in project PI_RAW (local)")
+                    if (str(out_pd) in self._derived_pairs
+                            or ((out_pd / "noisy.png").is_file()
+                                and (out_pd / "gt.png").is_file())):
+                        where = "dataset" if to_dataset else "project PI_RAW"
+                        out.append(f"{meta['scene']}{tag}: in {where} (local)")
                         continue
                     todo.append(rec)
                 total = max(len(todo), 1)
                 self._progress_begin(total)
-                for i, rec in enumerate(todo, 1):
-                    meta = rec.station.meta
-                    pd = meta.get("pair_dest")
-                    tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
-                           if meta.get("requested_gain") is not None else "")
-                    self._progress_update(
-                        i - 1, total,
-                        f"Building pair {meta['scene']}{tag}…")
-                    try:
-                        res = self.backend.derive_real_pair(
-                            rec.station.dest, pd, min_frames=min_frames)
-                        self.backend.write_gain_sidecar(pd, meta)
-                        self._derived_pairs.add(pd)
-                        out.append(f"{meta['scene']}{tag}: {res['noisy']} + {res['gt']} "
-                                   f"(gt from {res['frames_used']} frames)")
-                    except Exception as exc:  # noqa: BLE001
-                        out.append(f"{meta['scene']}{tag}: FAILED — {exc}")
+                if todo:
+                    names = self.backend.derive_filenames_needed(todo)
+                    mirror = self._transfer.fetch(names)
+                    d, f, written = self.backend.derive_recorded_pairs(
+                        mirror, todo, min_frames=min_frames,
+                        mark_derived=self._derived_pairs,
+                        project_pi_raw=project_pi_raw,
+                        output_pi_raw=output_pi_raw)
+                    if to_dataset and needs_remote and publish_dest and written:
+                        pw = self._password_for_publish_blocking(publish_dest)
+                        if pw is not False:
+                            pub = self._publish_with_auth(
+                                publish_dest, ssh_password=pw, only_under=written,
+                                src_pi_raw=output_pi_raw)
+                            if pub and (pub.get("error")
+                                        or (pub.get("verified", 0) == 0
+                                            and pub.get("failures"))):
+                                self._publish_any_failed = True
+                        else:
+                            self._publish_any_failed = True
+                    for line in d:
+                        tag_part = line.split(":", 1)[0]
+                        for rec in todo:
+                            m = rec.station.meta
+                            t = (f"ag{m['requested_gain']}"
+                                 if m.get("requested_gain") is not None else "pair")
+                            if t == tag_part:
+                                st = m.get("scene", "?")
+                                ag = (f" ag{m['requested_gain']}→{m.get('actual_gain', '?')}×"
+                                      if m.get("requested_gain") is not None else "")
+                                out.append(f"{st}{ag}: {line.split(':', 1)[-1].strip()}")
+                                break
+                    for line in f:
+                        out.append(f"FAILED — {line}")
                 self._progress_update(total, total, "Pairs built")
                 self._progress_end()
                 self.after(0, lambda: self._pairs_done(out))
@@ -3354,39 +3400,58 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _pairs_done(self, lines: list):
         self._set_busy(False)
-        pi_raw = self._local_pi_raw() / "Data"
+        to_dataset, publish_dest, project_pi_raw, output_pi_raw, needs_remote = (
+            self._dataset_output())
+        if to_dataset:
+            pi_raw = output_pi_raw / "Data"
+            loc = f"dataset root\n{output_pi_raw}"
+        else:
+            pi_raw = project_pi_raw / "Data"
+            loc = f"project PI_RAW\n{project_pi_raw}"
         pub_note = ""
         if self._publish_any_failed:
             pub_note = (
-                "\n\nAI-server copy failed for one or more cabinets — "
-                "files are in your project PI_RAW folder. Use RETRY AI-SERVER COPY below.")
+                "\n\nDataset rsync failed for one or more cabinets — "
+                f"pairs are under {output_pi_raw if to_dataset else project_pi_raw}. "
+                "Use RETRY DATASET RSYNC below.")
         self.applied_lbl.config(text=(
-            "Real noisy/gt pairs written locally under\n"
-            f"{pi_raw}\n"
+            "Real noisy/gt pairs written under\n"
+            f"{loc}\n"
             f"({self.capture_sensor}_ag<gain>_test/noisy.png + gt.png per scene)\n\n"
             + "\n".join(lines) + pub_note))
-        if self.publish_var.get() and not self._publish_any_failed:
+        if to_dataset and not needs_remote and not self._publish_any_failed:
             self._set_status(
-                f"Done — {len(lines)} pair(s) local; published per cabinet.", "ok")
+                f"Done — {len(lines)} pair(s) saved directly under {output_pi_raw}.", "ok")
+        elif to_dataset and needs_remote and not self._publish_any_failed:
+            self._set_status(
+                f"Done — {len(lines)} pair(s) on dataset at {publish_dest}.", "ok")
         elif self._publish_any_failed:
             self._set_status(
-                f"Done locally — {len(lines)} pair(s). AI publish needs retry.", "warn")
+                f"Done locally — {len(lines)} pair(s). Dataset rsync needs retry.", "warn")
             self._ensure_retry_publish_button()
         else:
             self._set_status(f"Done — {len(lines)} pair(s) in local project PI_RAW.", "ok")
-            self._publish_pairs()
 
     def _publish_pairs(self):
-        """Copy the finished PI_RAW pairs to the AI-server dataset root and
-        confirm (read-back) that they actually landed there."""
+        """Rsync staged pair folders to a remote dataset, or copy from project PI_RAW."""
         if not self.publish_var.get():
             return
         dest = self.backend.normalize_publish_dest(
             self.publish_path_var.get().strip())
         if not dest:
             return
-        src = self._local_pi_raw()
-        self._set_status(f"Publishing local PI_RAW → {dest}…")
+        to_dataset, _, project_pi_raw, output_pi_raw, needs_remote = (
+            self._dataset_output())
+        if to_dataset and not needs_remote:
+            return
+        src = output_pi_raw if to_dataset else project_pi_raw
+        only = None
+        if to_dataset:
+            only = [Path(p) for p in self._derived_pairs
+                    if Path(p).is_relative_to(output_pi_raw)]
+        else:
+            only = list(self._derived_pairs)
+        self._set_status(f"Publishing pairs → {dest}…")
         self._set_busy(True)
 
         def work():
@@ -3398,7 +3463,7 @@ class CttCaptureWizard(tk.Toplevel):
                     self.after(0, lambda: self._set_busy(False))
                     return
                 summary = self._publish_with_auth(
-                    dest, ssh_password=pw, only_under=list(self._derived_pairs))
+                    dest, ssh_password=pw, only_under=only, src_pi_raw=src)
             except Exception as exc:  # noqa: BLE001
                 summary = {"error": str(exc), "verified": 0, "failures": [],
                              "dest": dest, "src": str(src)}
@@ -3444,7 +3509,7 @@ class CttCaptureWizard(tk.Toplevel):
         if getattr(self, "_retry_pub_btn", None):
             self._retry_pub_btn.destroy()
         self._retry_pub_btn = RoundButton(
-            self, "RETRY AI-SERVER COPY", self._publish_pairs,
+            self, "RETRY DATASET RSYNC", self._publish_pairs,
             kind="primary", width=220, height=42)
         self._retry_pub_btn.pack(pady=(0, S(10)))
 

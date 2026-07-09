@@ -36,6 +36,7 @@ Example
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import shlex
@@ -111,21 +112,45 @@ def capture_sensor_hcg_enabled(sensor_tag: str) -> bool:
 
 # Temporal GT averaging: read noise in the average scales ~ gain/√N, so high gains
 # need more frames for the same residual.  Override cap with NSA_GT_BURST_MAX.
-GT_BURST_MAX_FRAMES = int(os.environ.get("NSA_GT_BURST_MAX", "512"))
+GT_BURST_MAX_FRAMES = int(os.environ.get("NSA_GT_BURST_MAX", "128"))
+# When building pairs we only pull/decode this many DNGs per burst (first frame +
+# subsample for GT). Override with NSA_GT_PULL_MAX.
+GT_PULL_MAX_FRAMES = int(os.environ.get("NSA_GT_PULL_MAX", "64"))
 
 
 def burst_frames_for_gain(gain: int, base: int, *,
                           max_frames: int | None = None) -> int:
     """Frames to capture for temporal GT at *gain* (base count is at 1×).
 
-    Uses N ≈ base × gain (capped) so residual read noise stays similar across
-    the sweep.  At 1× with base=48 → 48 frames; at 64× → 512 (cap); etc.
+    Uses N ≈ base × √gain (capped) — enough for a clean GT average without
+    shooting hundreds of frames at every high-gain step.
     """
     g = max(1, int(gain))
     base = max(4, int(base))
     cap = max_frames if max_frames is not None else GT_BURST_MAX_FRAMES
-    scaled = int(round(base * g))
+    scaled = int(round(base * math.sqrt(g)))
     return min(max(base, scaled), max(cap, base))
+
+
+def filenames_for_derive(fnames: list[str], *,
+                         pull_max: int | None = None) -> list[str]:
+    """Subset of capture filenames needed for noisy+gt (not the whole burst)."""
+    if not fnames:
+        return []
+    cap = max(2, int(pull_max if pull_max is not None else GT_PULL_MAX_FRAMES))
+    if len(fnames) <= cap:
+        return list(fnames)
+    if cap <= 1:
+        return [fnames[0]]
+    rest = cap - 1
+    if rest == 1:
+        picks = [0, len(fnames) - 1]
+    else:
+        picks = [0] + [
+            int(round(i * (len(fnames) - 1) / (rest - 1)))
+            for i in range(rest)
+        ]
+    return [fnames[i] for i in sorted(set(picks))]
 
 
 def parse_gain_sweep(spec: str | list | tuple | None) -> list[int]:
@@ -868,12 +893,39 @@ class RsyncTransfer(Transfer):
         if res.returncode != 0:
             raise CTTError(f"rsync failed: {res.stderr.strip() or res.stdout.strip()}")
 
+    def _sync_selective(self, filenames: list[str]) -> None:
+        """Pull only the named DNGs — not the whole Pi project tree."""
+        if not filenames:
+            return
+        idx = self._index()
+        need = [fn for fn in filenames if fn not in idx]
+        if not need:
+            return
+        includes = ["--include=*/"]
+        for fn in need:
+            includes.append(f"--include=**/{fn}")
+            includes.append(f"--include={fn}")
+        includes.append("--exclude=*")
+        cmd = [
+            "rsync", "-az", "-e", "ssh " + " ".join(SSH_OPTS),
+            *includes,
+            f"{self.ssh}:{self.remote}", f"{self.mirror}/",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise CTTError(f"rsync failed: {res.stderr.strip() or res.stdout.strip()}")
+
     def _index(self) -> dict[str, Path]:
         return {p.name: p for p in self.mirror.rglob("*.dng")}
 
     def fetch(self, filenames: list[str]) -> dict[str, Path]:
-        self._sync()
+        if filenames:
+            self._sync_selective(filenames)
+        else:
+            self._sync()
         idx = self._index()
+        if not filenames:
+            return idx
         return {f: idx[f] for f in filenames if f in idx}
 
     def finalize(self) -> dict[str, Path]:
@@ -1168,31 +1220,38 @@ def build_plan(project_root: Path, args: argparse.Namespace,
 
 def derive_real_pair(burst_dir: Path | str, test_dir: Path | str, *,
                      min_frames: int = 8, max_side: int = 0) -> dict:
-    """Turn a captured burst into a real noisy/gt pair (denoise-hw layout).
-
-    Both files are written as PNG — matching every other <sensor>_ag<N>_test
-    folder already in PI_RAW (imx219_*, and the existing imx662_ag12_test
-    sample), not a DNG-for-noisy format unique to this tool. ``noisy.png`` is
-    one real frame decoded straight off the sensor (genuine sensor noise, not
-    synthesised or averaged); ``gt.png`` is the temporal average of the burst.
-    Written into ``test_dir`` (e.g. PI_RAW/Data/<scene>/imx662_ag24_test/).
-    """
-    from nsa.gt_capture import burst_folder_to_gt, list_burst_frames, write_gt_png
-    from nsa.raw_io import _load_any
+    """Turn a captured burst folder into a real noisy/gt pair (denoise-hw layout)."""
+    from nsa.gt_capture import list_burst_frames
 
     burst_dir = Path(burst_dir)
+    frames = list_burst_frames(burst_dir)
+    return derive_real_pair_paths(frames, test_dir, min_frames=min_frames,
+                                  max_side=max_side)
+
+
+def derive_real_pair_paths(frame_paths: Sequence[Path | str], test_dir: Path | str, *,
+                           min_frames: int = 8, max_side: int = 0) -> dict:
+    """Build noisy+gt PNGs from an explicit list of burst frame paths."""
+    from nsa.gt_capture import temporal_average_gt, write_gt_png
+    from nsa.raw_io import _load_any
+
+    paths = sorted(
+        (Path(p) for p in frame_paths if Path(p).is_file()),
+        key=lambda p: p.name,
+    )
     test_dir = Path(test_dir)
     test_dir.mkdir(parents=True, exist_ok=True)
-    frames = list_burst_frames(burst_dir)  # sorted; raises if empty
+    if not paths:
+        raise ValueError("No burst frames to derive a pair from")
 
-    noisy_rgb = _load_any(frames[0])  # decode one real frame — real sensor noise
+    noisy_rgb = _load_any(paths[0])
     write_gt_png(test_dir / "noisy.png", noisy_rgb)
 
-    manifest = burst_folder_to_gt(
-        str(burst_dir), str(test_dir / "gt.png"),
-        min_frames=min(max(2, min_frames), len(frames)), max_side=max_side)
+    gt = temporal_average_gt(
+        paths, min_frames=min(max(2, min_frames), len(paths)), max_side=max_side)
+    write_gt_png(test_dir / "gt.png", gt)
     return {"scene_dir": str(test_dir), "noisy": "noisy.png", "gt": "gt.png",
-            "frames_used": manifest["frames_used"]}
+            "frames_used": len(paths)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1362,6 +1421,105 @@ def _place_files(mirror_map: dict[str, Path], rec: Recorded) -> int:
     return placed
 
 
+def derive_filenames_needed(recorded: Sequence[Recorded]) -> list[str]:
+    """DNG basenames to pull for *recorded* (subset for real pairs)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for rec in recorded:
+        if rec.station.meta.get("is_real_pair"):
+            names = filenames_for_derive(rec.ctt_filenames)
+        else:
+            names = list(rec.ctt_filenames)
+        for fn in names:
+            if fn not in seen:
+                seen.add(fn)
+                out.append(fn)
+    return out
+
+
+def remap_pair_dest(pair_dest: str | Path, project_pi_raw: Path | str,
+                    output_pi_raw: Path | str) -> Path:
+    """Map a project PI_RAW pair path onto a dataset PI_RAW root."""
+    pd = Path(pair_dest).expanduser().resolve()
+    root = Path(project_pi_raw).expanduser().resolve()
+    out = Path(output_pi_raw).expanduser().resolve()
+    if root == out:
+        return pd
+    try:
+        rel = pd.relative_to(root)
+    except ValueError:
+        return pd
+    return out / rel
+
+
+def resolve_pair_output_pi_raw(
+    project_root: Path | str,
+    publish_dest: str | None,
+    *,
+    to_dataset: bool,
+) -> tuple[Path, Path, bool]:
+    """Return ``(project_pi_raw, pair_output_pi_raw, needs_remote_publish)``.
+
+    When *to_dataset* is set, pairs are written straight to the training
+    dataset root (e.g. ``/opt/datasets/PI_RAW``) instead of the project copy.
+    Remote ``user@host:/opt/...`` targets use a small staging tree, then rsync.
+    """
+    project_root = Path(project_root)
+    project_pi_raw = project_root / "PI_RAW"
+    if not to_dataset or not (publish_dest or "").strip():
+        return project_pi_raw, project_pi_raw, False
+    dest_s = normalize_publish_dest(str(publish_dest).strip())
+    if is_remote_publish_dest(dest_s):
+        staging = project_root / ".publish_staging" / "PI_RAW"
+        staging.mkdir(parents=True, exist_ok=True)
+        return project_pi_raw, staging, True
+    dest = Path(dest_s).expanduser()
+    (dest / "Data").mkdir(parents=True, exist_ok=True)
+    return project_pi_raw, dest, False
+
+
+def derive_recorded_pairs(
+    mirror_map: dict[str, Path],
+    recorded: Sequence[Recorded],
+    *,
+    min_frames: int = 8,
+    pull_max: int | None = None,
+    mark_derived: set[str] | None = None,
+    project_pi_raw: Path | str | None = None,
+    output_pi_raw: Path | str | None = None,
+) -> tuple[list[str], list[str], list[Path]]:
+    """Build noisy/gt PNG pairs without saving every burst DNG."""
+    derived: list[str] = []
+    failed: list[str] = []
+    written_dirs: list[Path] = []
+    proj = Path(project_pi_raw).expanduser().resolve() if project_pi_raw else None
+    out_root = Path(output_pi_raw).expanduser().resolve() if output_pi_raw else None
+    for rec in recorded:
+        meta = rec.station.meta
+        if not meta.get("is_real_pair") or not meta.get("pair_dest"):
+            continue
+        pd = Path(meta["pair_dest"])
+        if proj is not None and out_root is not None:
+            pd = remap_pair_dest(pd, proj, out_root)
+        tag = (f"ag{meta['requested_gain']}"
+               if meta.get("requested_gain") is not None else "pair")
+        names = filenames_for_derive(rec.ctt_filenames, pull_max=pull_max)
+        paths = [mirror_map[f] for f in names if f in mirror_map]
+        try:
+            if len(paths) < min(2, min_frames):
+                raise ValueError(f"only {len(paths)}/{len(names)} DNG(s) available")
+            res = derive_real_pair_paths(
+                paths, pd, min_frames=min_frames)
+            write_gain_sidecar(pd, meta)
+            derived.append(f"{tag}: {res['noisy']}+{res['gt']}")
+            written_dirs.append(pd)
+            if mark_derived is not None:
+                mark_derived.add(str(pd))
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{meta.get('requested_gain', tag)}: {exc}")
+    return derived, failed, written_dirs
+
+
 def _prompt(msg: str) -> str:
     try:
         return console.input(f"[bold cyan]{msg}[/] ").strip().lower()
@@ -1370,8 +1528,12 @@ def _prompt(msg: str) -> str:
 
 
 def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
-               *, dry_run: bool, lightbox_percent: float | None = None) -> list[Recorded]:
+               *, dry_run: bool, lightbox_percent: float | None = None,
+               project_pi_raw: Path | str | None = None,
+               output_pi_raw: Path | str | None = None) -> list[Recorded]:
     recorded: list[Recorded] = []
+    proj_pi = Path(project_pi_raw) if project_pi_raw else None
+    out_pi = Path(output_pi_raw) if output_pi_raw else proj_pi
 
     for n, st in enumerate(stations, 1):
         level_rule(n, st.title)
@@ -1466,13 +1628,17 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                 continue
             recorded.extend(recs)
             if transfer.incremental:
-                for rec in recs:
-                    try:
-                        mirror = transfer.fetch(rec.ctt_filenames)
-                        placed = _place_files(mirror, rec)
-                        log(f"Filed {placed} DNG(s) → {rec.station.dest}", "ok")
-                    except CTTError as exc:
-                        log(f"Transfer failed (will retry at finalize): {exc}", "warn")
+                try:
+                    need = derive_filenames_needed(recs)
+                    mirror = transfer.fetch(need)
+                    derived, failed, _written = derive_recorded_pairs(
+                        mirror, recs, project_pi_raw=proj_pi, output_pi_raw=out_pi)
+                    for line in derived:
+                        log(f"Pair {line}", "ok")
+                    for line in failed:
+                        log(f"Pair failed: {line}", "warn")
+                except CTTError as exc:
+                    log(f"Transfer failed (will retry at finalize): {exc}", "warn")
             continue
 
         # Fire the burst.
@@ -1506,22 +1672,43 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
     return recorded
 
 
-def finalize_placement(transfer: Transfer, recorded: list[Recorded]) -> None:
+def finalize_placement(transfer: Transfer, recorded: list[Recorded], *,
+                       project_pi_raw: Path | str | None = None,
+                       output_pi_raw: Path | str | None = None) -> None:
     """Ensure every recorded station's files are pulled and filed locally."""
     log("Finalising transfer — pulling any remaining DNGs …", "info")
-    mirror = transfer.finalize()
-    if not mirror:
+    proj = Path(project_pi_raw).expanduser() if project_pi_raw else None
+    out = Path(output_pi_raw).expanduser() if output_pi_raw else proj
+    need_pairs = [r for r in recorded if r.station.meta.get("is_real_pair")]
+    need_calib = [r for r in recorded if not r.station.meta.get("is_real_pair")]
+    pending_pairs = []
+    for rec in need_pairs:
+        pd = Path(rec.station.meta.get("pair_dest", ""))
+        if proj is not None and out is not None:
+            pd = remap_pair_dest(pd, proj, out)
+        if pd.is_dir() and (pd / "noisy.png").is_file() and (pd / "gt.png").is_file():
+            continue
+        pending_pairs.append(rec)
+    fnames = derive_filenames_needed(pending_pairs + need_calib)
+    mirror = transfer.fetch(fnames) if fnames else transfer.finalize()
+    if not mirror and not fnames:
         log("Nothing to finalise (files already placed).", "info")
         return
     total = 0
-    for rec in recorded:
-        # Only re-place stations whose destination is empty/partial.
+    for rec in need_calib:
         want = len(rec.ctt_filenames)
         have = len(list(rec.station.dest.glob("*.dng"))) if rec.station.dest.is_dir() else 0
         if have >= want and have > 0:
             continue
         total += _place_files(mirror, rec)
-    log(f"Finalised placement ({total} DNG(s) filed).", "ok")
+    derived, failed, _written = derive_recorded_pairs(
+        mirror, pending_pairs, project_pi_raw=proj, output_pi_raw=out)
+    total += len(derived)
+    if derived:
+        log(f"Derived {len(derived)} pair(s) (pulled subset of burst DNGs).", "ok")
+    if failed:
+        log(f"Pair derive failures: {'; '.join(failed[:3])}", "warn")
+    log(f"Finalised placement ({total} item(s) filed/derived).", "ok")
 
 
 # --------------------------------------------------------------------------- #
@@ -2031,7 +2218,7 @@ def main() -> int:
     p.add_argument("--run-post", action="store_true",
                    help="also run calibrate_noise / capture_gt / simulate_dataset")
     p.add_argument("--publish-to", default=None,
-                   help="dataset root to copy finished PI_RAW pairs into and verify "
+                   help="dataset root to write finished pairs into directly "
                         f"(default: {default_publish_dest()} — USER@ai:{SYSTEM_PI_RAW} "
                         "from a laptop, or local /opt when on the AI server).")
     p.add_argument("--no-publish", action="store_true",
@@ -2121,47 +2308,53 @@ def main() -> int:
         log(str(exc), "err")
         return 2
 
+    project_pi_raw = project_root / "PI_RAW"
+    output_pi_raw = project_pi_raw
+    publish_dest = ""
+    needs_remote_pub = False
+    if not args.no_publish:
+        publish_dest = normalize_publish_dest(
+            args.publish_to if args.publish_to is not None else default_publish_dest())
+        project_pi_raw, output_pi_raw, needs_remote_pub = resolve_pair_output_pi_raw(
+            project_root, publish_dest, to_dataset=True)
+
     recorded = run_wizard(client, transfer, stations, dry_run=False,
-                          lightbox_percent=args.lightbox_percent)
+                          lightbox_percent=args.lightbox_percent,
+                          project_pi_raw=project_pi_raw,
+                          output_pi_raw=output_pi_raw)
     if not recorded:
         log("No captures recorded — nothing to place.", "warn")
         return 0
 
-    finalize_placement(transfer, recorded)
+    finalize_placement(transfer, recorded, project_pi_raw=project_pi_raw,
+                       output_pi_raw=output_pi_raw)
 
     if args.mode == "real":
         console.print()
-        level_rule(99, "Deriving real noisy/gt pairs")
-        if not _have_rawpy():
-            log("rawpy is required to average the burst into gt.png — install it: "
-                f"{sys.executable} -m pip install rawpy", "err")
-        for rec in recorded:
-            meta = rec.station.meta
-            if not meta.get("is_real_pair"):
+        level_rule(99, "Real noisy/gt pairs")
+        done = 0
+        for r in recorded:
+            if not r.station.meta.get("is_real_pair"):
                 continue
-            try:
-                res = derive_real_pair(rec.station.dest, meta["pair_dest"],
-                                       min_frames=min(8, args.burst_frames))
-                write_gain_sidecar(meta["pair_dest"], meta)
-                tag = ""
-                if meta.get("requested_gain") is not None:
-                    tag = f" [ag{meta['requested_gain']} → {meta.get('actual_gain', '?')}×]"
-                log(f"{meta['scene']}{tag}: {res['noisy']} + {res['gt']} "
-                    f"(gt from {res['frames_used']} frames) → {res['scene_dir']}", "ok")
-            except Exception as exc:  # noqa: BLE001
-                log(f"{meta['scene']}: could not derive pair: {exc}", "err")
+            pd = remap_pair_dest(r.station.meta["pair_dest"], project_pi_raw, output_pi_raw)
+            if (pd / "noisy.png").is_file() and (pd / "gt.png").is_file():
+                done += 1
+        where = output_pi_raw if output_pi_raw != project_pi_raw else project_pi_raw
+        log(f"{done} pair folder(s) under {where} (built during transfer).", "ok")
     else:
         post_process(project_root, args, list(args.scenes))
 
-    # Publish the finished PI_RAW pairs to the AI-server dataset root so training
-    # picks them up, and read them back to confirm they actually landed.
-    if not args.no_publish:
+    if not args.no_publish and publish_dest:
         console.print()
         level_rule(99, "Publishing to the AI-server dataset")
-        summary = publish_pi_raw(
-            project_root / "PI_RAW",
-            args.publish_to if args.publish_to is not None else default_publish_dest())
-        _log_publish(summary)
+        if needs_remote_pub:
+            summary = publish_pi_raw(output_pi_raw, publish_dest)
+            _log_publish(summary)
+        elif output_pi_raw != project_pi_raw:
+            log(f"Pairs saved directly under {output_pi_raw} (no project copy).", "ok")
+        else:
+            summary = publish_pi_raw(project_pi_raw, publish_dest)
+            _log_publish(summary)
 
     console.print()
     log("Done. Point Dataset Studio's PI_RAW root at "
