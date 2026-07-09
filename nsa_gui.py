@@ -2313,15 +2313,49 @@ class CttCaptureWizard(tk.Toplevel):
         self.capture_btn.pack(side="right")
 
     # -- helpers -------------------------------------------------------------
+    def _ui_alive(self) -> bool:
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _ui_call(self, func, *args, **kwargs):
+        """Run on the Tk main thread; no-op if the wizard was closed."""
+        if self._stop.is_set():
+            return
+
+        def run():
+            if not self._ui_alive():
+                return
+            try:
+                func(*args, **kwargs)
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(0, run)
+        except tk.TclError:
+            pass
+
     def _set_status(self, text: str, kind: str = "info"):
-        colour = {"ok": GREEN, "warn": AMBER, "err": RASPBERRY}.get(kind, SUBTLE)
-        self.status_lbl.config(text=text, fg=colour)
+        if not self._ui_alive():
+            return
+        try:
+            colour = {"ok": GREEN, "warn": AMBER, "err": RASPBERRY}.get(kind, SUBTLE)
+            self.status_lbl.config(text=text, fg=colour)
+        except tk.TclError:
+            pass
 
     def _set_busy(self, on: bool):
+        if not self._ui_alive():
+            return
         self._busy = on
-        for b in (self.capture_btn, self.apply_btn, self.back_btn,
-                  self.skip_btn, self.connect_btn):
-            b.set_enabled(not on)
+        try:
+            for b in (self.capture_btn, self.apply_btn, self.back_btn,
+                      self.skip_btn, self.connect_btn):
+                b.set_enabled(not on)
+        except tk.TclError:
+            pass
 
     def _browse_root(self):
         p = filedialog.askdirectory(title="NSA project root (PI_RAW / calibration / bursts)")
@@ -2710,9 +2744,9 @@ class CttCaptureWizard(tk.Toplevel):
                 if incremental:
                     mirror = self._transfer.fetch(fnames)
                     placed = self.backend._place_files(mirror, rec)
-                self.after(0, lambda: self._captured(len(fnames), placed, incremental))
+                self._ui_call(self._captured, len(fnames), placed, incremental)
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda e=exc: self._capture_fail(str(e)))
+                self._ui_call(self._capture_fail, str(exc))
 
         self._set_busy(True)
         self._set_status(f"Capturing {st.frames} frame(s)…")
@@ -2720,7 +2754,7 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _capture_sweep(self, st, project: str, incremental: bool):
         def status(msg, kind="info"):
-            self.after(0, lambda: self._set_status(msg, kind))
+            self._ui_call(self._set_status, msg, kind)
 
         scene = st.meta.get("scene", "scene")
         # Read Tk vars on the main thread before spawning the worker.
@@ -2748,9 +2782,9 @@ class CttCaptureWizard(tk.Toplevel):
                             publish_dest, ssh_password=pw, only_under=pair_dirs)
                     else:
                         status(f"{scene}: publish skipped (no password).", "warn")
-                self.after(0, lambda: self._swept(scene, recs, result))
+                self._ui_call(self._swept, scene, recs, result)
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda e=exc: self._capture_fail(str(e)))
+                self._ui_call(self._capture_fail, str(exc))
 
         self._set_busy(True)
         threading.Thread(target=work, daemon=True).start()
@@ -2936,6 +2970,8 @@ class CttCaptureWizard(tk.Toplevel):
             return {"error": str(exc), "verified": 0, "failures": [], "dest": dest}
 
     def _swept(self, scene: str, recs: list, result: dict):
+        if not self._ui_alive():
+            return
         self._set_busy(False)
         n = len(recs)
         parts = [f"{scene}: filed {result['placed']} DNG(s)"]
@@ -2971,11 +3007,15 @@ class CttCaptureWizard(tk.Toplevel):
         self.after(600, lambda: self._show_station(self._idx + 1))
 
     def _capture_fail(self, err: str):
+        if not self._ui_alive():
+            return
         self._set_busy(False)
         self._set_status(f"Capture failed: {err}", "err")
         messagebox.showerror("Capture failed", err)
 
     def _captured(self, n: int, placed: int, incremental: bool):
+        if not self._ui_alive():
+            return
         self._set_busy(False)
         if incremental:
             self._set_status(f"Captured {n} DNG(s), filed {placed} → advancing.", "ok")
