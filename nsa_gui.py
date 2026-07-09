@@ -2530,7 +2530,7 @@ class CttCaptureWizard(tk.Toplevel):
             pass
 
     def _paint(self):
-        if self._stop.is_set():
+        if self._stop.is_set() or not self._ui_alive():
             return
         import io
         with self._lock:
@@ -2542,38 +2542,47 @@ class CttCaptureWizard(tk.Toplevel):
                 photo = ImageTk.PhotoImage(im)
                 self._imgs["preview"] = photo
                 self.preview_lbl.config(image=photo, text="")
-            except Exception:  # noqa: BLE001
-                pass
-        self.after(120, self._paint)
+            except (tk.TclError, Exception):  # noqa: BLE001
+                return
+        if self._ui_alive():
+            self.after(120, self._paint)
 
     def _poll_controls(self):
-        if self._stop.is_set() or self._client is None:
+        if self._stop.is_set() or self._client is None or not self._ui_alive():
             return
 
         def work():
+            if self._stop.is_set():
+                return
             try:
                 c = self._client.get_controls()
                 h = self._client.histogram()
             except Exception:  # noqa: BLE001
                 return
-            self.after(0, lambda: self._update_readback(c, h))
+            self._ui_call(self._update_readback, c, h)
 
         threading.Thread(target=work, daemon=True).start()
-        self.after(1300, self._poll_controls)
+        if self._ui_alive():
+            self.after(1300, self._poll_controls)
 
     def _update_readback(self, c: dict, h: dict):
-        self.readback_lbl.config(text=(
-            f"exposure  {c.get('exposure', 0)/1000:.2f} ms      "
-            f"gain  {c.get('gain', 0):g}×\n"
-            f"colour temp  {c.get('colour_temp', 0)} K      "
-            f"lux  {c.get('lux', 0)}      focus  {c.get('focus_fom', 0)}\n"
-            f"auto-exposure  {'ON' if c.get('auto_exposure') else 'off (locked)'}"))
-        clip = h.get("clipping") or {}
-        if clip:
-            hot = any(float(v) > 1.0 for v in clip.values())
-            self.clip_lbl.config(
-                text="clipping  " + "  ".join(f"{k} {v}%" for k, v in clip.items()),
-                fg=AMBER if hot else SUBTLE)
+        if not self._ui_alive():
+            return
+        try:
+            self.readback_lbl.config(text=(
+                f"exposure  {c.get('exposure', 0)/1000:.2f} ms      "
+                f"gain  {c.get('gain', 0):g}×\n"
+                f"colour temp  {c.get('colour_temp', 0)} K      "
+                f"lux  {c.get('lux', 0)}      focus  {c.get('focus_fom', 0)}\n"
+                f"auto-exposure  {'ON' if c.get('auto_exposure') else 'off (locked)'}"))
+            clip = h.get("clipping") or {}
+            if clip:
+                hot = any(float(v) > 1.0 for v in clip.values())
+                self.clip_lbl.config(
+                    text="clipping  " + "  ".join(f"{k} {v}%" for k, v in clip.items()),
+                    fg=AMBER if hot else SUBTLE)
+        except tk.TclError:
+            pass
 
     # -- station flow --------------------------------------------------------
     def _show_station(self, idx: int):
