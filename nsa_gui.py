@@ -2204,7 +2204,7 @@ class CttCaptureWizard(tk.Toplevel):
             parent,
             text=("Copies finished pairs from the project PI_RAW folder on THIS "
                   "computer to the AI training dataset via rsync/SSH. Default: "
-                  f"{backend.default_publish_dest()}.  If key login fails, a "
+                  f"{self.backend.default_publish_dest()}.  If key login fails, a "
                   "password dialog appears (asked once per session)."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
