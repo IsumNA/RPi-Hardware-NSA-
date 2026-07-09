@@ -2207,11 +2207,10 @@ class CttCaptureWizard(tk.Toplevel):
                   font=font(10)).pack(side="left", fill="x", expand=True)
         tk.Label(
             parent,
-            text=("Copies finished pairs from your project PI_RAW folder into the "
-                  "training dataset. On the AI server itself the default is a local "
-                  f"path ({self.backend.SYSTEM_PI_RAW}). From another PC it uses "
-                  f"rsync/SSH ({self.backend.default_publish_dest()}). "
-                  "If key login fails, a password dialog appears once per session."),
+            text=("Copies only new imx662_ag<GAIN>_test pair folders into the "
+                  "training dataset. Existing imx219/other sensor data is never "
+                  "deleted or overwritten outside those new folders. Default: "
+                  f"{self.backend.default_publish_dest()}."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2740,11 +2739,13 @@ class CttCaptureWizard(tk.Toplevel):
                 status(f"{scene}: saving {len(recs)} pair(s)…")
                 result = self._save_recs(recs, incremental, min_frames, status)
                 if publish_dest and result["derived"]:
-                    status(f"{scene}: publishing to AI server…")
+                    status(f"{scene}: publishing new pair folders…")
+                    pair_dirs = [r.station.meta["pair_dest"] for r in recs
+                                 if r.station.meta.get("pair_dest")]
                     pw = self._password_for_publish_blocking(publish_dest)
                     if pw is not False:
                         result["publish"] = self._publish_with_auth(
-                            publish_dest, ssh_password=pw)
+                            publish_dest, ssh_password=pw, only_under=pair_dirs)
                     else:
                         status(f"{scene}: publish skipped (no password).", "warn")
                 self.after(0, lambda: self._swept(scene, recs, result))
@@ -2842,6 +2843,12 @@ class CttCaptureWizard(tk.Toplevel):
         else:
             lines.append(
                 "\n\nPublish is a local file copy on this machine (no SSH).")
+        pub_dirs = summary.get("published_dirs") or []
+        if pub_dirs:
+            lines.append(
+                "\n\nOnly these new pair folders were touched:\n  "
+                + "\n  ".join(pub_dirs[:8])
+                + (" …" if len(pub_dirs) > 8 else ""))
         return "\n".join(lines)
 
     def _resolve_publish_password(self, dest: str, *, force: bool = False) -> str | None | bool:
@@ -2888,10 +2895,12 @@ class CttCaptureWizard(tk.Toplevel):
         done.wait(timeout=600)
         return box.get("pw", False)
 
-    def _publish_with_auth(self, dest: str, ssh_password: str | None = None) -> dict | None:
+    def _publish_with_auth(self, dest: str, ssh_password: str | None = None,
+                           *, only_under: list | None = None) -> dict | None:
         """Publish to the AI server; prompt for password only when keys fail."""
         try:
-            summary = self._publish_now(dest, ssh_password=ssh_password) or {}
+            summary = self._publish_now(dest, ssh_password=ssh_password,
+                                        only_under=only_under) or {}
             if summary.get("auth_failed"):
                 if ssh_password and not shutil.which("sshpass"):
                     return summary
@@ -2899,27 +2908,30 @@ class CttCaptureWizard(tk.Toplevel):
                 self._ssh_password_cache.pop(host, None)
                 pw = self._password_for_publish_blocking(dest, force=True)
                 if pw is not False:
-                    summary = self._publish_now(dest, ssh_password=pw) or {}
+                    summary = self._publish_now(dest, ssh_password=pw,
+                                                only_under=only_under) or {}
             elif summary.get("needs_password"):
                 host = dest.rsplit(":", 1)[0]
                 self._ssh_password_cache.pop(host, None)
                 pw = self._password_for_publish_blocking(dest, force=True)
                 if pw is not False:
-                    summary = self._publish_now(dest, ssh_password=pw) or {}
+                    summary = self._publish_now(dest, ssh_password=pw,
+                                                only_under=only_under) or {}
             return summary
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc), "verified": 0, "failures": [],
                     "dest": dest, "src": str(self._local_pi_raw())}
 
-    def _publish_now(self, dest: str, *, ssh_password: str | None = None) -> dict | None:
-        """Copy the current PI_RAW tree to the AI-server dataset root (idempotent —
-        skips files already there). Returns the publish summary or None."""
+    def _publish_now(self, dest: str, *, ssh_password: str | None = None,
+                     only_under: list | None = None) -> dict | None:
+        """Copy new imx662 pair folders to the training dataset (idempotent)."""
         dest = self.backend.normalize_publish_dest(dest)
         if not dest:
             return None
         try:
             return self.backend.publish_pi_raw(
-                self._local_pi_raw(), dest, ssh_password=ssh_password)
+                self._local_pi_raw(), dest, ssh_password=ssh_password,
+                only_under=only_under)
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc), "verified": 0, "failures": [], "dest": dest}
 
@@ -3147,7 +3159,8 @@ class CttCaptureWizard(tk.Toplevel):
                         "Publish cancelled — SSH password required.", "warn"))
                     self.after(0, lambda: self._set_busy(False))
                     return
-                summary = self._publish_with_auth(dest, ssh_password=pw)
+                summary = self._publish_with_auth(
+                    dest, ssh_password=pw, only_under=list(self._derived_pairs))
             except Exception as exc:  # noqa: BLE001
                 summary = {"error": str(exc), "verified": 0, "failures": [],
                              "dest": dest, "src": str(src)}

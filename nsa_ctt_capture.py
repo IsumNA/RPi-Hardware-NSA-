@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -48,7 +49,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import requests
 
@@ -1352,6 +1353,72 @@ def _rsync_ssh_arg_publish() -> str:
     return "ssh " + " ".join(SSH_OPTS_PUBLISH)
 
 
+# Only these PI_RAW leaf folders may be published into the shared training dataset.
+# Existing imx219_* / other sensor trees are never touched or deleted.
+_IMX662_PAIR_DIR = re.compile(r"^imx662_ag\d+_test$")
+
+
+def imx662_pair_dirs(pi_raw: Path | str,
+                     hints: Sequence[Path | str] | None = None) -> list[Path]:
+    """Pair folders safe to publish (``Data/<scene>/imx662_ag<GAIN>_test`` only)."""
+    root = Path(pi_raw).expanduser().resolve()
+    if hints:
+        out: list[Path] = []
+        for item in hints:
+            d = Path(item).expanduser().resolve()
+            if not d.is_dir():
+                continue
+            try:
+                rel = d.relative_to(root)
+            except ValueError:
+                continue
+            if (len(rel.parts) >= 2 and rel.parts[0] == "Data"
+                    and _IMX662_PAIR_DIR.match(rel.name)):
+                out.append(d)
+        return out
+    return sorted(
+        d for d in root.glob("Data/*/*")
+        if d.is_dir() and _IMX662_PAIR_DIR.match(d.name))
+
+
+def _collect_publish_files(pi_raw: Path,
+                           hints: Sequence[Path | str] | None = None) -> tuple[list[Path], list[Path]]:
+    """Return (pair_dirs, files) scoped to new IMX662 pair folders only."""
+    src = pi_raw.expanduser().resolve()
+    pair_dirs = imx662_pair_dirs(src, hints)
+    files: list[Path] = []
+    seen: set[str] = set()
+    for d in pair_dirs:
+        for f in d.rglob("*"):
+            if f.is_file():
+                key = str(f)
+                if key not in seen:
+                    seen.add(key)
+                    files.append(f)
+    return pair_dirs, files
+
+
+def _apply_publish_copy(files: list[Path], src: Path, dest: Path,
+                        summary: dict[str, Any]) -> None:
+    """Copy *files* into *dest* — additive only; never deletes existing data."""
+    for f in files:
+        rel = f.relative_to(src)
+        target = dest / rel
+        try:
+            if target.exists() and target.stat().st_size == f.stat().st_size:
+                summary["skipped"] += 1
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+                summary["copied"] += 1
+            if target.exists() and target.stat().st_size == f.stat().st_size:
+                summary["verified"] += 1
+            else:
+                summary["failures"].append(str(rel))
+        except OSError as exc:
+            summary["failures"].append(f"{rel}: {exc}")
+
+
 def _publish_auth_error_extra(err: str, host: str, *, had_password: bool) -> str:
     """Extra guidance for SSH auth failures during publish."""
     low = err.lower()
@@ -1378,16 +1445,24 @@ def _publish_auth_error_extra(err: str, host: str, *, had_password: bool) -> str
 
 
 def _publish_pi_raw_rsync(src: Path, dest: str, *,
-                          ssh_password: str | None = None) -> dict:
-    """``rsync`` the PI_RAW tree to ``user@host:/path`` and verify sizes."""
+                          ssh_password: str | None = None,
+                          only_under: Sequence[Path | str] | None = None) -> dict:
+    """``rsync`` new IMX662 pair folders into ``user@host:/path`` (additive only)."""
     summary: dict[str, Any] = {"dest": dest, "copied": 0, "verified": 0,
                                "skipped": 0, "failures": [], "error": None,
                                "remote": True, "src": str(src),
-                               "needs_password": False, "auth_failed": False}
+                               "needs_password": False, "auth_failed": False,
+                               "published_dirs": []}
     try:
-        files = [p for p in src.rglob("*") if p.is_file()]
+        pair_dirs, files = _collect_publish_files(src, only_under)
+        summary["published_dirs"] = [str(d.relative_to(src)) for d in pair_dirs]
+        if not pair_dirs:
+            summary["error"] = (
+                f"nothing to publish — no imx662_ag<GAIN>_test folders under {src}. "
+                "Existing imx219/other sensor data is never copied or changed.")
+            return summary
         if not files:
-            summary["error"] = f"nothing to publish — {src} has no files."
+            summary["error"] = f"nothing to publish — pair folders have no files yet."
             return summary
         if shutil.which("rsync") is None:
             summary["error"] = "rsync not found on PATH — install rsync for remote publish."
@@ -1407,58 +1482,64 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
             return summary
 
         with ssh_publish_auth(ssh_password) as (env, prefix):
-            mkdir = subprocess.run(
-                prefix + _ssh_cmd_publish(host, f"mkdir -p {shlex.quote(remote_path)}"),
-                capture_output=True, text=True, env=env, timeout=120)
-            if mkdir.returncode != 0:
-                err = (mkdir.stderr or mkdir.stdout or "").strip()
-                had_pw = bool(ssh_password)
-                if "permission denied" in err.lower() or "publickey" in err.lower():
-                    summary["auth_failed"] = True
-                    if not had_pw:
-                        summary["needs_password"] = True
-                summary["error"] = (
-                    f"cannot create remote folder {dest}: {err}"
-                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else "")
-                    + _publish_auth_error_extra(err, host, had_password=had_pw))
-                return summary
-
             rsync_ssh = _rsync_ssh_shell(ssh_password)
-            dry = subprocess.run(
-                ["rsync", "-az", "--dry-run", "--itemize-changes",
-                 "-e", rsync_ssh, f"{src}/", f"{dest}/"],
-                capture_output=True, text=True, env=env, timeout=600)
-            if dry.returncode != 0:
-                err = (dry.stderr or dry.stdout or "").strip()
-                had_pw = bool(ssh_password)
-                if "permission denied" in err.lower() or "publickey" in err.lower():
-                    summary["auth_failed"] = True
-                    if not had_pw:
-                        summary["needs_password"] = True
-                summary["error"] = (
-                    f"rsync dry-run failed: {err}"
-                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else "")
-                    + _publish_auth_error_extra(err, host, had_password=had_pw))
-                return summary
-            pending = [ln for ln in dry.stdout.splitlines()
-                       if ln and ln[0] in "<>ch"]
-            summary["skipped"] = len(files) - len(pending)
+            for pair_dir in pair_dirs:
+                rel = pair_dir.relative_to(src).as_posix()
+                remote_sub = f"{host}:{remote_path}/{rel}/"
+                mkdir = subprocess.run(
+                    prefix + _ssh_cmd_publish(
+                        host, f"mkdir -p {shlex.quote(f'{remote_path}/{rel}')}"),
+                    capture_output=True, text=True, env=env, timeout=120)
+                if mkdir.returncode != 0:
+                    err = (mkdir.stderr or mkdir.stdout or "").strip()
+                    had_pw = bool(ssh_password)
+                    if "permission denied" in err.lower() or "publickey" in err.lower():
+                        summary["auth_failed"] = True
+                        if not had_pw:
+                            summary["needs_password"] = True
+                    summary["error"] = (
+                        f"cannot create remote folder {remote_sub}: {err}"
+                        + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else "")
+                        + _publish_auth_error_extra(err, host, had_password=had_pw))
+                    return summary
 
-            res = subprocess.run(
-                ["rsync", "-az", "-e", rsync_ssh, f"{src}/", f"{dest}/"],
-                capture_output=True, text=True, env=env, timeout=3600)
-            if res.returncode != 0:
-                err = (res.stderr or res.stdout or "").strip()
-                had_pw = bool(ssh_password)
-                if "permission denied" in err.lower() or "publickey" in err.lower():
-                    summary["auth_failed"] = True
-                    if not had_pw:
-                        summary["needs_password"] = True
-                summary["error"] = (
-                    f"rsync failed: {err}"
-                    + _publish_auth_error_extra(err, host, had_password=had_pw))
-                return summary
-            summary["copied"] = len(pending)
+                dry = subprocess.run(
+                    ["rsync", "-az", "--dry-run", "--itemize-changes",
+                     "-e", rsync_ssh, f"{pair_dir}/", remote_sub],
+                    capture_output=True, text=True, env=env, timeout=600)
+                if dry.returncode != 0:
+                    err = (dry.stderr or dry.stdout or "").strip()
+                    had_pw = bool(ssh_password)
+                    if "permission denied" in err.lower() or "publickey" in err.lower():
+                        summary["auth_failed"] = True
+                        if not had_pw:
+                            summary["needs_password"] = True
+                    summary["error"] = (
+                        f"rsync dry-run failed for {rel}: {err}"
+                        + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else "")
+                        + _publish_auth_error_extra(err, host, had_password=had_pw))
+                    return summary
+                pending = [ln for ln in dry.stdout.splitlines()
+                           if ln and ln[0] in "<>ch"]
+                dir_files = [f for f in files
+                             if str(f).startswith(str(pair_dir) + os.sep)]
+                summary["skipped"] += len(dir_files) - len(pending)
+
+                res = subprocess.run(
+                    ["rsync", "-az", "-e", rsync_ssh, f"{pair_dir}/", remote_sub],
+                    capture_output=True, text=True, env=env, timeout=3600)
+                if res.returncode != 0:
+                    err = (res.stderr or res.stdout or "").strip()
+                    had_pw = bool(ssh_password)
+                    if "permission denied" in err.lower() or "publickey" in err.lower():
+                        summary["auth_failed"] = True
+                        if not had_pw:
+                            summary["needs_password"] = True
+                    summary["error"] = (
+                        f"rsync failed for {rel}: {err}"
+                        + _publish_auth_error_extra(err, host, had_password=had_pw))
+                    return summary
+                summary["copied"] += len(pending)
 
             for f in files:
                 rel = f.relative_to(src).as_posix()
@@ -1495,32 +1576,43 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
 
 def publish_pi_raw(project_pi_raw: Path | str,
                    dest_root: Path | str | None = None,
-                   *, ssh_password: str | None = None) -> dict:
-    """Copy the produced PI_RAW tree to the AI-server dataset root and VERIFY it.
+                   *, ssh_password: str | None = None,
+                   only_under: Sequence[Path | str] | None = None) -> dict:
+    """Copy new IMX662 pair folders into the shared training dataset (additive).
 
-    ``project_pi_raw`` is the wizard's ``<project>/PI_RAW`` folder; its contents
-    are mirrored into ``dest_root``.  Use a local path when the wizard runs ON
-    the AI server (default ``/opt/datasets/PI_RAW``), or a remote rsync target
-    when it runs on a laptop: ``user@ai-host:/opt/datasets/PI_RAW``.
+    Only ``Data/<scene>/imx662_ag<GAIN>_test/`` trees are ever published.
+    Existing imx219_* and other sensor folders under ``dest_root`` are left
+    untouched — nothing is deleted, moved, or rsync'd with ``--delete``.
+
+    ``project_pi_raw`` is the wizard's ``<project>/PI_RAW`` folder.
+    Pass ``only_under`` to limit to pair folders from the current cabinet/session.
 
     Returns a dict:
         {"dest": str, "src": str, "copied": int, "verified": int, "skipped": int,
-         "failures": [str, ...], "error": str | None, "remote": bool}
+         "failures": [str, ...], "error": str | None, "remote": bool,
+         "published_dirs": [str, ...]}
   """
     src = Path(project_pi_raw).expanduser().resolve()
     dest_s = normalize_publish_dest(
         str(dest_root if dest_root is not None else default_publish_dest()).strip())
     if is_remote_publish_dest(dest_s):
-        return _publish_pi_raw_rsync(src, dest_s, ssh_password=ssh_password)
+        return _publish_pi_raw_rsync(src, dest_s, ssh_password=ssh_password,
+                                     only_under=only_under)
 
     dest = Path(dest_s).expanduser()
     summary: dict[str, Any] = {"dest": str(dest), "src": str(src), "copied": 0,
                                "verified": 0, "skipped": 0, "failures": [],
-                               "error": None, "remote": False}
+                               "error": None, "remote": False, "published_dirs": []}
 
-    files = [p for p in src.rglob("*") if p.is_file()] if src.is_dir() else []
+    pair_dirs, files = _collect_publish_files(src, only_under)
+    summary["published_dirs"] = [str(d.relative_to(src)) for d in pair_dirs]
+    if not pair_dirs:
+        summary["error"] = (
+            f"nothing to publish — no imx662_ag<GAIN>_test folders under {src}. "
+            "Existing sensor data at the destination is not modified.")
+        return summary
     if not files:
-        summary["error"] = f"nothing to publish — {src} has no files."
+        summary["error"] = "nothing to publish — pair folders have no files yet."
         return summary
 
     try:
@@ -1532,24 +1624,7 @@ def publish_pi_raw(project_pi_raw: Path | str,
             f"sudo chown $USER {dest}")
         return summary
 
-    for f in files:
-        rel = f.relative_to(src)
-        target = dest / rel
-        try:
-            # Skip files already present and identical (fast re-runs).
-            if target.exists() and target.stat().st_size == f.stat().st_size:
-                summary["skipped"] += 1
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(f, target)
-                summary["copied"] += 1
-            # Read-back verification: it must exist AND match the source size.
-            if target.exists() and target.stat().st_size == f.stat().st_size:
-                summary["verified"] += 1
-            else:
-                summary["failures"].append(str(rel))
-        except OSError as exc:
-            summary["failures"].append(f"{rel}: {exc}")
+    _apply_publish_copy(files, src, dest, summary)
 
     return summary
 
