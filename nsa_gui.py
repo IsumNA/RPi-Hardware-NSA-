@@ -323,11 +323,14 @@ class RoundButton(tk.Canvas):
 
     def __init__(self, parent, text, command, kind="primary", width=170, height=44):
         self._is_hero = kind == "hero"
+        self._base_width = width
         # Hero is slightly larger than primary, but must not blow past the content area.
         if self._is_hero:
-            w, h = S(min(width, 210)), S(min(height, 48))
+            w = S(min(width, 210))
+            h = S(min(height, 48))
         else:
-            w, h = S(width), S(height)
+            w = self._width_for_text(text, width)
+            h = S(height)
         super().__init__(parent, width=w, height=h, bg=parent["bg"],
                          highlightthickness=0, bd=0)
         self.command = command
@@ -339,6 +342,23 @@ class RoundButton(tk.Canvas):
         self.bind("<Enter>", lambda e: self._draw(hover=True))
         self.bind("<Leave>", lambda e: self._draw(hover=False))
         self._draw()
+
+    def _width_for_text(self, text: str, base_width: int) -> int:
+        """At least *base_width*, wide enough for the label (+ padding)."""
+        pad = S(28)
+        tw = tkfont.Font(font=font(11, "bold")).measure(text)
+        return max(S(base_width), tw + pad)
+
+    def _label_font(self) -> tuple:
+        """Pick the largest bold size that fits the canvas width."""
+        pad = S(24)
+        lo = 9
+        hi = 12 if self._is_hero else 11
+        for fsize in range(hi, lo - 1, -1):
+            ft = font(fsize, "bold")
+            if tkfont.Font(font=ft).measure(self.text) <= self.w - pad:
+                return ft
+        return font(lo, "bold")
 
     def _palette(self, hover):
         if self.kind == "hero":
@@ -360,13 +380,7 @@ class RoundButton(tk.Canvas):
         outline = 2.5 if self._is_hero else 1.5
         self.create_polygon(_round_points(2, 2, self.w - 2, self.h - 2, r),
                             smooth=True, fill=fill, outline=border, width=outline)
-        fsize = 12 if self._is_hero else 11
-        # Shrink label if the canvas is tight so text is not clipped at the edges.
-        ft = font(fsize, "bold")
-        tw = tkfont.Font(font=ft).measure(self.text)
-        if tw > self.w - S(20):
-            fsize = max(9, fsize - 1)
-            ft = font(fsize, "bold")
+        ft = self._label_font()
         self.create_text(self.w / 2, self.h / 2, text=self.text, fill=fg,
                         font=ft)
 
@@ -380,6 +394,11 @@ class RoundButton(tk.Canvas):
 
     def set_text(self, text: str):
         self.text = text
+        if not self._is_hero:
+            new_w = self._width_for_text(text, self._base_width)
+            if new_w != self.w:
+                self.w = new_w
+                self.configure(width=new_w)
         self._draw()
 
 
