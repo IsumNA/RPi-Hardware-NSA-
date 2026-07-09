@@ -2013,7 +2013,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.autolight_var = tk.BooleanVar(value=True)
         # Copy the finished PI_RAW pairs to the AI-server dataset root (and verify)
         # so training picks them up. Default: {USER}@ai:/opt/datasets/PI_RAW.
-        self.publish_var = tk.BooleanVar(value=False)
+        self.publish_var = tk.BooleanVar(value=True)
         self.publish_path_var = tk.StringVar(value=backend.default_publish_dest())
         self._lightbox_present = False
         self._lightbox_illums = []      # driver's channel names, for the override combo
