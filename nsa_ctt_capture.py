@@ -1339,14 +1339,21 @@ def check_publish_dest(dest_root: Path | str) -> str | None:
             "If the AI training server is a different machine, set the dataset "
             "root to  user@ai-host:/opt/datasets/PI_RAW  (rsync over SSH)."
         )
-    if not os.access(dest, os.W_OK):
-        return (
-            f"No write permission to {dest}.\n\n"
-            f"On the AI server run once:\n"
-            f"  sudo mkdir -p {dest} && sudo chown $USER {dest}\n\n"
-            "Or publish remotely:  user@ai-host:/opt/datasets/PI_RAW"
-        )
-    return None
+    # Publish only creates Data/<scene>/imx662_ag<GAIN>_test/ — check that path.
+    data = dest / "Data"
+    if data.is_dir():
+        if os.access(data, os.W_OK):
+            return None
+    elif os.access(dest, os.W_OK):
+        return None
+    return (
+        f"Your account cannot write new imx662 pair folders under {dest}.\n\n"
+        "The shared PI_RAW dataset is already there — do NOT chown or recreate "
+        "the whole tree (that would affect existing imx219/sensor data).\n\n"
+        "Ask your admin to grant you write access under Data/, for example:\n"
+        f"  sudo chgrp $USER {data if data.is_dir() else dest / 'Data'}\n"
+        f"  sudo chmod g+w {data if data.is_dir() else dest / 'Data'}\n\n"
+        "Publish only adds Data/<scene>/imx662_ag<GAIN>_test/ folders.")
 
 
 def _rsync_ssh_arg_publish() -> str:
@@ -1619,9 +1626,9 @@ def publish_pi_raw(project_pi_raw: Path | str,
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         summary["error"] = (
-            f"cannot write to {dest}: {exc}. "
-            f"Create it once with:  sudo mkdir -p {dest} && "
-            f"sudo chown $USER {dest}")
+            f"cannot write under {dest}: {exc}.\n\n"
+            "The shared dataset may already exist — do not chown the whole "
+            "PI_RAW tree. Ask your admin for write access under Data/ only.")
         return summary
 
     _apply_publish_copy(files, src, dest, summary)
