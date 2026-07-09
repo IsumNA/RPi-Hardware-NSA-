@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -1979,6 +1980,8 @@ class CttCaptureWizard(tk.Toplevel):
         self._ssh_password_cache: dict[str, str] = {}
         self._published_scenes: set[str] = set()
         self._publish_failed_scenes: set[str] = set()
+        self._publish_warned = False
+        self._publish_any_failed = False
         self._project_root = None
         self._controls_range: dict = {}
         self._busy = False
@@ -2204,10 +2207,11 @@ class CttCaptureWizard(tk.Toplevel):
                   font=font(10)).pack(side="left", fill="x", expand=True)
         tk.Label(
             parent,
-            text=("Copies finished pairs from the project PI_RAW folder on THIS "
-                  "computer to the AI training dataset via rsync/SSH. Default: "
-                  f"{self.backend.default_publish_dest()}.  If key login fails, a "
-                  "password dialog appears (asked once per session)."),
+            text=("Copies finished pairs from your project PI_RAW folder into the "
+                  "training dataset. On the AI server itself the default is a local "
+                  f"path ({self.backend.SYSTEM_PI_RAW}). From another PC it uses "
+                  f"rsync/SSH ({self.backend.default_publish_dest()}). "
+                  "If key login fails, a password dialog appears once per session."),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2405,6 +2409,11 @@ class CttCaptureWizard(tk.Toplevel):
         self._derived_pairs = set()
         self._published_scenes = set()
         self._publish_failed_scenes = set()
+        self._publish_warned = False
+        self._publish_any_failed = False
+        pub = self.backend.normalize_publish_dest(self.publish_path_var.get().strip())
+        if pub != self.publish_path_var.get().strip():
+            self.publish_path_var.set(pub)
         # Build the transfer backend.
         mirror = project_root / ".ctt_mirror"
         mode = self.transfer_var.get()
@@ -2717,7 +2726,10 @@ class CttCaptureWizard(tk.Toplevel):
         scene = st.meta.get("scene", "scene")
         # Read Tk vars on the main thread before spawning the worker.
         min_frames = min(8, int(self.burst_var.get() or "48"))
-        publish_dest = self.publish_path_var.get().strip() if self.publish_var.get() else ""
+        publish_dest = ""
+        if self.publish_var.get():
+            publish_dest = self.backend.normalize_publish_dest(
+                self.publish_path_var.get().strip())
 
         def work():
             try:
@@ -2794,7 +2806,8 @@ class CttCaptureWizard(tk.Toplevel):
     def _warn_publish_dest(self):
         if not self.publish_var.get():
             return
-        dest = self.publish_path_var.get().strip()
+        dest = self.backend.normalize_publish_dest(
+            self.publish_path_var.get().strip())
         if not dest:
             return
         hint = self.backend.check_publish_dest(dest)
@@ -2821,6 +2834,14 @@ class CttCaptureWizard(tk.Toplevel):
             lines.append(
                 "\n\nPublish target is a local folder on this computer. "
                 f"The default is {self.backend.default_publish_dest()}.")
+        elif self.backend.is_remote_publish_dest(dest):
+            lines.append(
+                "\n\nNote: publish uses SSH from this computer to the AI server. "
+                "If you are already on the AI machine, set the path to "
+                f"{self.backend.SYSTEM_PI_RAW} (local copy, no SSH).")
+        else:
+            lines.append(
+                "\n\nPublish is a local file copy on this machine (no SSH).")
         return "\n".join(lines)
 
     def _resolve_publish_password(self, dest: str, *, force: bool = False) -> str | None | bool:
@@ -2828,6 +2849,7 @@ class CttCaptureWizard(tk.Toplevel):
 
         Returns False when the user cancels the password dialog.
         """
+        dest = self.backend.normalize_publish_dest(dest)
         if not dest or not self.backend.is_remote_publish_dest(dest):
             return None
         host = dest.rsplit(":", 1)[0]
@@ -2839,8 +2861,11 @@ class CttCaptureWizard(tk.Toplevel):
             return None
         pw = simpledialog.askstring(
             "SSH password for AI server",
-            f"SSH key login to {host} did not work.\n\n"
-            "Enter your password — it is reused for the rest of this session.",
+            f"SSH key login from this computer to {host} did not work.\n\n"
+            "The Pi's SSH keys are not used for publish.\n\n"
+            + ("Install sshpass first:  sudo apt install sshpass\n\n"
+               if not shutil.which("sshpass") else "")
+            + "Enter your password — it is reused for the rest of this session.",
             show="*", parent=self)
         if pw is None:
             return False
@@ -2865,19 +2890,31 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _publish_with_auth(self, dest: str, ssh_password: str | None = None) -> dict | None:
         """Publish to the AI server; prompt for password only when keys fail."""
-        summary = self._publish_now(dest, ssh_password=ssh_password)
-        if summary and summary.get("needs_password"):
-            host = dest.rsplit(":", 1)[0]
-            self._ssh_password_cache.pop(host, None)
-            pw = self._password_for_publish_blocking(dest, force=True)
-            if pw is False:
-                return summary
-            summary = self._publish_now(dest, ssh_password=pw)
-        return summary
+        try:
+            summary = self._publish_now(dest, ssh_password=ssh_password) or {}
+            if summary.get("auth_failed"):
+                if ssh_password and not shutil.which("sshpass"):
+                    return summary
+                host = dest.rsplit(":", 1)[0]
+                self._ssh_password_cache.pop(host, None)
+                pw = self._password_for_publish_blocking(dest, force=True)
+                if pw is not False:
+                    summary = self._publish_now(dest, ssh_password=pw) or {}
+            elif summary.get("needs_password"):
+                host = dest.rsplit(":", 1)[0]
+                self._ssh_password_cache.pop(host, None)
+                pw = self._password_for_publish_blocking(dest, force=True)
+                if pw is not False:
+                    summary = self._publish_now(dest, ssh_password=pw) or {}
+            return summary
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc), "verified": 0, "failures": [],
+                    "dest": dest, "src": str(self._local_pi_raw())}
 
     def _publish_now(self, dest: str, *, ssh_password: str | None = None) -> dict | None:
         """Copy the current PI_RAW tree to the AI-server dataset root (idempotent —
         skips files already there). Returns the publish summary or None."""
+        dest = self.backend.normalize_publish_dest(dest)
         if not dest:
             return None
         try:
@@ -2903,21 +2940,22 @@ class CttCaptureWizard(tk.Toplevel):
                     + result.get("rawpy_reason", "install rawpy"))
         pub = result.get("publish")
         if pub is not None:
-            if pub.get("error"):
-                parts.append(f"AI-server copy FAILED")
-            elif pub.get("verified", 0) == 0 and pub.get("failures"):
-                parts.append("AI-server copy FAILED (0 verified)")
+            if pub.get("error") or (pub.get("verified", 0) == 0 and pub.get("failures")):
+                parts.append("AI-server copy failed (saved locally)")
+                self._publish_any_failed = True
             else:
                 parts.append(f"AI server +{pub.get('copied', 0)} "
                              f"(verified {pub.get('verified', 0)})")
-        kind = "warn" if (result["failed"] or (pub and (pub.get("error")
-                         or pub.get("verified", 0) == 0))) else "ok"
+        kind = "warn" if (result["failed"] or (pub and pub.get("error"))) else "ok"
         self._set_status("  ·  ".join(parts) + " → advancing.", kind)
-        if pub and (pub.get("error") or pub.get("verified", 0) == 0):
+        if pub and pub.get("error") and not self._publish_warned:
+            self._publish_warned = True
             messagebox.showwarning(
-                "AI-server copy failed",
+                "AI-server copy failed (capture continues)",
                 self._format_publish_help(pub) +
-                "\n\nCaptures are safe in the local project PI_RAW folder.")
+                "\n\nYour captures are safe locally. The wizard will keep going — "
+                "use RETRY AI-SERVER COPY when you are done.")
+        self._ensure_retry_publish_button()
         self.after(600, lambda: self._show_station(self._idx + 1))
 
     def _capture_fail(self, err: str):
@@ -3067,20 +3105,34 @@ class CttCaptureWizard(tk.Toplevel):
     def _pairs_done(self, lines: list):
         self._set_busy(False)
         pi_raw = self._local_pi_raw() / "Data"
+        pub_note = ""
+        if self._publish_any_failed:
+            pub_note = (
+                "\n\nAI-server copy failed for one or more cabinets — "
+                "files are in your project PI_RAW folder. Use RETRY AI-SERVER COPY below.")
         self.applied_lbl.config(text=(
             "Real noisy/gt pairs written locally under\n"
             f"{pi_raw}\n"
             "(imx662_ag<gain>_test/noisy.png + gt.png per scene)\n\n"
-            + "\n".join(lines)))
-        self._set_status(f"Done — {len(lines)} pair(s) in local project PI_RAW.", "ok")
-        self._publish_pairs()
+            + "\n".join(lines) + pub_note))
+        if self.publish_var.get() and not self._publish_any_failed:
+            self._set_status(
+                f"Done — {len(lines)} pair(s) local; published per cabinet.", "ok")
+        elif self._publish_any_failed:
+            self._set_status(
+                f"Done locally — {len(lines)} pair(s). AI publish needs retry.", "warn")
+            self._ensure_retry_publish_button()
+        else:
+            self._set_status(f"Done — {len(lines)} pair(s) in local project PI_RAW.", "ok")
+            self._publish_pairs()
 
     def _publish_pairs(self):
         """Copy the finished PI_RAW pairs to the AI-server dataset root and
         confirm (read-back) that they actually landed there."""
         if not self.publish_var.get():
             return
-        dest = self.publish_path_var.get().strip()
+        dest = self.backend.normalize_publish_dest(
+            self.publish_path_var.get().strip())
         if not dest:
             return
         src = self._local_pi_raw()
@@ -3105,31 +3157,36 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _published(self, summary: dict):
         self._set_busy(False)
-        dest = summary["dest"]
+        dest = summary.get("dest", "?")
         prior = self.applied_lbl.cget("text")
         help_txt = self._format_publish_help(summary)
-        if summary["error"]:
+        if summary.get("error"):
+            self._publish_any_failed = True
             self.applied_lbl.config(text=prior + f"\n\n{help_txt}")
-            self._set_status(f"NOT on AI server — see message.", "err")
-            messagebox.showerror("AI-server copy failed", help_txt)
+            self._set_status("NOT on AI server — local copies are safe.", "warn")
+            messagebox.showwarning("AI-server copy failed", help_txt)
             self._offer_retry_publish()
             return
-        verified = summary["verified"]
-        total = verified + len(summary["failures"])
-        if summary["failures"] or verified == 0:
+        verified = summary.get("verified", 0)
+        total = verified + len(summary.get("failures") or [])
+        if summary.get("failures") or verified == 0:
+            self._publish_any_failed = True
             self.applied_lbl.config(text=prior + f"\n\n{help_txt}")
             self._set_status(
-                f"NOT on AI server — {verified}/{total} verified.", "err")
-            messagebox.showerror("AI-server copy failed", help_txt)
+                f"NOT on AI server — {verified}/{total} verified.", "warn")
+            messagebox.showwarning("AI-server copy failed", help_txt)
             self._offer_retry_publish()
         else:
             self.applied_lbl.config(text=(
                 prior + f"\n\nConfirmed on AI server:\n"
                 f"{dest}/Data/<scene>/imx662_ag<gain>_test/\n"
-                f"{verified} file(s) present (copied {summary['copied']}, "
-                f"already-there {summary['skipped']})."))
+                f"{verified} file(s) present (copied {summary.get('copied', 0)}, "
+                f"already-there {summary.get('skipped', 0)})."))
             self._set_status(
                 f"Confirmed — {verified} file(s) on AI server ({dest}).", "ok")
+
+    def _ensure_retry_publish_button(self):
+        self._offer_retry_publish()
 
     def _offer_retry_publish(self):
         """Show a retry button when publish failed (pairs are safe locally)."""

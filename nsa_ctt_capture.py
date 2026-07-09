@@ -61,7 +61,8 @@ from nsa.dataset_layout import (
     resolve_layout,
     scaffold_imx662_project,
 )
-from nsa.denoise_hw_data import SYSTEM_PI_RAW, default_publish_dest
+from nsa.denoise_hw_data import (SYSTEM_PI_RAW, default_publish_dest,
+                                  is_remote_publish_dest, normalize_publish_dest)
 from nsa.theme import banner, console, kv_table, level_rule, log
 
 # Capture is capped server-side at 16 frames per POST (see ctt-server capture()).
@@ -1319,16 +1320,13 @@ def finalize_placement(transfer: Transfer, recorded: list[Recorded]) -> None:
 # --------------------------------------------------------------------------- #
 def is_remote_publish_dest(dest: str) -> bool:
     """True for ``user@host:/path`` rsync destinations."""
-    dest = dest.strip()
-    if ":" not in dest:
-        return False
-    host = dest.rsplit(":", 1)[0]
-    return "@" in host
+    from nsa.denoise_hw_data import is_remote_publish_dest as _is_remote
+    return _is_remote(dest)
 
 
 def check_publish_dest(dest_root: Path | str) -> str | None:
     """Return a human-readable problem with *dest_root*, or None if it looks OK."""
-    dest_s = str(dest_root).strip()
+    dest_s = normalize_publish_dest(str(dest_root).strip())
     if is_remote_publish_dest(dest_s):
         if shutil.which("rsync") is None:
             return "rsync is not on PATH — install rsync for remote publish."
@@ -1354,9 +1352,29 @@ def _rsync_ssh_arg_publish() -> str:
     return "ssh " + " ".join(SSH_OPTS_PUBLISH)
 
 
-def _publish_auth_failed(err: str, *, had_password: bool) -> bool:
+def _publish_auth_error_extra(err: str, host: str, *, had_password: bool) -> str:
+    """Extra guidance for SSH auth failures during publish."""
     low = err.lower()
-    return ("permission denied" in low or "publickey" in low) and not had_password
+    if "permission denied" not in low and "publickey" not in low:
+        return ""
+    lines = [
+        "",
+        "Publish copies from this computer to the AI training dataset. "
+        "The Pi's SSH keys are not used for this step — only login from "
+        f"here to {host}.",
+    ]
+    if had_password:
+        if not shutil.which("sshpass"):
+            lines.append(
+                "A password was entered but SSH could not use it. Install "
+                "sshpass:  sudo apt install sshpass")
+        else:
+            lines.append(
+                "SSH rejected the password — check it, or set up key login: "
+                f"ssh-copy-id {host}")
+    else:
+        lines.append("Enter your password when prompted, or run ssh-copy-id.")
+    return "\n".join(lines)
 
 
 def _publish_pi_raw_rsync(src: Path, dest: str, *,
@@ -1365,7 +1383,7 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
     summary: dict[str, Any] = {"dest": dest, "copied": 0, "verified": 0,
                                "skipped": 0, "failures": [], "error": None,
                                "remote": True, "src": str(src),
-                               "needs_password": False}
+                               "needs_password": False, "auth_failed": False}
     try:
         files = [p for p in src.rglob("*") if p.is_file()]
         if not files:
@@ -1378,17 +1396,31 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
         host, _, remote_path = dest.partition(":")
         remote_path = remote_path.rstrip("/") or "/"
 
+        if ssh_password and not shutil.which("sshpass"):
+            summary["auth_failed"] = True
+            summary["error"] = (
+                "Password-based SSH publish needs sshpass on this computer.\n"
+                "Install it:  sudo apt install sshpass\n\n"
+                f"Or set up key login:  ssh-copy-id {host}"
+                + _publish_auth_error_extra("permission denied", host,
+                                            had_password=True))
+            return summary
+
         with ssh_publish_auth(ssh_password) as (env, prefix):
             mkdir = subprocess.run(
                 prefix + _ssh_cmd_publish(host, f"mkdir -p {shlex.quote(remote_path)}"),
                 capture_output=True, text=True, env=env, timeout=120)
             if mkdir.returncode != 0:
                 err = (mkdir.stderr or mkdir.stdout or "").strip()
-                if _publish_auth_failed(err, bool(ssh_password)):
-                    summary["needs_password"] = True
+                had_pw = bool(ssh_password)
+                if "permission denied" in err.lower() or "publickey" in err.lower():
+                    summary["auth_failed"] = True
+                    if not had_pw:
+                        summary["needs_password"] = True
                 summary["error"] = (
                     f"cannot create remote folder {dest}: {err}"
-                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else ""))
+                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else "")
+                    + _publish_auth_error_extra(err, host, had_password=had_pw))
                 return summary
 
             rsync_ssh = _rsync_ssh_shell(ssh_password)
@@ -1398,11 +1430,15 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
                 capture_output=True, text=True, env=env, timeout=600)
             if dry.returncode != 0:
                 err = (dry.stderr or dry.stdout or "").strip()
-                if _publish_auth_failed(err, bool(ssh_password)):
-                    summary["needs_password"] = True
+                had_pw = bool(ssh_password)
+                if "permission denied" in err.lower() or "publickey" in err.lower():
+                    summary["auth_failed"] = True
+                    if not had_pw:
+                        summary["needs_password"] = True
                 summary["error"] = (
                     f"rsync dry-run failed: {err}"
-                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else ""))
+                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else "")
+                    + _publish_auth_error_extra(err, host, had_password=had_pw))
                 return summary
             pending = [ln for ln in dry.stdout.splitlines()
                        if ln and ln[0] in "<>ch"]
@@ -1413,9 +1449,14 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
                 capture_output=True, text=True, env=env, timeout=3600)
             if res.returncode != 0:
                 err = (res.stderr or res.stdout or "").strip()
-                if _publish_auth_failed(err, bool(ssh_password)):
-                    summary["needs_password"] = True
-                summary["error"] = f"rsync failed: {err}"
+                had_pw = bool(ssh_password)
+                if "permission denied" in err.lower() or "publickey" in err.lower():
+                    summary["auth_failed"] = True
+                    if not had_pw:
+                        summary["needs_password"] = True
+                summary["error"] = (
+                    f"rsync failed: {err}"
+                    + _publish_auth_error_extra(err, host, had_password=had_pw))
                 return summary
             summary["copied"] = len(pending)
 
@@ -1467,7 +1508,8 @@ def publish_pi_raw(project_pi_raw: Path | str,
          "failures": [str, ...], "error": str | None, "remote": bool}
   """
     src = Path(project_pi_raw).expanduser().resolve()
-    dest_s = str(dest_root if dest_root is not None else default_publish_dest()).strip()
+    dest_s = normalize_publish_dest(
+        str(dest_root if dest_root is not None else default_publish_dest()).strip())
     if is_remote_publish_dest(dest_s):
         return _publish_pi_raw_rsync(src, dest_s, ssh_password=ssh_password)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -94,17 +95,70 @@ SYSTEM_PI_RAW = Path("/opt/datasets/PI_RAW")
 DEFAULT_AI_HOST = os.environ.get("NSA_AI_HOST", "ai")
 
 
+def is_remote_publish_dest(dest: str) -> bool:
+    """True for ``user@host:/path`` rsync destinations."""
+    dest = dest.strip()
+    if ":" not in dest:
+        return False
+    return "@" in dest.rsplit(":", 1)[0]
+
+
+def publish_host_is_local(host: str) -> bool:
+    """True when *host* (``user@name`` or ``name``) refers to this machine."""
+    name = host.split("@")[-1].strip().lower()
+    if name in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        local_names = {socket.gethostname().lower(), socket.getfqdn().lower()}
+        if name in local_names:
+            return True
+        # ``user@ai`` when this machine's hostname is ``ai``.
+        if name == DEFAULT_AI_HOST.lower() and DEFAULT_AI_HOST.lower() in local_names:
+            return True
+        resolved = socket.gethostbyname(name)
+        local_ip = socket.gethostbyname(socket.gethostname())
+        if resolved in (local_ip, "127.0.0.1"):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def running_on_ai_server() -> bool:
+    """True when this process is on the machine named ``NSA_AI_HOST`` (default ``ai``)."""
+    try:
+        local = {socket.gethostname().lower(), socket.getfqdn().lower()}
+        return DEFAULT_AI_HOST.lower() in local
+    except OSError:
+        return False
+
+
+def normalize_publish_dest(dest: str) -> str:
+    """Use a local path when the remote target is this same machine."""
+    dest = str(dest).strip()
+    if not is_remote_publish_dest(dest):
+        return dest
+    host, _, path = dest.partition(":")
+    if publish_host_is_local(host):
+        return path.rstrip("/") or "/"
+    return dest
+
+
 def default_publish_dest() -> str:
     """Where finished PI_RAW pairs should land after capture.
 
   * ``NSA_PUBLISH_DEST`` env — explicit override.
   * Local ``/opt/datasets/PI_RAW`` when it already exists and is writable
     (wizard running on the AI server itself).
-  * Otherwise ``{USER}@ai:/opt/datasets/PI_RAW`` — rsync from a laptop.
+  * Local ``/opt/datasets/PI_RAW`` when this machine *is* the AI server
+    (hostname matches ``NSA_AI_HOST``, default ``ai``) — no SSH loopback.
+  * Otherwise ``{USER}@ai:/opt/datasets/PI_RAW`` — rsync from another PC.
     """
     if dest := os.environ.get("NSA_PUBLISH_DEST", "").strip():
-        return dest
+        return normalize_publish_dest(dest)
     if SYSTEM_PI_RAW.exists() and os.access(SYSTEM_PI_RAW, os.W_OK):
+        return str(SYSTEM_PI_RAW)
+    if running_on_ai_server():
         return str(SYSTEM_PI_RAW)
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
     return f"{user}@{DEFAULT_AI_HOST}:{SYSTEM_PI_RAW}"
