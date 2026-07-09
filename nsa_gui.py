@@ -4102,33 +4102,41 @@ class App(tk.Tk):
         dlg.title("Choose sensor mode")
         dlg.configure(bg=WHITE)
         dlg.transient(self)
-        dlg.resizable(False, False)
         result: dict[str, str | None] = {"v": None}
 
         def choose(v: str | None):
             result["v"] = v
+            try:
+                dlg.grab_release()
+            except tk.TclError:
+                pass
             dlg.destroy()
 
         pad = S(20)
-        tk.Label(dlg, text="Which IMX662 capture mode?", bg=WHITE, fg=INK,
-                 font=font(12, "bold")).pack(anchor="w", padx=pad, pady=(pad, S(6)))
+        body = tk.Frame(dlg, bg=WHITE)
+        body.pack(fill="both", expand=True, padx=pad, pady=pad)
+        tk.Label(body, text="Which IMX662 capture mode?", bg=WHITE, fg=INK,
+                 font=font(12, "bold")).pack(anchor="w", pady=(0, S(6)))
         tk.Label(
-            dlg,
+            body,
             text=("imx662 = standard (low conversion gain).\n"
                   "imx662h = high conversion gain — the Pi runs "
                   "v4l2-ctl hcg_enable=1 before the camera starts."),
             bg=WHITE, fg=SUBTLE, font=font(9), justify="left",
-        ).pack(anchor="w", padx=pad, pady=(0, S(12)))
-        btn_row = tk.Frame(dlg, bg=WHITE)
-        btn_row.pack(fill="x", padx=pad, pady=(0, pad))
-        RoundButton(btn_row, "IMX662 (standard)", lambda: choose("imx662"),
-                    kind="secondary", width=170, height=40).pack(side="left")
-        RoundButton(btn_row, "IMX662-H (high conversion)", lambda: choose("imx662h"),
-                    kind="primary", width=220, height=40).pack(
-                        side="left", padx=(S(8), 0))
+        ).pack(anchor="w", pady=(0, S(16)))
+        btn_row = tk.Frame(body, bg=WHITE)
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="IMX662 (standard)",
+                   command=lambda: choose("imx662")).pack(side="left", ipadx=S(8), ipady=S(4))
+        ttk.Button(btn_row, text="IMX662-H (high conversion)",
+                   command=lambda: choose("imx662h")).pack(
+                       side="left", padx=(S(10), 0), ipadx=S(8), ipady=S(4))
         dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-        place_window(dlg, 520, 180, master=self)
-        dlg.grab_set()
+        place_window(dlg, 560, 240, master=self, resizable=False)
+        dlg.update_idletasks()
+        dlg.lift()
+        dlg.focus_force()
+        self._grab_when_ready(dlg)
         self.wait_window(dlg)
         return result["v"]
 
@@ -4137,7 +4145,9 @@ class App(tk.Tk):
         if sensor is None:
             return
         try:
-            CttCaptureWizard(self, capture_sensor=sensor)
+            win = CttCaptureWizard(self, capture_sensor=sensor)
+            win.lift()
+            win.focus_force()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Camera capture", str(exc))
 
