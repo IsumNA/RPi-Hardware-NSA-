@@ -569,15 +569,47 @@ def _discover_ctt_server(ssh: str) -> str | None:
     return None
 
 
+def _free_ctt_port(ssh: str, port: int,
+                    status: Callable[[str], None] = lambda _m: None) -> None:
+    """Stop ctt-server and anything else bound to *port* on the Pi."""
+    status(f"Stopping stale ctt-server on {ssh} …")
+    script = (
+        "pkill -9 -f ctt-server 2>/dev/null || true; "
+        f"fuser -k {int(port)}/tcp 2>/dev/null || true; "
+        "sleep 1"
+    )
+    subprocess.run(_ssh_cmd(ssh, script), capture_output=True, text=True, timeout=20)
+    time.sleep(1.5)
+
+
+def _launch_ctt_server(ssh: str, *, ctt_cmd: str, port: int,
+                       workspace: str | None) -> subprocess.CompletedProcess[str]:
+    """Start ctt-server detached on the Pi."""
+    full = f"{ctt_cmd} --host 0.0.0.0 --port {int(port)}"
+    if workspace:
+        full += f" --workspace {shlex.quote(workspace)}"
+    launch = f"setsid nohup {full} > ~/ctt-server.log 2>&1 < /dev/null & echo LAUNCHED"
+    return subprocess.run(_ssh_cmd(ssh, launch), capture_output=True, text=True, timeout=25)
+
+
 def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-server",
                   port: int = 5000, workspace: str | None = None,
                   autostart: bool = True, wait_s: float = 45.0,
                   status: Callable[[str], None] = lambda _m: None) -> str:
     """Make sure the CTT server is answering; SSH in and start it if not.
 
+    When *autostart* is on and *ssh* is set, any existing ctt-server on the Pi
+    is stopped first (frees port 5000 after sensor moves / hung processes).
+
     Returns "running" (already up), "started" (we launched it), and raises
     CTTError with an actionable message otherwise.
     """
+    if autostart and ssh:
+        ok, ssh_err = _probe_ssh(ssh)
+        if ok:
+            _free_ctt_port(ssh, port, status)
+        # If SSH is down we'll try health / fail with a clear message below.
+
     try:
         client.health(timeout=HEALTH_POLL_TIMEOUT)
         return "running"
@@ -631,24 +663,20 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
                     "~/ctt-venv/bin/ctt-server) or a command like "
                     "'source ~/ctt-venv/bin/activate && ctt-server'.")
 
-    status(f"Stopping any stale ctt-server on {ssh} …")
-    subprocess.run(_ssh_cmd(ssh, "pkill -f ctt-server || true"),
-                   capture_output=True, text=True, timeout=15)
-    time.sleep(2.0)
-
     status(f"Starting {ctt_cmd} on {ssh} …")
-    full = f"{ctt_cmd} --host 0.0.0.0 --port {int(port)}"
-    if workspace:
-        full += f" --workspace {shlex.quote(workspace)}"
-    # setsid+nohup+</dev/null fully detaches so the ssh call returns immediately
-    # while the server keeps running; output goes to a log on the Pi.
-    launch = f"setsid nohup {full} > ~/ctt-server.log 2>&1 < /dev/null & echo LAUNCHED"
-    res = subprocess.run(_ssh_cmd(ssh, launch), capture_output=True, text=True, timeout=25)
+    res = _launch_ctt_server(ssh, ctt_cmd=ctt_cmd, port=port, workspace=workspace)
     if res.returncode != 0 or "LAUNCHED" not in res.stdout:
         err = (res.stderr or res.stdout or "unknown error").strip()
-        hint = _ssh_hint(err)
-        raise CTTError("Could not start ctt-server over SSH"
-                       + (f":\n{hint}" if hint else f": {err}"))
+        if "in use" in err.lower() or "address already in use" in err.lower():
+            status("Port 5000 still busy — stopping again and retrying …")
+            _free_ctt_port(ssh, port, status)
+            res = _launch_ctt_server(ssh, ctt_cmd=ctt_cmd, port=port,
+                                     workspace=workspace)
+            err = (res.stderr or res.stdout or "unknown error").strip()
+        if res.returncode != 0 or "LAUNCHED" not in res.stdout:
+            hint = _ssh_hint(err)
+            raise CTTError("Could not start ctt-server over SSH"
+                           + (f":\n{hint}" if hint else f": {err}"))
 
     deadline = time.time() + wait_s
     last = ""
