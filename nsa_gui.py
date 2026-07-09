@@ -1977,6 +1977,8 @@ class CttCaptureWizard(tk.Toplevel):
         # final reconcile don't redo work.
         self._derived_pairs: set = set()
         self._ssh_password_cache: dict[str, str] = {}
+        self._published_scenes: set[str] = set()
+        self._publish_failed_scenes: set[str] = set()
         self._project_root = None
         self._controls_range: dict = {}
         self._busy = False
@@ -2401,6 +2403,8 @@ class CttCaptureWizard(tk.Toplevel):
         self._idx = 0
         self._recorded = []
         self._derived_pairs = set()
+        self._published_scenes = set()
+        self._publish_failed_scenes = set()
         # Build the transfer backend.
         mirror = project_root / ".ctt_mirror"
         mode = self.transfer_var.get()
@@ -2714,14 +2718,6 @@ class CttCaptureWizard(tk.Toplevel):
         # Read Tk vars on the main thread before spawning the worker.
         min_frames = min(8, int(self.burst_var.get() or "48"))
         publish_dest = self.publish_path_var.get().strip() if self.publish_var.get() else ""
-        pub_password = None
-        skip_publish = False
-        if publish_dest:
-            pub_password = self._resolve_publish_password(publish_dest)
-            if pub_password is False:
-                skip_publish = True
-                self._set_status(
-                    f"{scene}: capturing — publish skipped (no SSH password).", "warn")
 
         def work():
             try:
@@ -2731,10 +2727,14 @@ class CttCaptureWizard(tk.Toplevel):
                 self._recorded.extend(recs)
                 status(f"{scene}: saving {len(recs)} pair(s)…")
                 result = self._save_recs(recs, incremental, min_frames, status)
-                if publish_dest and not skip_publish and result["derived"]:
+                if publish_dest and result["derived"]:
                     status(f"{scene}: publishing to AI server…")
-                    result["publish"] = self._publish_now(
-                        publish_dest, ssh_password=pub_password)
+                    pw = self._password_for_publish_blocking(publish_dest)
+                    if pw is not False:
+                        result["publish"] = self._publish_with_auth(
+                            publish_dest, ssh_password=pw)
+                    else:
+                        status(f"{scene}: publish skipped (no password).", "warn")
                 self.after(0, lambda: self._swept(scene, recs, result))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._capture_fail(str(e)))
@@ -2823,7 +2823,7 @@ class CttCaptureWizard(tk.Toplevel):
                 f"The default is {self.backend.default_publish_dest()}.")
         return "\n".join(lines)
 
-    def _resolve_publish_password(self, dest: str) -> str | None | bool:
+    def _resolve_publish_password(self, dest: str, *, force: bool = False) -> str | None | bool:
         """SSH password for remote publish, or None when keys work / local dest.
 
         Returns False when the user cancels the password dialog.
@@ -2831,15 +2831,16 @@ class CttCaptureWizard(tk.Toplevel):
         if not dest or not self.backend.is_remote_publish_dest(dest):
             return None
         host = dest.rsplit(":", 1)[0]
-        if host in self._ssh_password_cache:
+        if force:
+            self._ssh_password_cache.pop(host, None)
+        elif host in self._ssh_password_cache:
             return self._ssh_password_cache[host]
-        if self.backend.probe_ssh_key_auth(host):
+        if not force and self.backend.probe_ssh_key_auth(host):
             return None
         pw = simpledialog.askstring(
             "SSH password for AI server",
             f"SSH key login to {host} did not work.\n\n"
-            "Enter your password — it is used for this publish only and "
-            "reused for the rest of this capture session (one SSH session).",
+            "Enter your password — it is reused for the rest of this session.",
             show="*", parent=self)
         if pw is None:
             return False
@@ -2848,6 +2849,31 @@ class CttCaptureWizard(tk.Toplevel):
             return False
         self._ssh_password_cache[host] = pw
         return pw
+
+    def _password_for_publish_blocking(self, dest: str, *, force: bool = False):
+        """Resolve publish password on the Tk main thread (safe from worker threads)."""
+        box: dict = {}
+        done = threading.Event()
+
+        def on_main():
+            box["pw"] = self._resolve_publish_password(dest, force=force)
+            done.set()
+
+        self.after(0, on_main)
+        done.wait(timeout=600)
+        return box.get("pw", False)
+
+    def _publish_with_auth(self, dest: str, ssh_password: str | None = None) -> dict | None:
+        """Publish to the AI server; prompt for password only when keys fail."""
+        summary = self._publish_now(dest, ssh_password=ssh_password)
+        if summary and summary.get("needs_password"):
+            host = dest.rsplit(":", 1)[0]
+            self._ssh_password_cache.pop(host, None)
+            pw = self._password_for_publish_blocking(dest, force=True)
+            if pw is False:
+                return summary
+            summary = self._publish_now(dest, ssh_password=pw)
+        return summary
 
     def _publish_now(self, dest: str, *, ssh_password: str | None = None) -> dict | None:
         """Copy the current PI_RAW tree to the AI-server dataset root (idempotent —
@@ -3057,18 +3083,19 @@ class CttCaptureWizard(tk.Toplevel):
         dest = self.publish_path_var.get().strip()
         if not dest:
             return
-        password = self._resolve_publish_password(dest)
-        if password is False:
-            self._set_status("Publish cancelled — SSH password required.", "warn")
-            return
         src = self._local_pi_raw()
         self._set_status(f"Publishing local PI_RAW → {dest}…")
         self._set_busy(True)
 
         def work():
             try:
-                summary = self.backend.publish_pi_raw(
-                    src, dest, ssh_password=password)
+                pw = self._password_for_publish_blocking(dest)
+                if pw is False:
+                    self.after(0, lambda: self._set_status(
+                        "Publish cancelled — SSH password required.", "warn"))
+                    self.after(0, lambda: self._set_busy(False))
+                    return
+                summary = self._publish_with_auth(dest, ssh_password=pw)
             except Exception as exc:  # noqa: BLE001
                 summary = {"error": str(exc), "verified": 0, "failures": [],
                              "dest": dest, "src": str(src)}

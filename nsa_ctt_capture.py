@@ -416,6 +416,56 @@ def _ssh_cmd_publish(ssh: str, inner: str) -> list[str]:
     return ["ssh", *SSH_OPTS_PUBLISH, ssh, f"bash -c {shlex.quote(inner)}"]
 
 
+def _ssh_publish_prefix(password: str | None) -> list[str]:
+    """Prefix for ssh/rsync when a password is required (``sshpass`` if installed)."""
+    if password and shutil.which("sshpass"):
+        return ["sshpass", "-e"]
+    return []
+
+
+def _rsync_ssh_shell(password: str | None) -> str:
+    inner = "ssh " + " ".join(SSH_OPTS_PUBLISH)
+    prefix = _ssh_publish_prefix(password)
+    return (" ".join(prefix) + " " + inner) if prefix else inner
+
+
+@contextmanager
+def ssh_publish_auth(password: str | None):
+    """Environment + argv prefix for password-based publish SSH/rsync."""
+    prefix = _ssh_publish_prefix(password)
+    if not password:
+        yield os.environ.copy(), prefix
+        return
+    env = os.environ.copy()
+    if prefix:
+        env["SSHPASS"] = password
+    else:
+        script = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False)
+        try:
+            safe = password.replace("'", "'\"'\"'")
+            script.write(f"#!/bin/sh\nprintf '%s' '{safe}'\n")
+            script.close()
+            os.chmod(script.name, stat.S_IRWXU)
+            env["SSH_ASKPASS"] = script.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env.setdefault("DISPLAY", ":0")
+            yield env, prefix
+        finally:
+            try:
+                os.unlink(script.name)
+            except OSError:
+                pass
+        return
+    yield env, prefix
+
+
+@contextmanager
+def ssh_askpass_env(password: str | None):
+    """Back-compat wrapper — prefer :func:`ssh_publish_auth`."""
+    with ssh_publish_auth(password) as (env, _prefix):
+        yield env
+
+
 def probe_ssh_key_auth(ssh_target: str) -> bool:
     """True when ``ssh_target`` accepts key-based login without a password."""
     if shutil.which("ssh") is None:
@@ -429,30 +479,6 @@ def probe_ssh_key_auth(ssh_target: str) -> bool:
     return res.returncode == 0
 
 
-@contextmanager
-def ssh_askpass_env(password: str | None):
-    """Provide ``SSH_ASKPASS`` so OpenSSH can read a password without a TTY."""
-    if not password:
-        yield os.environ.copy()
-        return
-    script = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False)
-    try:
-        safe = password.replace("'", "'\"'\"'")
-        script.write(f"#!/bin/sh\nprintf '%s' '{safe}'\n")
-        script.close()
-        os.chmod(script.name, stat.S_IRWXU)
-        env = os.environ.copy()
-        env["SSH_ASKPASS"] = script.name
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        env.setdefault("DISPLAY", ":0")
-        yield env
-    finally:
-        try:
-            os.unlink(script.name)
-        except OSError:
-            pass
-
-
 def _ssh_cmd(ssh: str, inner: str) -> list[str]:
     """An ssh argv that runs ``inner`` in a NON-login shell on the Pi.
 
@@ -464,21 +490,26 @@ def _ssh_cmd(ssh: str, inner: str) -> list[str]:
     return ["ssh", *SSH_OPTS, ssh, f"bash -c {shlex.quote(inner)}"]
 
 
-def _ssh_hint(stderr: str) -> str | None:
+def _ssh_hint(stderr: str, *, for_publish: bool = False) -> str | None:
     """Turn a raw ssh stderr line into an actionable hint, or None."""
     low = stderr.lower()
     if "no route to host" in low:
-        return ("Cannot reach the Pi over the network (no route to host). "
-                "Check it is powered on, on the same network, and the IP "
-                f"({stderr.split()[-1] if stderr.split() else 'see SSH target'}) "
-                "is correct.")
+        target = "the AI server" if for_publish else "the Pi"
+        return (f"Cannot reach {target} over the network (no route to host). "
+                "Check it is powered on and on the same network.")
     if "connection timed out" in low or "operation timed out" in low:
-        return ("SSH to the Pi timed out. Check the IP address, Wi‑Fi/Ethernet, "
-                "and that nothing is blocking port 22.")
+        target = "AI server" if for_publish else "Pi"
+        return (f"SSH to the {target} timed out. Check the hostname/IP and "
+                "that nothing is blocking port 22.")
     if "connection refused" in low:
+        if for_publish:
+            return "SSH on the AI server refused the connection (port 22)."
         return ("SSH on the Pi refused the connection (port 22). "
                 "Enable SSH on the Pi (raspi-config) or check sshd is running.")
     if "permission denied" in low:
+        if for_publish:
+            return ("SSH login to the AI server failed. Key login did not work — "
+                    "enter your password when the wizard prompts you.")
         return ("SSH login failed (permission denied). Set up key-based login "
                 "to the Pi, or check the username in the SSH target.")
     if "name or service not known" in low or "could not resolve hostname" in low:
@@ -1323,12 +1354,18 @@ def _rsync_ssh_arg_publish() -> str:
     return "ssh " + " ".join(SSH_OPTS_PUBLISH)
 
 
+def _publish_auth_failed(err: str, *, had_password: bool) -> bool:
+    low = err.lower()
+    return ("permission denied" in low or "publickey" in low) and not had_password
+
+
 def _publish_pi_raw_rsync(src: Path, dest: str, *,
                           ssh_password: str | None = None) -> dict:
     """``rsync`` the PI_RAW tree to ``user@host:/path`` and verify sizes."""
     summary: dict[str, Any] = {"dest": dest, "copied": 0, "verified": 0,
                                "skipped": 0, "failures": [], "error": None,
-                               "remote": True, "src": str(src)}
+                               "remote": True, "src": str(src),
+                               "needs_password": False}
     try:
         files = [p for p in src.rglob("*") if p.is_file()]
         if not files:
@@ -1341,29 +1378,31 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
         host, _, remote_path = dest.partition(":")
         remote_path = remote_path.rstrip("/") or "/"
 
-        with ssh_askpass_env(ssh_password) as env:
+        with ssh_publish_auth(ssh_password) as (env, prefix):
             mkdir = subprocess.run(
-                _ssh_cmd_publish(host, f"mkdir -p {shlex.quote(remote_path)}"),
+                prefix + _ssh_cmd_publish(host, f"mkdir -p {shlex.quote(remote_path)}"),
                 capture_output=True, text=True, env=env, timeout=120)
             if mkdir.returncode != 0:
                 err = (mkdir.stderr or mkdir.stdout or "").strip()
-                hint = _ssh_hint(err)
+                if _publish_auth_failed(err, bool(ssh_password)):
+                    summary["needs_password"] = True
                 summary["error"] = (
                     f"cannot create remote folder {dest}: {err}"
-                    + (f"\n\n{hint}" if hint else ""))
+                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else ""))
                 return summary
 
-            rsync_ssh = _rsync_ssh_arg_publish()
+            rsync_ssh = _rsync_ssh_shell(ssh_password)
             dry = subprocess.run(
                 ["rsync", "-az", "--dry-run", "--itemize-changes",
                  "-e", rsync_ssh, f"{src}/", f"{dest}/"],
                 capture_output=True, text=True, env=env, timeout=600)
             if dry.returncode != 0:
                 err = (dry.stderr or dry.stdout or "").strip()
-                hint = _ssh_hint(err)
+                if _publish_auth_failed(err, bool(ssh_password)):
+                    summary["needs_password"] = True
                 summary["error"] = (
                     f"rsync dry-run failed: {err}"
-                    + (f"\n\n{hint}" if hint else ""))
+                    + (f"\n\n{_ssh_hint(err, for_publish=True)}" if err else ""))
                 return summary
             pending = [ln for ln in dry.stdout.splitlines()
                        if ln and ln[0] in "<>ch"]
@@ -1373,7 +1412,10 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
                 ["rsync", "-az", "-e", rsync_ssh, f"{src}/", f"{dest}/"],
                 capture_output=True, text=True, env=env, timeout=3600)
             if res.returncode != 0:
-                summary["error"] = f"rsync failed: {(res.stderr or res.stdout).strip()}"
+                err = (res.stderr or res.stdout or "").strip()
+                if _publish_auth_failed(err, bool(ssh_password)):
+                    summary["needs_password"] = True
+                summary["error"] = f"rsync failed: {err}"
                 return summary
             summary["copied"] = len(pending)
 
@@ -1381,7 +1423,7 @@ def _publish_pi_raw_rsync(src: Path, dest: str, *,
                 rel = f.relative_to(src).as_posix()
                 remote_file = f"{remote_path}/{rel}"
                 stat_res = subprocess.run(
-                    _ssh_cmd_publish(
+                    prefix + _ssh_cmd_publish(
                         host,
                         f"test -f {shlex.quote(remote_file)} && "
                         f"stat -c %s {shlex.quote(remote_file)}"),
