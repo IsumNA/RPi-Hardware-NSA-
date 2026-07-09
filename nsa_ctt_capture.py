@@ -631,6 +631,11 @@ def ensure_server(client: "CTTClient", *, ssh: str | None, ctt_cmd: str = "ctt-s
                     "~/ctt-venv/bin/ctt-server) or a command like "
                     "'source ~/ctt-venv/bin/activate && ctt-server'.")
 
+    status(f"Stopping any stale ctt-server on {ssh} …")
+    subprocess.run(_ssh_cmd(ssh, "pkill -f ctt-server || true"),
+                   capture_output=True, text=True, timeout=15)
+    time.sleep(2.0)
+
     status(f"Starting {ctt_cmd} on {ssh} …")
     full = f"{ctt_cmd} --host 0.0.0.0 --port {int(port)}"
     if workspace:
