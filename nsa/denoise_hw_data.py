@@ -144,20 +144,37 @@ def normalize_publish_dest(dest: str) -> str:
     return dest
 
 
+def _home_pi_raw() -> Path:
+    return Path.home() / "PI_RAW"
+
+
+def system_pi_raw_writable() -> bool:
+    """True when this account can add imx662 pair folders under the system PI_RAW."""
+    if not SYSTEM_PI_RAW.exists():
+        return False
+    data = SYSTEM_PI_RAW / "Data"
+    if data.is_dir():
+        return os.access(data, os.W_OK)
+    return os.access(SYSTEM_PI_RAW, os.W_OK)
+
+
 def default_publish_dest() -> str:
     """Where finished PI_RAW pairs should land after capture.
 
   * ``NSA_PUBLISH_DEST`` env — explicit override.
-  * Local ``/opt/datasets/PI_RAW`` when it already exists and is writable
-    (wizard running on the AI server itself).
-  * Local ``/opt/datasets/PI_RAW`` when this machine *is* the AI server
-    (hostname matches ``NSA_AI_HOST``, default ``ai``) — no SSH loopback.
+  * Local ``/opt/datasets/PI_RAW`` when ``Data/`` is writable on this account.
+  * ``~/PI_RAW`` when the system tree exists but is owned by someone else
+    (no admin needed — train from home, or merge into /opt later).
+  * Local ``/opt/datasets/PI_RAW`` when this machine *is* the AI server and
+    the tree does not exist yet.
   * Otherwise ``{USER}@ai:/opt/datasets/PI_RAW`` — rsync from another PC.
     """
     if dest := os.environ.get("NSA_PUBLISH_DEST", "").strip():
         return normalize_publish_dest(dest)
-    if SYSTEM_PI_RAW.exists() and os.access(SYSTEM_PI_RAW, os.W_OK):
+    if system_pi_raw_writable():
         return str(SYSTEM_PI_RAW)
+    if SYSTEM_PI_RAW.exists() and running_on_ai_server():
+        return str(_home_pi_raw())
     if running_on_ai_server():
         return str(SYSTEM_PI_RAW)
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"

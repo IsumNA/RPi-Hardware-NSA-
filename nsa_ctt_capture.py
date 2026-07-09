@@ -62,7 +62,7 @@ from nsa.dataset_layout import (
     resolve_layout,
     scaffold_imx662_project,
 )
-from nsa.denoise_hw_data import (SYSTEM_PI_RAW, default_publish_dest,
+from nsa.denoise_hw_data import (SYSTEM_PI_RAW, _home_pi_raw, default_publish_dest,
                                   is_remote_publish_dest, normalize_publish_dest)
 from nsa.theme import banner, console, kv_table, level_rule, log
 
@@ -1366,7 +1366,11 @@ def check_publish_dest(dest_root: Path | str) -> str | None:
         f"  sudo setfacl -R -m u:$USER:rwx {data_path}\n"
         f"  sudo setfacl -R -d -m u:$USER:rwx {data_path}\n\n"
         "Publish only adds Data/<scene>/imx662_ag<GAIN>_test/ — existing "
-        "imx219/sensor data is not deleted or overwritten elsewhere.")
+        "imx219/sensor data is not deleted or overwritten elsewhere.\n\n"
+        "Without contacting the owner you can:\n"
+        "  • Uncheck Publish — captures stay in your project PI_RAW folder.\n"
+        f"  • Set publish path to {_home_pi_raw()} (your home folder).\n"
+        "  • Point Dataset Studio / training at that PI_RAW root instead of /opt.")
 
 
 def _rsync_ssh_arg_publish() -> str:
