@@ -59,6 +59,7 @@ sys.path.insert(0, str(ROOT))
 from nsa.dataset_layout import (
     IMX662_TARGET_AG_TAGS,
     MANAGER_SCENES,
+    ensure_manager_scenes,
     resolve_layout,
     scaffold_imx662_project,
 )
@@ -86,6 +87,27 @@ DEFAULT_LIGHTBOX_PERCENT = 100.0
 # hardware — but the libcamera tuning/mode may clamp a requested value, in which
 # case the achieved gain is recorded alongside the pair.
 DEFAULT_GAIN_SWEEP = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+CAPTURE_SENSOR_IMX662 = "imx662"
+CAPTURE_SENSOR_IMX662H = "imx662h"
+CAPTURE_SENSORS = (CAPTURE_SENSOR_IMX662, CAPTURE_SENSOR_IMX662H)
+DEFAULT_HCG_SUBDEV = os.environ.get("IMX662_HCG_SUBDEV", "/dev/v4l-subdev2")
+
+
+def normalize_capture_sensor(tag: str | None) -> str:
+    s = (tag or CAPTURE_SENSOR_IMX662).strip().lower()
+    if s not in CAPTURE_SENSORS:
+        raise ValueError(f"capture_sensor must be one of {CAPTURE_SENSORS}, got {tag!r}")
+    return s
+
+
+def pair_folder_name(sensor_tag: str, gain: int) -> str:
+    return f"{normalize_capture_sensor(sensor_tag)}_ag{int(gain)}_test"
+
+
+def capture_sensor_hcg_enabled(sensor_tag: str) -> bool:
+    return normalize_capture_sensor(sensor_tag) == CAPTURE_SENSOR_IMX662H
+
 
 # Temporal GT averaging: read noise in the average scales ~ gain/√N, so high gains
 # need more frames for the same residual.  Override cap with NSA_GT_BURST_MAX.
@@ -163,6 +185,7 @@ def parse_scene_light(scene: str) -> tuple[str | None, int | None]:
 
         cabinet_D50_100  → ('D50', 100)       # D50 at 100 %
         cabinet_F11_25   → ('F11', 25)        # F11 at 25 %
+        cabinet_H_2      → ('Halogen10', 2)   # halogen channel + 2 %
         cabinet_H_10     → ('Halogen10', 10)  # halogen channel + 10 %
 
     The third field is the light-box **intensity percent** (0–100), not a
@@ -317,13 +340,20 @@ class CTTClient:
 
     def capture(self, name: str, *, image_type: str, frames: int,
                 colour_temp: int | None = None, lux: int | None = None,
-                label: str | None = None) -> list[dict]:
+                label: str | None = None,
+                progress: Callable[[int, int, str], None] | None = None) -> list[dict]:
         """Capture a burst (looping over the 16-frame server cap). Returns the
         list of ``added`` capture records (each has a ``filename``)."""
         added: list[dict] = []
         remaining = max(1, frames)
+        total = frames
+        captured = 0
         while remaining > 0:
             n = min(remaining, CTT_MAX_BURST)
+            if progress:
+                hi = min(captured + n, total)
+                progress(captured, total,
+                         f"Capturing frames {captured + 1}–{hi} of {total}")
             body: dict[str, Any] = {"image_type": image_type, "frames": n}
             if image_type != "dark":
                 body["colour_temp"] = int(colour_temp if colour_temp is not None else 5000)
@@ -337,6 +367,10 @@ class CTTClient:
             payload = r.json()
             new = payload.get("added", [])
             added.extend(new)
+            batch = len(new) if new else n
+            captured += batch
+            if progress:
+                progress(captured, total, f"Captured {captured}/{total} frames")
             # Remember any direct URL/path the server returns per file, so the
             # HTTP transfer can pull it straight to disk without guessing routes.
             for a in new:
@@ -546,6 +580,99 @@ def _probe_ssh(ssh: str) -> tuple[bool, str]:
     err = (res.stderr or res.stdout or "unknown ssh error").strip()
     hint = _ssh_hint(err)
     return False, hint or f"SSH to {ssh} failed: {err}"
+
+
+def _discover_hcg_subdev(ssh: str) -> str | None:
+    """Locate the V4L2 subdev that exposes ``hcg_enable`` on the Pi."""
+    probe = (
+        "for d in /dev/v4l-subdev*; do "
+        "v4l2-ctl -d \"$d\" --list-ctrls 2>/dev/null | grep -q hcg_enable && "
+        "{ echo \"$d\"; exit 0; }; done; exit 1"
+    )
+    res = subprocess.run(_ssh_cmd(ssh, probe), capture_output=True, text=True,
+                         timeout=20)
+    for ln in res.stdout.splitlines():
+        ln = ln.strip()
+        if ln.startswith("/dev/"):
+            return ln
+    return None
+
+
+def _parse_hcg_ctrl(stdout: str) -> bool | None:
+    for ln in stdout.splitlines():
+        if "hcg_enable" not in ln:
+            continue
+        val = ln.split(":", 1)[-1].strip().lower()
+        return val in ("1", "true", "on")
+    return None
+
+
+def read_pi_hcg(ssh: str, subdev: str | None = None) -> bool | None:
+    """Read ``hcg_enable`` on the Pi. Returns None when the control is missing."""
+    dev = subdev or DEFAULT_HCG_SUBDEV
+    cmd = f"v4l2-ctl -d {shlex.quote(dev)} --get-ctrl hcg_enable 2>/dev/null"
+    res = subprocess.run(_ssh_cmd(ssh, cmd), capture_output=True, text=True,
+                         timeout=15)
+    if res.returncode != 0:
+        if subdev is None:
+            discovered = _discover_hcg_subdev(ssh)
+            if discovered:
+                return read_pi_hcg(ssh, discovered)
+        return None
+    return _parse_hcg_ctrl(res.stdout)
+
+
+def set_pi_hcg(ssh: str, enable: bool, subdev: str | None = None,
+               status: Callable[[str], None] = lambda _m: None) -> str:
+    """Set conversion gain on the Pi before the camera starts. Returns subdev used."""
+    dev = subdev or DEFAULT_HCG_SUBDEV
+    val = 1 if enable else 0
+    cmd = f"v4l2-ctl -d {shlex.quote(dev)} --set-ctrl hcg_enable={val}"
+    res = subprocess.run(_ssh_cmd(ssh, cmd), capture_output=True, text=True,
+                         timeout=15)
+    if res.returncode != 0 and subdev is None:
+        discovered = _discover_hcg_subdev(ssh)
+        if discovered:
+            status(f"hcg_enable on {dev} failed — trying {discovered}")
+            return set_pi_hcg(ssh, enable, discovered, status=status)
+        err = (res.stderr or res.stdout or "v4l2-ctl failed").strip()
+        raise CTTError(f"Could not set hcg_enable={val} on {dev}: {err}")
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or "v4l2-ctl failed").strip()
+        raise CTTError(f"Could not set hcg_enable={val} on {dev}: {err}")
+    return dev
+
+
+def ensure_pi_hcg(ssh: str | None, want_hcg: bool, subdev: str | None = None,
+                  status: Callable[[str], None] = lambda _m: None) -> str | None:
+    """Configure and verify conversion gain on the Pi before ctt-server opens the camera."""
+    if not ssh:
+        if want_hcg:
+            raise CTTError(
+                "IMX662-H (high conversion gain) requires SSH to the Pi to run "
+                "v4l2-ctl hcg_enable=1 before the camera starts. Set the SSH target.")
+        return None
+    ok, ssh_err = _probe_ssh(ssh)
+    if not ok:
+        raise CTTError(ssh_err or f"SSH to {ssh} failed")
+    used = set_pi_hcg(ssh, want_hcg, subdev=subdev, status=status)
+    mode = "high conversion gain (HCG)" if want_hcg else "low conversion gain (LCG)"
+    status(f"Set {mode} via v4l2-ctl on {used}")
+    actual = read_pi_hcg(ssh, used)
+    if actual is None:
+        if want_hcg:
+            raise CTTError(
+                f"hcg_enable could not be read back from {used} — "
+                "cannot verify high conversion gain is active.")
+        status(f"Warning: could not read back hcg_enable from {used}")
+        return used
+    if actual != want_hcg:
+        want_txt = "enabled (1)" if want_hcg else "disabled (0)"
+        got_txt = "enabled (1)" if actual else "disabled (0)"
+        raise CTTError(
+            f"hcg_enable verify failed on {used}: wanted {want_txt}, read {got_txt}.")
+    status(f"Verified hcg_enable={'1' if want_hcg else '0'} on {used}")
+    return used
 
 
 def _discover_ctt_server(ssh: str) -> str | None:
@@ -979,23 +1106,30 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     #    the mode changes only what we derive from them afterwards.
     pi_raw = project_root / "PI_RAW"
     gain_sweep = parse_gain_sweep(getattr(args, "gain_sweep", None) or DEFAULT_GAIN_SWEEP)
-    for scene in args.scenes:
+    capture_sensor = normalize_capture_sensor(getattr(args, "capture_sensor", None))
+    hcg_enabled = capture_sensor_hcg_enabled(capture_sensor)
+    for scene in ensure_manager_scenes(args.scenes):
         if mode == "real":
             gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
             title = f"REAL PAIR SWEEP  ·  {scene}"
+            hcg_note = (
+                "• Pi is set to high conversion gain (HCG) before the camera starts.\n"
+                if hcg_enabled else "")
             setup = (
                 f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
                 "• Light it well (~100%, back off only if CLIPPING flags highlights).\n"
+                f"{hcg_note}"
                 f"• CAPTURE averages more frames at higher gain for cleaner GT "
                 f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
                 f"gains {gains_txt}), dropping exposure as gain rises.\n"
-                f"• → PI_RAW/Data/{scene}/imx662_ag<GAIN>_test/"
+                f"• → PI_RAW/Data/{scene}/{capture_sensor}_ag<GAIN>_test/"
             )
             meta = {
                 "scene": scene, "is_real_pair": True, "gain_sweep": list(gain_sweep),
                 "burst_root": str(project_root / "bursts" / scene),
                 "pair_root": str(pi_raw / "Data" / scene),
                 "exp_min": exp_min, "exp_max": exp_max,
+                "capture_sensor": capture_sensor, "hcg_enabled": hcg_enabled,
             }
         else:
             title = f"SCENE BURST  ·  {scene}"
@@ -1067,7 +1201,9 @@ def derive_real_pair(burst_dir: Path | str, test_dir: Path | str, *,
 def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
                        burst_frames: int,
                        status: Callable[..., None] = lambda *_a, **_k: None,
-                       stop: Callable[[], bool] = lambda: False) -> list[Recorded]:
+                       stop: Callable[[], bool] = lambda: False,
+                       progress: Callable[[int, int, str], None] | None = None,
+                       ) -> list[Recorded]:
     """Sweep the analogue gain for a real-pair scene after a single rig setup.
 
     Meters the scene ONCE (auto-exposure) to fix the target brightness = exposure
@@ -1083,6 +1219,8 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
     gains = list(meta["gain_sweep"])
     burst_root = Path(meta["burst_root"])
     pair_root = Path(meta["pair_root"])
+    sensor_tag = meta.get("capture_sensor", CAPTURE_SENSOR_IMX662)
+    hcg_enabled = meta.get("hcg_enabled", capture_sensor_hcg_enabled(sensor_tag))
     exp_min = int(meta.get("exp_min", 13))
     exp_max = int(meta.get("exp_max", 33_000))
 
@@ -1096,11 +1234,13 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
     status(f"Metered {scene}: brightness target ≈ {product/1000:.1f} ms·× — "
            f"sweeping {len(gains)} gain(s).", "ok")
 
+    frame_budgets = [burst_frames_for_gain(g, burst_frames) for g in gains]
+    total_frames = sum(frame_budgets)
+    done_frames = 0
     recs: list[Recorded] = []
-    for g in gains:
+    for g, n_frames in zip(gains, frame_budgets):
         if stop():
             break
-        n_frames = burst_frames_for_gain(g, burst_frames)
         exposure = int(min(max(round(product / g), exp_min), exp_max))
         client.set_controls({"auto_exposure": False, "gain": float(g),
                              "exposure": exposure})
@@ -1110,9 +1250,16 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
         if clamped:
             status(f"ag{g}: sensor clamped gain to {actual:g}× (tuning/mode limit); "
                    f"folder still tagged ag{g}, actual gain recorded.", "warn")
+
+        def _cap_prog(cur: int, _tot: int, _lbl: str) -> None:
+            if progress:
+                progress(done_frames + cur, total_frames,
+                         f"ag{g}× · {_lbl}")
+
         added = client.capture(project, image_type=station.image_type,
                                frames=n_frames, colour_temp=station.colour_temp,
-                               lux=station.lux)
+                               lux=station.lux,
+                               progress=_cap_prog if progress else None)
         fnames = [a["filename"] for a in added
                   if a.get("filename", "").lower().endswith(".dng")]
         gstation = Station(
@@ -1126,12 +1273,16 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
             colour_temp=station.colour_temp,
             lux=station.lux,
             meta={"scene": scene, "is_real_pair": True,
-                  "pair_dest": str(pair_root / f"imx662_ag{g}_test"),
+                  "pair_dest": str(pair_root / pair_folder_name(sensor_tag, g)),
+                  "capture_sensor": sensor_tag, "hcg_enabled": hcg_enabled,
                   "requested_gain": g, "actual_gain": actual,
                   "clamped": clamped, "exposure_us": exposure,
                   "burst_frames": n_frames},
         )
         recs.append(Recorded(station=gstation, ctt_filenames=fnames))
+        done_frames += n_frames
+        if progress:
+            progress(done_frames, total_frames, f"Finished ag{g}×")
         status(f"ag{g}: {len(fnames)}/{n_frames} DNG(s) at {actual:g}× "
                f"(exp {exposure/1000:.2f} ms, GT avg).", "ok")
     return recs
@@ -1149,6 +1300,8 @@ def write_gain_sidecar(pair_dir: Path | str, rec_meta: dict) -> None:
         "actual_gain": rec_meta.get("actual_gain"),
         "clamped": bool(rec_meta.get("clamped", False)),
         "exposure_us": rec_meta.get("exposure_us"),
+        "capture_sensor": rec_meta.get("capture_sensor"),
+        "hcg_enabled": rec_meta.get("hcg_enabled"),
     }, indent=2), encoding="utf-8")
 
 
@@ -1235,7 +1388,8 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                     extra += f" · lightbox {illum} at {pct:.0f}%"
                 pair_root = st.meta.get("pair_root")
                 if pair_root:
-                    extra += f" → pairs under {pair_root}/imx662_ag<gain>_test/"
+                    sensor = st.meta.get("capture_sensor", CAPTURE_SENSOR_IMX662)
+                    extra += f" → pairs under {pair_root}/{sensor}_ag<gain>_test/"
             log(f"[dry-run] would apply controls={st.controls} · {st.frames} frame(s) "
                 f"→ {st.dest}{extra}", "info")
             continue
@@ -1433,12 +1587,12 @@ def _rsync_ssh_arg_publish() -> str:
 
 # Only these PI_RAW leaf folders may be published into the shared training dataset.
 # Existing imx219_* / other sensor trees are never touched or deleted.
-_IMX662_PAIR_DIR = re.compile(r"^imx662_ag\d+_test$")
+_IMX662_PAIR_DIR = re.compile(r"^imx662h?_ag\d+_test$")
 
 
 def imx662_pair_dirs(pi_raw: Path | str,
                      hints: Sequence[Path | str] | None = None) -> list[Path]:
-    """Pair folders safe to publish (``Data/<scene>/imx662_ag<GAIN>_test`` only)."""
+    """Pair folders safe to publish (``Data/<scene>/imx662[h]_ag<GAIN>_test`` only)."""
     root = Path(pi_raw).expanduser().resolve()
     if hints:
         out: list[Path] = []
@@ -1818,10 +1972,17 @@ def main() -> int:
     p.add_argument("--ag-tag", default="ag24",
                    help="(legacy) single analogue-gain folder tag; ignored in real "
                         "mode, which now sweeps --gain-sweep")
+    p.add_argument("--capture-sensor", choices=CAPTURE_SENSORS,
+                   default=CAPTURE_SENSOR_IMX662,
+                   help="'imx662' = standard (LCG); 'imx662h' = high conversion gain "
+                        "(sets hcg_enable=1 on the Pi before the camera starts)")
+    p.add_argument("--hcg-subdev", default=DEFAULT_HCG_SUBDEV,
+                   help="V4L2 subdev for hcg_enable (default: /dev/v4l-subdev2; "
+                        "auto-discovered if unset control)")
     p.add_argument("--gain-sweep", type=parse_gain_sweep, default=list(DEFAULT_GAIN_SWEEP),
                    help="comma list of analogue gains to sweep per scene in real "
                         "mode (default: 1,2,4,8,16,32,64,128,256,512). Each lands in "
-                        "PI_RAW/Data/<scene>/imx662_ag<gain>_test.")
+                        "PI_RAW/Data/<scene>/<capture-sensor>_ag<gain>_test.")
     p.add_argument("--gain", type=int, default=256,
                    help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=list(MANAGER_SCENES))
@@ -1893,6 +2054,14 @@ def main() -> int:
 
     controls_range: dict = {}
     if not args.dry_run:
+        # HCG must be set before ctt-server opens the camera.
+        try:
+            ensure_pi_hcg(
+                args.pi_ssh, capture_sensor_hcg_enabled(args.capture_sensor),
+                subdev=args.hcg_subdev, status=lambda m: log(m, "info"))
+        except CTTError as exc:
+            log(str(exc), "err")
+            return 2
         # Make sure the server is up — SSH in and start it if needed.
         try:
             state = ensure_server(

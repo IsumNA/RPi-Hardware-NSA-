@@ -11,6 +11,7 @@ PI_RAW/Data/
     imx219_ag8_test/   …
     imx219_ag12_test/  …
   cabinet_F11_25/      (same pattern)
+  cabinet_H_2/
   cabinet_H_10/
   colour_stripes/
 ```

@@ -18,7 +18,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+from typing import Callable
 
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
@@ -1223,13 +1225,14 @@ class Imx662DataStudio(tk.Toplevel):
             self._refresh()
 
     def _compute_audit(self) -> dict:
-        from nsa.dataset_layout import IMX662_TARGET_AG_TAGS, audit_project
+        from nsa.dataset_layout import IMX662_TARGET_AG_TAGS, MANAGER_SCENES, audit_project
         root = Path(self.root_var.get().strip() or ".")
         try:
             gain = int(self.gain_var.get())
         except ValueError:
             gain = 256
-        return audit_project(root, gain=gain, imx662_ag_tags=IMX662_TARGET_AG_TAGS)
+        return audit_project(root, gain=gain, imx662_ag_tags=IMX662_TARGET_AG_TAGS,
+                             scenes=MANAGER_SCENES)
 
     @staticmethod
     def _audit_signature(audit: dict) -> str:
@@ -1976,17 +1979,17 @@ class CttCaptureWizard(tk.Toplevel):
     PANEL_W = 680  # ~1.77:1, matching the IMX662's 1936x1096 sensor aspect
     PANEL_H = 385
 
-    def __init__(self, master):
+    def __init__(self, master, capture_sensor="imx662"):
         super().__init__(master, bg=WHITE)
         self.app = master
-        self.title("NAS  ·  Camera capture")
-        self.configure(bg=WHITE)
-
         import types
         import nsa_ctt_capture as backend
-        from nsa.dataset_layout import MANAGER_SCENES
+        from nsa.dataset_layout import MANAGER_SCENES, ensure_manager_scenes
         self.backend = backend
         self._types = types
+        self.capture_sensor = self.backend.normalize_capture_sensor(capture_sensor)
+        self.title(f"NAS  ·  Camera capture ({self.capture_sensor})")
+        self.configure(bg=WHITE)
 
         self._client = None
         self._transfer = None
@@ -2024,6 +2027,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
         self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
+        self._sync_scenes_field()
         self.transfer_var = tk.StringVar(value="rsync")
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
@@ -2052,7 +2056,8 @@ class CttCaptureWizard(tk.Toplevel):
         pad = S(24)
         header = tk.Frame(self, bg=WHITE)
         header.pack(fill="x", padx=pad, pady=(S(16), S(4)))
-        tk.Label(header, text="Camera capture", bg=WHITE, fg=INK,
+        tk.Label(header, text=f"Camera capture  ·  {self.capture_sensor}",
+                 bg=WHITE, fg=INK,
                  font=font(17, "bold")).pack(anchor="w")
         self.step_lbl = tk.Label(
             header, text="Connect to the CTT server on the Pi",
@@ -2069,6 +2074,16 @@ class CttCaptureWizard(tk.Toplevel):
         tk.Frame(self, bg=LINE, height=1).pack(side="bottom", fill="x", padx=pad)
         log_fr = tk.Frame(self, bg=FIELD)
         log_fr.pack(side="bottom", fill="x", padx=pad, pady=(S(6), 0))
+        self.cap_prog_fr = tk.Frame(log_fr, bg=FIELD)
+        self.cap_prog = ttk.Progressbar(
+            self.cap_prog_fr, mode="determinate", length=S(420),
+            style="Rpi.Horizontal.TProgressbar")
+        self.cap_prog.pack(side="left", padx=(0, S(8)))
+        self.cap_prog_lbl = tk.Label(
+            self.cap_prog_fr, text="", bg=FIELD, fg=SUBTLE, font=font(9))
+        self.cap_prog_lbl.pack(side="left", fill="x", expand=True)
+        self._prog_total = 1
+        self._prog_start = 0.0
         self.status_lbl = tk.Label(log_fr, text="Ready.", bg=FIELD, fg=SUBTLE,
                                    font=font(9), wraplength=S(880), justify="left")
         self.status_lbl.pack(anchor="w", padx=S(10), pady=S(8))
@@ -2135,7 +2150,7 @@ class CttCaptureWizard(tk.Toplevel):
             side="left")
         tk.Label(grid, text=("real pairs = for EACH scene, sweep the Gains series (one "
                              "genuine noisy+gt pair per gain) into PI_RAW/Data/<scene>/"
-                             "imx662_ag<gain>_test — one rig setup, all gains captured "
+                             f"{self.capture_sensor}_ag<gain>_test — one rig setup, all gains captured "
                              "back-to-back. GT burst @ 1× is frames at minimum gain; "
                              "high gains capture more for cleaner GT averaging.  "
                              "calibration = bias/dark/flat noise model + synthesis."),
@@ -2227,7 +2242,7 @@ class CttCaptureWizard(tk.Toplevel):
                   font=font(10)).pack(side="left", fill="x", expand=True)
         tk.Label(
             parent,
-            text=("Copies only new imx662_ag<GAIN>_test pair folders into the "
+            text=("Copies only new imx662/imx662h_ag<GAIN>_test pair folders into the "
                   "training dataset. Existing imx219/other sensor data is never "
                   "deleted or overwritten outside those new folders. Default: "
                   f"{self.backend.default_publish_dest()}."),
@@ -2366,6 +2381,73 @@ class CttCaptureWizard(tk.Toplevel):
         except tk.TclError:
             pass
 
+    def _format_eta(self, seconds: float) -> str:
+        s = max(0, int(seconds))
+        if s < 5:
+            return "a few seconds"
+        if s < 90:
+            return f"{s}s"
+        m, sec = divmod(s, 60)
+        if m < 90:
+            return f"{m}m {sec}s"
+        h, m = divmod(m, 60)
+        return f"{h}h {m}m"
+
+    def _progress_begin(self, total: int):
+        self._prog_total = max(1, int(total))
+        self._prog_start = time.monotonic()
+
+        def show():
+            if not self._ui_alive():
+                return
+            try:
+                self.cap_prog["maximum"] = 100
+                self.cap_prog["value"] = 0
+                self.cap_prog_lbl.config(text="Starting…")
+                self.cap_prog_fr.pack(fill="x", padx=S(10), pady=(S(6), 0),
+                                      before=self.status_lbl)
+            except tk.TclError:
+                pass
+
+        self._ui_call(show)
+
+    def _progress_update(self, current: int, total: int | None = None, label: str = ""):
+        total = max(1, int(total if total is not None else self._prog_total))
+        current = min(max(0, int(current)), total)
+        self._prog_total = total
+
+        def update():
+            if not self._ui_alive():
+                return
+            try:
+                pct = 100.0 * current / total
+                self.cap_prog["value"] = pct
+                eta_txt = ""
+                if 0 < current < total:
+                    elapsed = time.monotonic() - self._prog_start
+                    eta = elapsed * (total - current) / current
+                    eta_txt = f" · ~{self._format_eta(eta)} left"
+                step_txt = f" ({current}/{total})" if total > 1 else ""
+                txt = (label or "Working…") + step_txt + eta_txt
+                self.cap_prog_lbl.config(text=txt)
+            except tk.TclError:
+                pass
+
+        self._ui_call(update)
+
+    def _progress_end(self):
+        def hide():
+            if not self._ui_alive():
+                return
+            try:
+                self.cap_prog_fr.pack_forget()
+                self.cap_prog["value"] = 0
+                self.cap_prog_lbl.config(text="")
+            except tk.TclError:
+                pass
+
+        self._ui_call(hide)
+
     def _set_busy(self, on: bool):
         if not self._ui_alive():
             return
@@ -2382,8 +2464,17 @@ class CttCaptureWizard(tk.Toplevel):
         if p:
             self.root_var.set(p)
 
+    def _sync_scenes_field(self):
+        """Ensure the Scenes field lists every canonical manager scene."""
+        from nsa.dataset_layout import ensure_manager_scenes
+        merged = ensure_manager_scenes(
+            [s.strip() for s in self.scenes_var.get().split(",") if s.strip()])
+        self.scenes_var.set(", ".join(merged))
+
     def _args_namespace(self):
-        scenes = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
+        from nsa.dataset_layout import ensure_manager_scenes
+        scenes = list(ensure_manager_scenes(
+            [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]))
         return self._types.SimpleNamespace(
             gain=int(self.gain_var.get() or "256"),
             # 0 → calibrate bias/dark/flat at the target gain (the real operating
@@ -2397,12 +2488,14 @@ class CttCaptureWizard(tk.Toplevel):
             mode="real" if self.mode_var.get().startswith("real") else "calib",
             ag_tag=(self.agtag_var.get().strip() or "ag24"),
             gain_sweep=self.backend.parse_gain_sweep(self.gains_var.get()),
+            capture_sensor=self.capture_sensor,
         )
 
     # -- connect -------------------------------------------------------------
     def _connect(self):
         if self._busy:
             return
+        self._sync_scenes_field()
         host = self.host_var.get().strip()
         try:
             port = int(self.port_var.get())
@@ -2427,6 +2520,8 @@ class CttCaptureWizard(tk.Toplevel):
                     project_root, gain=args.gain,
                     scenes=tuple(args.scenes),
                     flat_levels=max(2, args.flat_levels))
+                want_hcg = self.backend.capture_sensor_hcg_enabled(self.capture_sensor)
+                self.backend.ensure_pi_hcg(ssh, want_hcg, status=status)
                 client = self.backend.CTTClient(host, port)
                 # SSH in and start ctt-server if it isn't answering yet.
                 self.backend.ensure_server(
@@ -2496,6 +2591,8 @@ class CttCaptureWizard(tk.Toplevel):
             self.light_illum_combo.config(values=self._lightbox_illums)
 
         status = f"Connected — camera ready. {len(plan)} stations planned."
+        if self.backend.capture_sensor_hcg_enabled(self.capture_sensor):
+            status += "  HCG verified on Pi."
         if self._lightbox_present:
             status += f"  Lightbox: {lb.get('model', 'detected')}."
         self._warn_publish_dest()
@@ -2595,8 +2692,9 @@ class CttCaptureWizard(tk.Toplevel):
         self.station_title.config(text=st.title)
         self.setup_lbl.config(text=st.setup)
         if st.meta.get("gain_sweep"):
+            sensor = st.meta.get("capture_sensor", self.capture_sensor)
             self.progress_lbl.config(
-                text=f"→ {st.meta['pair_root']}/imx662_ag<gain>_test")
+                text=f"→ {st.meta['pair_root']}/{sensor}_ag<gain>_test")
         else:
             self.progress_lbl.config(text=f"→ files land in  {st.dest}")
         self.back_btn.set_enabled(self._idx > 0)
@@ -2765,17 +2863,29 @@ class CttCaptureWizard(tk.Toplevel):
 
         def work():
             try:
+                total = st.frames + (2 if incremental else 0)
+                self._progress_begin(total)
+
+                def cap_prog(cur, tot, lbl):
+                    self._progress_update(cur, tot, lbl)
+
                 added = self._client.capture(
                     project, image_type=st.image_type, frames=st.frames,
-                    colour_temp=st.colour_temp, lux=capture_lux)
+                    colour_temp=st.colour_temp, lux=capture_lux, progress=cap_prog)
                 fnames = [a["filename"] for a in added
                           if a.get("filename", "").lower().endswith(".dng")]
                 rec = self.backend.Recorded(station=st, ctt_filenames=fnames)
                 self._recorded.append(rec)
                 placed = 0
                 if incremental:
+                    self._progress_update(st.frames, total, "Pulling DNGs from Pi…")
                     mirror = self._transfer.fetch(fnames)
+                    self._progress_update(st.frames + 1, total, "Saving DNGs locally…")
                     placed = self.backend._place_files(mirror, rec)
+                    self._progress_update(total, total, "Saved")
+                else:
+                    self._progress_update(st.frames, st.frames, "Captured on Pi")
+                self._progress_end()
                 self._ui_call(self._captured, len(fnames), placed, incremental)
             except Exception as exc:  # noqa: BLE001
                 self._ui_call(self._capture_fail, str(exc))
@@ -2798,12 +2908,27 @@ class CttCaptureWizard(tk.Toplevel):
 
         def work():
             try:
+                gains = list(st.meta.get("gain_sweep", []))
+                frame_total = sum(
+                    self.backend.burst_frames_for_gain(g, st.frames) for g in gains)
+                save_steps = 2 + len(gains)  # pull, file, derive per gain
+                total = frame_total + save_steps
+                self._progress_begin(total)
+
+                def cap_prog(cur, _tot, lbl):
+                    self._progress_update(cur, total, lbl)
+
                 recs = self.backend.capture_gain_sweep(
                     self._client, project, st, burst_frames=st.frames,
-                    status=status, stop=self._stop.is_set)
+                    status=status, stop=self._stop.is_set, progress=cap_prog)
                 self._recorded.extend(recs)
                 status(f"{scene}: saving {len(recs)} pair(s)…")
-                result = self._save_recs(recs, incremental, min_frames, status)
+
+                def save_prog(step, lbl):
+                    self._progress_update(frame_total + step, total, lbl)
+
+                result = self._save_recs(
+                    recs, incremental, min_frames, status, progress=save_prog)
                 if publish_dest and result["derived"]:
                     status(f"{scene}: publishing new pair folders…")
                     pair_dirs = [r.station.meta["pair_dest"] for r in recs
@@ -2814,6 +2939,8 @@ class CttCaptureWizard(tk.Toplevel):
                             publish_dest, ssh_password=pw, only_under=pair_dirs)
                     else:
                         status(f"{scene}: publish skipped (no password).", "warn")
+                self._progress_update(total, total, "Done")
+                self._progress_end()
                 self._ui_call(self._swept, scene, recs, result)
             except Exception as exc:  # noqa: BLE001
                 self._ui_call(self._capture_fail, str(exc))
@@ -2822,7 +2949,8 @@ class CttCaptureWizard(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     def _save_recs(self, recs: list, incremental: bool, min_frames: int,
-                   status=lambda *_a, **_k: None) -> dict:
+                   status=lambda *_a, **_k: None,
+                   progress: Callable[[int, str], None] | None = None) -> dict:
         """Pull a cabinet's DNGs local, file them, and derive real noisy/gt pairs.
 
         Runs on a worker thread. rsync fetches only the new frames; the archive
@@ -2831,7 +2959,10 @@ class CttCaptureWizard(tk.Toplevel):
         progress via ``status`` so a big transfer/derive doesn't look frozen.
         """
         fnames = [f for rec in recs for f in rec.ctt_filenames]
-        status(f"Pulling {len(fnames)} DNG(s) from the Pi…")
+        if progress:
+            progress(0, f"Pulling {len(fnames)} DNG(s) from the Pi…")
+        else:
+            status(f"Pulling {len(fnames)} DNG(s) from the Pi…")
         if incremental:
             mirror = self._transfer.fetch(fnames)
         else:
@@ -2839,7 +2970,10 @@ class CttCaptureWizard(tk.Toplevel):
         placed = 0
         for rec in recs:
             placed += self.backend._place_files(mirror, rec)
-        status(f"Filed {placed} DNG(s).")
+        if progress:
+            progress(1, f"Filed {placed} DNG(s)")
+        else:
+            status(f"Filed {placed} DNG(s).")
 
         derived, failed = [], []
         rawpy_ok, rawpy_reason = self.backend._rawpy_status()
@@ -2852,7 +2986,11 @@ class CttCaptureWizard(tk.Toplevel):
                 pd = meta["pair_dest"]
                 tag = (f"ag{meta['requested_gain']}"
                        if meta.get("requested_gain") is not None else "pair")
-                status(f"Averaging burst → {tag} ({i}/{len(todo)})…")
+                msg = f"Averaging burst → {tag} ({i}/{len(todo)})…"
+                if progress:
+                    progress(1 + i, msg)
+                else:
+                    status(msg)
                 try:
                     res = self.backend.derive_real_pair(
                         rec.station.dest, pd, min_frames=min_frames)
@@ -3004,6 +3142,7 @@ class CttCaptureWizard(tk.Toplevel):
     def _swept(self, scene: str, recs: list, result: dict):
         if not self._ui_alive():
             return
+        self._progress_end()
         self._set_busy(False)
         n = len(recs)
         parts = [f"{scene}: filed {result['placed']} DNG(s)"]
@@ -3041,6 +3180,7 @@ class CttCaptureWizard(tk.Toplevel):
     def _capture_fail(self, err: str):
         if not self._ui_alive():
             return
+        self._progress_end()
         self._set_busy(False)
         self._set_status(f"Capture failed: {err}", "err")
         messagebox.showerror("Capture failed", err)
@@ -3048,6 +3188,7 @@ class CttCaptureWizard(tk.Toplevel):
     def _captured(self, n: int, placed: int, incremental: bool):
         if not self._ui_alive():
             return
+        self._progress_end()
         self._set_busy(False)
         if incremental:
             self._set_status(f"Captured {n} DNG(s), filed {placed} → advancing.", "ok")
@@ -3069,28 +3210,39 @@ class CttCaptureWizard(tk.Toplevel):
 
         def work():
             try:
-                # Only pull/finalise the stations that aren't already fully on disk
-                # (per-cabinet saving files most of them during capture) — this
-                # avoids a redundant whole-project archive re-download at the end.
                 def complete(rec):
                     n = len(rec.ctt_filenames)
                     have = len(list(rec.station.dest.glob("*.dng"))) \
                         if rec.station.dest.is_dir() else 0
                     return n > 0 and have >= n
                 need = [rec for rec in self._recorded if not complete(rec)]
-                total = 0
+                total = max(len(need), 1)
+                self._progress_begin(total)
+                total_placed = 0
                 if need:
+                    self._progress_update(0, total, "Pulling remaining DNGs…")
                     mirror = self._transfer.finalize()
-                    for rec in need:
-                        total += self.backend._place_files(mirror, rec)
-                self.after(0, lambda: self._finished(total))
+                    for i, rec in enumerate(need, 1):
+                        self._progress_update(
+                            i - 1, total,
+                            f"Saving {rec.station.title or rec.station.station_id}…")
+                        total_placed += self.backend._place_files(mirror, rec)
+                    self._progress_update(total, total, "Saved")
+                self._progress_end()
+                self.after(0, lambda: self._finished(total_placed))
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda e=exc: self._set_status(f"Finalise failed: {e}", "err"))
+                self.after(0, lambda: self._finish_fail(str(exc)))
 
         self._set_busy(True)
         threading.Thread(target=work, daemon=True).start()
 
+    def _finish_fail(self, err: str):
+        self._progress_end()
+        self._set_busy(False)
+        self._set_status(f"Finalise failed: {err}", "err")
+
     def _finished(self, placed: int):
+        self._progress_end()
         self._set_busy(False)
         self.back_btn.set_enabled(False)
         rawpy_ok, rawpy_reason = self.backend._rawpy_status()
@@ -3111,6 +3263,7 @@ class CttCaptureWizard(tk.Toplevel):
             def work():
                 out = []
                 min_frames = max(2, int(self.burst_var.get() or "48") // 4)
+                todo = []
                 for rec in self._recorded:
                     meta = rec.station.meta
                     if not meta.get("is_real_pair"):
@@ -3121,6 +3274,17 @@ class CttCaptureWizard(tk.Toplevel):
                     if pd in self._derived_pairs:
                         out.append(f"{meta['scene']}{tag}: in project PI_RAW (local)")
                         continue
+                    todo.append(rec)
+                total = max(len(todo), 1)
+                self._progress_begin(total)
+                for i, rec in enumerate(todo, 1):
+                    meta = rec.station.meta
+                    pd = meta.get("pair_dest")
+                    tag = (f" ag{meta['requested_gain']}→{meta.get('actual_gain', '?')}×"
+                           if meta.get("requested_gain") is not None else "")
+                    self._progress_update(
+                        i - 1, total,
+                        f"Building pair {meta['scene']}{tag}…")
                     try:
                         res = self.backend.derive_real_pair(
                             rec.station.dest, pd, min_frames=min_frames)
@@ -3130,6 +3294,8 @@ class CttCaptureWizard(tk.Toplevel):
                                    f"(gt from {res['frames_used']} frames)")
                     except Exception as exc:  # noqa: BLE001
                         out.append(f"{meta['scene']}{tag}: FAILED — {exc}")
+                self._progress_update(total, total, "Pairs built")
+                self._progress_end()
                 self.after(0, lambda: self._pairs_done(out))
 
             self._set_busy(True)
@@ -3197,7 +3363,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.applied_lbl.config(text=(
             "Real noisy/gt pairs written locally under\n"
             f"{pi_raw}\n"
-            "(imx662_ag<gain>_test/noisy.png + gt.png per scene)\n\n"
+            f"({self.capture_sensor}_ag<gain>_test/noisy.png + gt.png per scene)\n\n"
             + "\n".join(lines) + pub_note))
         if self.publish_var.get() and not self._publish_any_failed:
             self._set_status(
@@ -3264,7 +3430,7 @@ class CttCaptureWizard(tk.Toplevel):
         else:
             self.applied_lbl.config(text=(
                 prior + f"\n\nConfirmed on AI server:\n"
-                f"{dest}/Data/<scene>/imx662_ag<gain>_test/\n"
+                f"{dest}/Data/<scene>/{self.capture_sensor}_ag<gain>_test/\n"
                 f"{verified} file(s) present (copied {summary.get('copied', 0)}, "
                 f"already-there {summary.get('skipped', 0)})."))
             self._set_status(
@@ -3931,9 +4097,47 @@ class App(tk.Tk):
         RoundButton(btn_row, "NOISE DATASET WIZARD", self._open_noise_wizard,
                     kind="secondary", width=220, height=40).pack(side="left", padx=(S(8), 0))
 
+    def _pick_capture_sensor(self) -> str | None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Choose sensor mode")
+        dlg.configure(bg=WHITE)
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        result: dict[str, str | None] = {"v": None}
+
+        def choose(v: str | None):
+            result["v"] = v
+            dlg.destroy()
+
+        pad = S(20)
+        tk.Label(dlg, text="Which IMX662 capture mode?", bg=WHITE, fg=INK,
+                 font=font(12, "bold")).pack(anchor="w", padx=pad, pady=(pad, S(6)))
+        tk.Label(
+            dlg,
+            text=("imx662 = standard (low conversion gain).\n"
+                  "imx662h = high conversion gain — the Pi runs "
+                  "v4l2-ctl hcg_enable=1 before the camera starts."),
+            bg=WHITE, fg=SUBTLE, font=font(9), justify="left",
+        ).pack(anchor="w", padx=pad, pady=(0, S(12)))
+        btn_row = tk.Frame(dlg, bg=WHITE)
+        btn_row.pack(fill="x", padx=pad, pady=(0, pad))
+        RoundButton(btn_row, "IMX662 (standard)", lambda: choose("imx662"),
+                    kind="secondary", width=170, height=40).pack(side="left")
+        RoundButton(btn_row, "IMX662-H (high conversion)", lambda: choose("imx662h"),
+                    kind="primary", width=220, height=40).pack(
+                        side="left", padx=(S(8), 0))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        place_window(dlg, 520, 180, master=self)
+        dlg.grab_set()
+        self.wait_window(dlg)
+        return result["v"]
+
     def _open_capture_wizard(self):
+        sensor = self._pick_capture_sensor()
+        if sensor is None:
+            return
         try:
-            CttCaptureWizard(self)
+            CttCaptureWizard(self, capture_sensor=sensor)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Camera capture", str(exc))
 

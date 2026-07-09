@@ -7,6 +7,7 @@ Your manager's captures already live here::
         imx219_ag2_test/   noisy.dng  noisy.png  gt.dng  gt.png
         imx662_ag12_test/  …
       cabinet_F11_25/ …
+      cabinet_H_2/ …
       cabinet_H_10/ …
       colour_stripes/ …
 
@@ -26,7 +27,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from nsa.noise_calib.io import discover_phase1_root, list_frames
 from nsa.raw_io import IMAGE_EXTS, SUPPORTED_EXTS, _pair_in_folder, find_paired_folders
@@ -37,9 +38,29 @@ DEFAULT_FLAT_LEVELS = 12
 MANAGER_SCENES: tuple[str, ...] = (
     "cabinet_D50_100",
     "cabinet_F11_25",
+    "cabinet_H_2",
     "cabinet_H_10",
     "colour_stripes",
 )
+
+
+def ensure_manager_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
+    """Keep the user's scene order, then append any ``MANAGER_SCENES`` they omitted."""
+    if scenes is None:
+        return MANAGER_SCENES
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in scenes:
+        s = str(raw).strip()
+        if s and s not in seen:
+            out.append(s)
+            seen.add(s)
+    for s in MANAGER_SCENES:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    return tuple(out)
+
 
 # denoise-hw analogue-gain tags already shot for IMX219 / legacy work.
 LEGACY_AG_TAGS: tuple[str, ...] = ("ag1", "ag2", "ag4", "ag8", "ag12")
@@ -49,7 +70,7 @@ LEGACY_AG_TAGS: tuple[str, ...] = ("ag1", "ag2", "ag4", "ag8", "ag12")
 IMX662_TARGET_AG_TAGS: tuple[str, ...] = ("ag12", "ag24", "ag48")
 
 _TEST_FOLDER_RE = re.compile(
-    r"^(?P<sensor>imx219|imx662|imxng)_(?P<ag>ag\d+)_test$", re.IGNORECASE,
+    r"^(?P<sensor>imx219|imx662h?|imxng)_(?P<ag>ag\d+)_test$", re.IGNORECASE,
 )
 
 STATUS_COMPLETE = "complete"
@@ -411,7 +432,10 @@ def _slot_status(spec: SlotSpec, project_root: Path, pi_raw_root: Path) -> dict[
     }
 
 
-def _existing_pi_raw_slots(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+def _existing_pi_raw_slots(
+    inventory: dict[str, Any],
+    manager_scenes: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     """Turn scan results into tree slots for the GUI."""
     slots: list[dict[str, Any]] = []
     for scene in inventory.get("scenes", []):
@@ -436,6 +460,30 @@ def _existing_pi_raw_slots(inventory: dict[str, Any]) -> list[dict[str, Any]]:
             "meta": {"scene": scene["name"]},
             "children": scene.get("tests", []),
         })
+    if manager_scenes:
+        on_disk = {s["title"] for s in slots}
+        for scene in manager_scenes:
+            if scene in on_disk:
+                continue
+            slots.append({
+                "slot_id": f"scene_{scene}",
+                "rel_path": f"Data/{scene}",
+                "title": scene,
+                "section": "on_disk",
+                "status": STATUS_MISSING,
+                "found": 0,
+                "required": 1,
+                "files": [],
+                "purpose": f"Scene folder not on disk yet — capture or scaffold {scene}/.",
+                "how_to_capture": (
+                    "Use Camera Capture (real-pairs mode) or scaffold the project "
+                    f"to create PI_RAW/Data/{scene}/ and shoot this scene."
+                ),
+                "optional": False,
+                "meta": {"scene": scene},
+                "children": [],
+            })
+        slots.sort(key=lambda s: s["title"])
     return slots
 
 
@@ -449,7 +497,7 @@ def audit_project(
 ) -> dict[str, Any]:
     """Full audit: what's ON DISK (manager PI_RAW) + what the noise pipeline NEEDS."""
     project_root, pi_raw_root = resolve_layout(root)
-    scene_tuple = scenes or MANAGER_SCENES
+    scene_tuple = ensure_manager_scenes(scenes)
     ag_tuple = imx662_ag_tags or IMX662_TARGET_AG_TAGS
 
     inventory = scan_pi_raw(pi_raw_root) if pi_raw_root.is_dir() else {
@@ -458,7 +506,7 @@ def audit_project(
         "pi_raw_root": str(pi_raw_root),
     }
 
-    on_disk = _existing_pi_raw_slots(inventory)
+    on_disk = _existing_pi_raw_slots(inventory, scene_tuple)
     cal_specs = _calibration_specs(gain, flat_levels)
     target_specs = _imx662_target_specs(scene_tuple, ag_tuple, pi_raw_root)
 
@@ -546,13 +594,14 @@ def scaffold_imx662_project(
 ) -> Path:
     """Create calibration/ + clean_scenes/ beside an existing or new PI_RAW tree."""
     project_root, pi_raw_root = resolve_layout(root)
+    scene_tuple = ensure_manager_scenes(scenes)
     project_root.mkdir(parents=True, exist_ok=True)
     (pi_raw_root / "Data").mkdir(parents=True, exist_ok=True)
 
     readme = project_root / "README.md"
     if overwrite_readme or not readme.exists():
         readme.write_text(_PROJECT_README.format(
-            scenes=", ".join(scenes),
+            scenes=", ".join(scene_tuple),
             ag_tags=", ".join(imx662_ag_tags),
             legacy_ag=", ".join(LEGACY_AG_TAGS),
         ), encoding="utf-8")
@@ -571,12 +620,13 @@ def scaffold_imx662_project(
                 encoding="utf-8",
             )
 
-    for scene in scenes:
+    for scene in scene_tuple:
+        (pi_raw_root / "Data" / scene).mkdir(parents=True, exist_ok=True)
         (project_root / "clean_scenes" / scene).mkdir(parents=True, exist_ok=True)
         (project_root / "bursts" / scene / "take01").mkdir(parents=True, exist_ok=True)
 
     manifest = audit_project(project_root, gain=gain, imx662_ag_tags=imx662_ag_tags,
-                             scenes=scenes)
+                             scenes=scene_tuple)
     (project_root / "dataset_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
     )
@@ -592,6 +642,7 @@ Your team's real captures live in **PI_RAW/Data/** — do not delete or move the
     PI_RAW/Data/
       cabinet_D50_100/   imx219_ag1_test … imx219_ag12_test  (noisy.* + gt.*)
       cabinet_F11_25/
+      cabinet_H_2/
       cabinet_H_10/
       colour_stripes/
 
