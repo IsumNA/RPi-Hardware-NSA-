@@ -113,6 +113,15 @@ def capture_sensor_hcg_enabled(sensor_tag: str) -> bool:
     return normalize_capture_sensor(sensor_tag) == CAPTURE_SENSOR_IMX662H
 
 
+def ctt_capture_lux(lux: float | int | None, *, fallback: int = 1) -> int:
+    """Lux metadata for CTT macbeth captures — must be a positive integer."""
+    try:
+        v = int(round(float(lux))) if lux is not None else 0
+    except (TypeError, ValueError):
+        v = 0
+    return max(1, v if v > 0 else int(fallback))
+
+
 # Temporal GT averaging: read noise in the average scales ~ gain/√N, so high gains
 # need more frames for the same residual.  Override cap with NSA_GT_BURST_MAX.
 GT_BURST_MAX_FRAMES = int(os.environ.get("NSA_GT_BURST_MAX", "128"))
@@ -282,7 +291,7 @@ def assign_panel_scene(station: Station, lux: float, project_root: Path | str) -
     station.dest = project_root / "bursts" / scene / "take01"
     station.station_id = f"burst_{scene}"
     station.title = f"REAL PAIR SWEEP  ·  {scene}"
-    station.lux = max(1, int(round(measured)))
+    station.lux = ctt_capture_lux(measured, fallback=1)
     (station.dest).mkdir(parents=True, exist_ok=True)
     (pi_raw / "Data" / scene).mkdir(parents=True, exist_ok=True)
     return scene
@@ -433,12 +442,17 @@ class CTTClient:
             if image_type != "dark":
                 body["colour_temp"] = int(colour_temp if colour_temp is not None else 5000)
             if lux is not None:
-                body["lux"] = int(lux)
+                body["lux"] = ctt_capture_lux(lux, fallback=1)
             if label:
                 body["label"] = label
             r = self._post(f"/projects/{name}/capture", json=body, timeout=max(self.timeout, 180))
             if r.status_code != 200:
-                raise CTTError(f"capture failed ({r.status_code}): {r.text[:200]}")
+                detail = r.text[:400].strip()
+                if detail.lstrip().startswith("<!") or "<html" in detail.lower():
+                    detail = ("CTT server internal error (HTTP 500). "
+                              "On the Pi: restart ctt-server and check its log — "
+                              "often a hung camera/light-box handle after a power cycle.")
+                raise CTTError(f"capture failed ({r.status_code}): {detail}")
             payload = r.json()
             new = payload.get("added", [])
             added.extend(new)
@@ -1304,6 +1318,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             station_lux = 3
         else:
             station_lux = 500
+        station_lux = ctt_capture_lux(station_lux, fallback=3 if hcg_enabled else 500)
         stations.append(Station(
             station_id=(f"burst_{scene_key}" if not panel_auto
                         else f"burst_panel_{stage_meta['panel_slot']}"),
@@ -1382,7 +1397,11 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
     a sidecar can record the ground truth.
     """
     meta = station.meta
-    scene = meta["scene"]
+    scene = (meta.get("scene") or "").strip()
+    if not scene:
+        raise CTTError(
+            "panel stage has no scene name yet — measure lux and assign "
+            "cabinet_panel_<lux> before CAPTURE.")
     gains = list(meta["gain_sweep"])
     burst_root = Path(meta["burst_root"])
     pair_root = Path(meta["pair_root"])
@@ -1423,10 +1442,15 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
                 progress(done_frames + cur, total_frames,
                          f"ag{g}× · {_lbl}")
 
-        added = client.capture(project, image_type=station.image_type,
-                               frames=n_frames, colour_temp=station.colour_temp,
-                               lux=station.lux,
-                               progress=_cap_prog if progress else None)
+        capture_lux = ctt_capture_lux(station.lux, fallback=1)
+        try:
+            added = client.capture(project, image_type=station.image_type,
+                                   frames=n_frames, colour_temp=station.colour_temp,
+                                   lux=capture_lux,
+                                   progress=_cap_prog if progress else None)
+        except CTTError as exc:
+            status(f"ag{g}: capture failed — {exc}", "err")
+            raise
         fnames = [a["filename"] for a in added
                   if a.get("filename", "").lower().endswith(".dng")]
         gstation = Station(
@@ -1691,7 +1715,7 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                 try:
                     meas = client._settled_lux()
                     if meas > 0:
-                        capture_lux = int(round(meas))
+                        capture_lux = ctt_capture_lux(meas, fallback=1)
                         project_root = Path(st.meta["burst_root"]).parent.parent
                         assign_panel_scene(st, meas, project_root)
                         log(f"Panel stage → {st.meta['scene']} "
@@ -1715,7 +1739,7 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                         log(f"Lightbox set to {illum} at {pct:.0f}% "
                             f"(measured {meas:.0f} lux)", "ok")
                         if meas > 0:
-                            capture_lux = int(round(meas))  # metadata only
+                            capture_lux = ctt_capture_lux(meas, fallback=1)  # metadata only
                     except Exception as exc:  # noqa: BLE001
                         log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
             else:
@@ -2396,8 +2420,9 @@ def main() -> int:
     if not args.dry_run:
         # HCG must be set before ctt-server opens the camera.
         try:
+            want_hcg = capture_sensor_hcg_enabled(args.capture_sensor)
             ensure_pi_hcg(
-                args.pi_ssh, capture_sensor_hcg_enabled(args.capture_sensor),
+                args.pi_ssh, want_hcg,
                 subdev=args.hcg_subdev, status=lambda m: log(m, "info"))
         except CTTError as exc:
             log(str(exc), "err")
@@ -2410,6 +2435,11 @@ def main() -> int:
                 wait_s=args.autostart_wait, status=lambda m: log(m, "info"))
             if state == "started":
                 log("Auto-started ctt-server on the Pi.", "ok")
+            if want_hcg and args.pi_ssh:
+                log("Re-checking HCG after camera start…", "info")
+                ensure_pi_hcg(
+                    args.pi_ssh, True, subdev=args.hcg_subdev,
+                    status=lambda m: log(m, "info"))
         except CTTError as exc:
             log(str(exc), "err")
             return 2

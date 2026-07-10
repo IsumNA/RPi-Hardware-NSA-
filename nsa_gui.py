@@ -2543,12 +2543,17 @@ class CttCaptureWizard(tk.Toplevel):
                     scenes=tuple(args.scenes),
                     flat_levels=max(2, args.flat_levels))
                 want_hcg = self.backend.capture_sensor_hcg_enabled(self.capture_sensor)
+                # Set HCG before the camera opens, then again after ctt-server starts
+                # (some drivers reset hcg_enable when the sensor is opened).
                 hcg_status = self.backend.ensure_pi_hcg(ssh, want_hcg, status=status)
                 client = self.backend.CTTClient(host, port)
                 # SSH in and start ctt-server if it isn't answering yet.
                 self.backend.ensure_server(
                     client, ssh=ssh, ctt_cmd=ctt_cmd, port=port,
                     workspace=workspace, autostart=autostart, status=status)
+                if want_hcg and ssh:
+                    status("Re-checking HCG after camera start…")
+                    hcg_status = self.backend.ensure_pi_hcg(ssh, True, status=status)
                 h = client.health()
                 if not h.get("camera"):
                     raise self.backend.CTTError(
@@ -2862,7 +2867,7 @@ class CttCaptureWizard(tk.Toplevel):
             self.light_illum_var.set(illum)
             self.light_pct_var.set(f"{pct:.0f}")
             if meas > 0:
-                self._capture_lux = int(round(meas))  # measured lux, metadata only
+                self._capture_lux = self.backend.ctt_capture_lux(meas, fallback=1)
             self.light_lbl.config(
                 text=f"{illum} at {pct:.0f}% → {meas:.0f} lux.  Adjust % + SET if needed.",
                 fg=SUBTLE)
@@ -2898,7 +2903,7 @@ class CttCaptureWizard(tk.Toplevel):
                 self._client.set_lightbox(illum, pct)
                 meas = self._client._settled_lux()
                 if meas > 0:
-                    self._capture_lux = int(round(meas))  # metadata only
+                    self._capture_lux = self.backend.ctt_capture_lux(meas, fallback=1)
                 self.after(0, lambda: self._set_status(
                     f"Lightbox set to {illum} at {pct:.0f}% (measured {meas:.0f} lux). "
                     "Press RE-APPLY to re-lock exposure to this light.", "ok"))
@@ -2946,8 +2951,8 @@ class CttCaptureWizard(tk.Toplevel):
         if st.meta.get("gain_sweep"):
             if st.meta.get("panel_auto_name") and not self._prepare_panel_stage(st):
                 return
-            if self._capture_lux:
-                st.lux = self._capture_lux
+            st.lux = self.backend.ctt_capture_lux(
+                self._capture_lux if self._capture_lux else st.lux, fallback=1)
             self._set_busy(True)
             self._set_status("Metering, then sweeping the gain series…")
             self._capture_sweep(st, project, incremental)
