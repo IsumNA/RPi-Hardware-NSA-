@@ -65,6 +65,8 @@ from nsa.dataset_layout import (
     HCG_PANEL_GAIN_SWEEP,
     HCG_PANEL_SLOTS_PER_VARIANT,
     HCG_PANEL_VARIANTS,
+    calibration_dir,
+    noise_model_path,
     ensure_manager_scenes,
     ensure_hcg_illuminant_scenes,
     resolve_layout,
@@ -1176,7 +1178,8 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     mode = getattr(args, "mode", "real")
     ag_tag = getattr(args, "ag_tag", "ag24")
     gain = args.gain
-    cal = project_root / f"calibration/imx662_gain{gain}"
+    capture_sensor = normalize_capture_sensor(getattr(args, "capture_sensor", None))
+    cal = calibration_dir(project_root, capture_sensor, gain)
     # The advertised exposure_max is the sensor's absolute ceiling (hundreds of
     # seconds); the *usable* ceiling is frame-duration limited (~33 ms at 30 fps).
     # So flats ramp over explicit millisecond bounds, only clamped to the sensor.
@@ -1266,7 +1269,6 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     #    the mode changes only what we derive from them afterwards.
     pi_raw = project_root / "PI_RAW"
     gain_sweep = parse_gain_sweep(getattr(args, "gain_sweep", None) or DEFAULT_GAIN_SWEEP)
-    capture_sensor = normalize_capture_sensor(getattr(args, "capture_sensor", None))
     hcg_enabled = capture_sensor_hcg_enabled(capture_sensor)
     if hcg_enabled:
         stage_specs: list[tuple[str | None, dict]] = [
@@ -2302,8 +2304,9 @@ def _run(cmd: list[str]) -> int:
 def post_process(project_root: Path, args: argparse.Namespace,
                  scenes: list[str]) -> None:
     py = sys.executable
-    cal_dir = project_root / f"calibration/imx662_gain{args.gain}"
-    noise_json = project_root / f"models/noise/imx662_gain{args.gain}.json"
+    sensor = normalize_capture_sensor(getattr(args, "capture_sensor", None))
+    cal_dir = calibration_dir(project_root, sensor, args.gain)
+    noise_json = noise_model_path(project_root, sensor, args.gain)
     clean_root = project_root / "clean_scenes"
     pi_raw = project_root / "PI_RAW"
 
@@ -2465,6 +2468,7 @@ def main() -> int:
     # Resolve + scaffold the NSA layout so downstream tools & Dataset Studio see it.
     project_root, _ = resolve_layout(args.root)
     scaffold_imx662_project(project_root, gain=args.gain,
+                            calibration_sensor=normalize_capture_sensor(args.capture_sensor),
                             imx662_ag_tags=IMX662_TARGET_AG_TAGS,
                             scenes=tuple(args.scenes),
                             flat_levels=max(2, args.flat_levels))

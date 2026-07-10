@@ -1285,7 +1285,11 @@ class Imx662DataStudio(tk.Toplevel):
         sm = self._audit.get("summary", {})
         inv = self._audit.get("pi_raw_inventory", {})
         cal = self._audit.get("calibration_pipeline") or {}
-        cal_ok = "READY" if cal.get("ready") else "needed"
+        if cal and not cal.get("ready") and any(isinstance(v, dict) for v in cal.values()):
+            ready = [k for k, v in cal.items() if isinstance(v, dict) and v.get("ready")]
+            cal_ok = ("READY " + ", ".join(ready)) if ready else "needed"
+        else:
+            cal_ok = "READY" if cal.get("ready") else "needed"
         self.prog["value"] = min(
             100.0,
             100.0 * sm.get("imx662_pairs_on_disk", 0)
@@ -1553,18 +1557,21 @@ class NoiseDatasetWizard(tk.Toplevel):
         self._busy = False
 
         self.calib_dir = tk.StringVar()
-        self.model_out = tk.StringVar(value=str(ROOT / "models" / "noise" / "imx662_gain256.json"))
+        self.model_out = tk.StringVar()
         self.sensor_var = tk.StringVar(value="imx662")
         self.gain_var = tk.StringVar(value="256")
         self.temp_var = tk.StringVar()
         from nsa.dataset_layout import find_best_project_root, resolve_layout
+        from nsa.dataset_layout import calibration_dir, noise_model_path
         _pi = find_best_project_root() or (ROOT / "datasets" / "PI_RAW")
         _proj, _pi_raw = resolve_layout(_pi)
         self.clean_dir = tk.StringVar(
             value=str(_proj / "clean_scenes") if (_proj / "clean_scenes").is_dir() else "")
-        self.calib_dir.set(
-            str(_proj / "calibration" / "imx662_gain256")
-            if (_proj / "calibration" / "imx662_gain256").is_dir() else "")
+        _default_sensor = "imx662"
+        _default_gain = 256
+        self.model_out.set(str(noise_model_path(_proj, _default_sensor, _default_gain)))
+        _cal = calibration_dir(_proj, _default_sensor, _default_gain)
+        self.calib_dir.set(str(_cal) if _cal.is_dir() else "")
         self.dataset_out = tk.StringVar(value=str(_pi_raw))
         self.calib_json = tk.StringVar()
         self.ag_tag_var = tk.StringVar(value="ag12")
@@ -1649,7 +1656,7 @@ class NoiseDatasetWizard(tk.Toplevel):
         opts.pack(fill="x", pady=(S(8), 0))
         tk.Label(opts, text="Sensor", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
         ttk.Combobox(opts, textvariable=self.sensor_var, width=10,
-                     values=["imx662", "imx219", "imxng"], state="readonly",
+                     values=["imx662", "imx662h", "imx219", "imxng"], state="readonly",
                      style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
         tk.Label(opts, text="Gain", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
         ttk.Combobox(opts, textvariable=self.gain_var, width=6,
@@ -2542,6 +2549,7 @@ class CttCaptureWizard(tk.Toplevel):
                 project_root, _ = resolve_layout(self.root_var.get().strip())
                 scaffold_imx662_project(
                     project_root, gain=args.gain,
+                    calibration_sensor=self.capture_sensor,
                     scenes=tuple(args.scenes),
                     flat_levels=max(2, args.flat_levels))
                 want_hcg = self.backend.capture_sensor_hcg_enabled(self.capture_sensor)
@@ -3455,7 +3463,8 @@ class CttCaptureWizard(tk.Toplevel):
         # post_process() step, THEN hand off to the noise dataset builder.
         # Without this, "Clean images" in step 2 points at an empty folder.
         gain = self.gain_var.get()
-        cal_dir = self._project_root / f"calibration/imx662_gain{gain}"
+        from nsa.dataset_layout import calibration_dir
+        cal_dir = calibration_dir(self._project_root, self.capture_sensor, gain)
         clean_dir = self._project_root / "clean_scenes"
         if not rawpy_ok:
             messagebox.showwarning(
@@ -3618,10 +3627,17 @@ class CttCaptureWizard(tk.Toplevel):
     def _open_builder(self):
         # Hand off to the existing noise dataset wizard, prefilled.
         try:
+            from nsa.dataset_layout import noise_model_path
             wiz = NoiseDatasetWizard(self.app)
             cal_dir, clean_dir = self._builder_prefill
             wiz.calib_dir.set(cal_dir)
+            wiz.sensor_var.set(self.capture_sensor)
             wiz.gain_var.set(self.gain_var.get())
+            try:
+                gain = int(self.gain_var.get())
+            except ValueError:
+                gain = 256
+            wiz.model_out.set(str(noise_model_path(self._project_root, self.capture_sensor, gain)))
             if Path(clean_dir).is_dir():
                 wiz.clean_dir.set(clean_dir)
             self._on_close()

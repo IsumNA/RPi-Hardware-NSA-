@@ -14,7 +14,8 @@ Your manager's captures already live here::
 The **noise synthesis pipeline** (unchanged) adds a separate calibration tree and
 writes new ``imx662_ag*_test`` folders — it does not replace the existing data.
 
-    <project>/calibration/imx662_gain256/   bias/ dark/ flat/   → noise model JSON
+    <project>/calibration/imx662_gain256/    bias/ dark/ flat/  → LCG noise model
+    <project>/calibration/imx662h_gain256/   bias/ dark/ flat/  → HCG noise model
     <project>/clean_scenes/<scene>/         GT for synthesis (from bursts OR copy gt.* from PI_RAW)
     PI_RAW/Data/<scene>/imx662_ag24_test/   synthesized noisy+gt pairs
 """
@@ -55,6 +56,35 @@ HCG_PANEL_SLOTS_PER_VARIANT = 3  # 3× panel_H_<lux>, 3× panel_F_<lux>, 3× pan
 HCG_PANEL_SLOT_COUNT = len(HCG_PANEL_VARIANTS) * HCG_PANEL_SLOTS_PER_VARIANT
 # Panel stages (manual lux) only sweep high gains — skip 1–64×.
 HCG_PANEL_GAIN_SWEEP: tuple[int, ...] = (128, 256, 512)
+
+
+CALIBRATION_SENSORS: tuple[str, ...] = ("imx662", "imx662h")
+
+
+def normalize_calibration_sensor(tag: str | None) -> str:
+    """``imx662`` (LCG) or ``imx662h`` (HCG) — separate calibration trees."""
+    s = (tag or "imx662").strip().lower()
+    return "imx662h" if s == "imx662h" else "imx662"
+
+
+def calibration_folder_name(sensor: str | None, gain: int) -> str:
+    return f"{normalize_calibration_sensor(sensor)}_gain{int(gain)}"
+
+
+def calibration_rel_path(sensor: str | None, gain: int) -> str:
+    return f"calibration/{calibration_folder_name(sensor, gain)}"
+
+
+def calibration_dir(project_root: Path | str, sensor: str | None, gain: int) -> Path:
+    return Path(project_root).expanduser().resolve() / calibration_rel_path(sensor, gain)
+
+
+def noise_model_rel_path(sensor: str | None, gain: int) -> str:
+    return f"models/noise/{calibration_folder_name(sensor, gain)}.json"
+
+
+def noise_model_path(project_root: Path | str, sensor: str | None, gain: int) -> Path:
+    return Path(project_root).expanduser().resolve() / noise_model_rel_path(sensor, gain)
 
 
 def ensure_manager_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
@@ -282,12 +312,14 @@ def export_clean_gt_from_pi_raw(
     return written
 
 
-def _calibration_specs(gain: int, flat_levels: int) -> list[SlotSpec]:
-    cal = f"calibration/imx662_gain{gain}"
+def _calibration_specs(gain: int, flat_levels: int,
+                       sensor: str = "imx662") -> list[SlotSpec]:
+    cal = calibration_rel_path(sensor, gain)
+    sensor_tag = normalize_calibration_sensor(sensor)
     specs: list[SlotSpec] = [
         SlotSpec(
-            slot_id="cal_root", rel_path=cal,
-            title=f"Noise calibration (gain {gain}×)",
+            slot_id=f"cal_root_{sensor_tag}", rel_path=cal,
+            title=f"Noise calibration ({sensor_tag} gain {gain}×)",
             section="noise_pipeline",
             purpose="NEW captures for the 5-phase noise model — separate from PI_RAW scenes.",
             how_to_capture=(
@@ -299,7 +331,7 @@ def _calibration_specs(gain: int, flat_levels: int) -> list[SlotSpec]:
             min_count=1, count_label="folder",
         ),
         SlotSpec(
-            slot_id="bias", rel_path=f"{cal}/bias",
+            slot_id=f"bias_{sensor_tag}", rel_path=f"{cal}/bias",
             title="bias/ — read noise",
             section="noise_pipeline",
             purpose="Lens capped, minimal exposure. Measures read noise + ADC offset.",
@@ -310,7 +342,7 @@ def _calibration_specs(gain: int, flat_levels: int) -> list[SlotSpec]:
             example_files=["bias_00.dng", "bias_01.dng"],
         ),
         SlotSpec(
-            slot_id="dark", rel_path=f"{cal}/dark",
+            slot_id=f"dark_{sensor_tag}", rel_path=f"{cal}/dark",
             title="dark/ — row noise",
             section="noise_pipeline",
             purpose="Lens capped, normal exposure at the IMX662 night gain.",
@@ -321,7 +353,7 @@ def _calibration_specs(gain: int, flat_levels: int) -> list[SlotSpec]:
             example_files=["dark_00.dng"],
         ),
         SlotSpec(
-            slot_id="flat_root", rel_path=f"{cal}/flat",
+            slot_id=f"flat_root_{sensor_tag}", rel_path=f"{cal}/flat",
             title="flat/ — shot noise curve",
             section="noise_pipeline",
             purpose="10–15 brightness levels; each level_XX/ holds a.dng + b.dng.",
@@ -332,7 +364,7 @@ def _calibration_specs(gain: int, flat_levels: int) -> list[SlotSpec]:
     for i in range(1, flat_levels + 1):
         lv = f"{i:02d}"
         specs.append(SlotSpec(
-            slot_id=f"flat_{lv}", rel_path=f"{cal}/flat/level_{lv}",
+            slot_id=f"flat_{sensor_tag}_{lv}", rel_path=f"{cal}/flat/level_{lv}",
             title=f"flat/level_{lv}/",
             section="noise_pipeline",
             purpose=f"Flat-field pair at brightness step {i}.",
@@ -405,18 +437,18 @@ def _slot_status(spec: SlotSpec, project_root: Path, pi_raw_root: Path) -> dict[
             files = list(files.values())
         found = 1 if pr else (len(files) // 2 if files else 0)
         req = 1
-    elif spec.slot_id.startswith("flat_"):
-        files_p = list_frames(folder) if folder.is_dir() else []
-        found = len(files_p)
-        files = [str(f.relative_to(project_root)) for f in files_p]
-    elif spec.slot_id == "flat_root":
+    elif spec.slot_id.startswith("flat_root"):
         levels = 0
         if folder.is_dir():
             for d in sorted(folder.iterdir()):
                 if d.is_dir() and len(list_frames(d)) >= 2:
                     levels += 1
         found = levels
-    elif spec.slot_id == "cal_root":
+    elif spec.slot_id.startswith("flat_"):
+        files_p = list_frames(folder) if folder.is_dir() else []
+        found = len(files_p)
+        files = [str(f.relative_to(project_root)) for f in files_p]
+    elif spec.slot_id.startswith("cal_root"):
         found = 1 if folder.is_dir() else 0
     else:
         files_p = list_frames(folder) if folder.is_dir() else []
@@ -525,18 +557,23 @@ def audit_project(
     }
 
     on_disk = _existing_pi_raw_slots(inventory, scene_tuple)
-    cal_specs = _calibration_specs(gain, flat_levels)
+    cal_specs: list[SlotSpec] = []
+    for sensor in CALIBRATION_SENSORS:
+        cal_specs.extend(_calibration_specs(gain, flat_levels, sensor))
     target_specs = _imx662_target_specs(scene_tuple, ag_tuple, pi_raw_root)
 
     noise_slots = [_slot_status(s, project_root, pi_raw_root) for s in cal_specs]
     target_slots = [_slot_status(s, project_root, pi_raw_root) for s in target_specs]
 
-    cal_path = project_root / f"calibration/imx662_gain{gain}"
-    cal_validation: dict[str, Any] | None = None
-    if cal_path.is_dir():
+    cal_pipelines: dict[str, Any] = {}
+    for sensor in CALIBRATION_SENSORS:
+        cal_path = calibration_dir(project_root, sensor, gain)
+        if not cal_path.is_dir():
+            continue
         try:
             discovered = discover_phase1_root(cal_path)
-            cal_validation = {
+            cal_pipelines[sensor] = {
+                "path": str(cal_path),
                 "bias": len(discovered["bias"]),
                 "dark": len(discovered["dark"]),
                 "flat_levels": len(discovered["flat_pairs"]),
@@ -547,7 +584,8 @@ def audit_project(
                 ),
             }
         except Exception as exc:  # noqa: BLE001
-            cal_validation = {"error": str(exc), "ready": False}
+            cal_pipelines[sensor] = {"path": str(cal_path), "error": str(exc), "ready": False}
+    cal_validation: dict[str, Any] | None = cal_pipelines or None
 
     imx662_on_disk = [
         t for t in inventory.get("tests", [])
@@ -581,7 +619,9 @@ def audit_project(
             "scenes_on_disk": len(inventory.get("scenes", [])),
             "imx662_pairs_on_disk": len(imx662_on_disk),
             "imx662_targets_missing": len(imx662_missing),
-            "calibration_ready": bool(cal_validation and cal_validation.get("ready")),
+            "calibration_ready": any(
+                bool(v.get("ready")) for v in (cal_validation or {}).values()
+                if isinstance(v, dict)),
         },
         "calibration_pipeline": cal_validation,
         "slots": on_disk + noise_slots + target_slots,
@@ -605,6 +645,7 @@ def scaffold_imx662_project(
     root: Path | str,
     *,
     gain: int = 256,
+    calibration_sensor: str = "imx662",
     imx662_ag_tags: tuple[str, ...] = IMX662_TARGET_AG_TAGS,
     scenes: tuple[str, ...] = MANAGER_SCENES,
     flat_levels: int = DEFAULT_FLAT_LEVELS,
@@ -613,6 +654,7 @@ def scaffold_imx662_project(
     """Create calibration/ + clean_scenes/ beside an existing or new PI_RAW tree."""
     project_root, pi_raw_root = resolve_layout(root)
     scene_tuple = ensure_manager_scenes(scenes)
+    cal_sensor = normalize_calibration_sensor(calibration_sensor)
     project_root.mkdir(parents=True, exist_ok=True)
     (pi_raw_root / "Data").mkdir(parents=True, exist_ok=True)
 
@@ -628,7 +670,7 @@ def scaffold_imx662_project(
     if overwrite_readme or not gt_guide.exists():
         gt_guide.write_text(_GT_CAPTURE_GUIDE, encoding="utf-8")
 
-    for spec in _calibration_specs(gain, flat_levels):
+    for spec in _calibration_specs(gain, flat_levels, cal_sensor):
         folder = project_root / spec.rel_path
         folder.mkdir(parents=True, exist_ok=True)
         md = folder / "CAPTURE.md"
@@ -670,7 +712,8 @@ Each test folder contains up to four files: ``noisy.dng``, ``noisy.png``, ``gt.d
 
 | Folder | Purpose |
 |--------|---------|
-| ``calibration/imx662_gain256/`` | NEW bias/dark/flat shoots → noise model JSON |
+| ``calibration/imx662_gain256/`` | LCG bias/dark/flat → noise model JSON |
+| ``calibration/imx662h_gain256/`` | HCG bias/dark/flat → separate noise model |
 | ``clean_scenes/<scene>/`` | Clean GT for synthesis (copy from PI_RAW gt.* or burst average) |
 | ``PI_RAW/Data/<scene>/imx662_ag24_test/`` | **Generated** pairs (night-vision tags: {ag_tags}) |
 
