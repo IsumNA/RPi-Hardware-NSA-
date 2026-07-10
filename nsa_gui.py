@@ -2938,7 +2938,7 @@ class CttCaptureWizard(tk.Toplevel):
         sensor = st.meta.get("capture_sensor", self.capture_sensor)
         self.progress_lbl.config(
             text=f"→ {st.meta['pair_root']}/{sensor}_ag<gain>_test")
-        self._set_status(f"Panel stage → {scene} ({float(lux):.2f} lux)", "ok")
+        self._set_status(f"Panel stage → {scene} ({float(lux):.3f} lux)", "ok")
         return True
 
     def _capture(self):

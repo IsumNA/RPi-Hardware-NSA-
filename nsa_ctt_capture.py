@@ -281,12 +281,15 @@ def is_panel_scene(scene: str) -> bool:
     return parse_panel_scene_lux(scene) is not None
 
 
+PANEL_LUX_DECIMALS = 3
+
+
 def panel_scene_from_lux(lux: float, variant: str = "H") -> str:
-    """``cabinet_panel_{H|F}_<lux>`` with lux rounded to 2 decimal places."""
+    """``cabinet_panel_{H|F}_<lux>`` with lux rounded to 3 decimal places."""
     v = (variant or "H").strip().upper()
     if v not in ("H", "F"):
         v = "H"
-    return f"cabinet_panel_{v}_{max(0.0, float(lux)):.2f}"
+    return f"cabinet_panel_{v}_{max(0.0, float(lux)):.{PANEL_LUX_DECIMALS}f}"
 
 
 def panel_variant_for_slot(slot: int) -> str:
@@ -301,7 +304,7 @@ def assign_panel_scene(station: Station, lux: float, project_root: Path | str) -
         station.meta.get("panel_slot", 1))
     scene = panel_scene_from_lux(lux, variant)
     pi_raw = project_root / "PI_RAW"
-    measured = round(float(lux), 2)
+    measured = round(float(lux), PANEL_LUX_DECIMALS)
     station.meta["scene"] = scene
     station.meta["panel_lux"] = measured
     station.meta["measured_lux"] = measured
@@ -1281,7 +1284,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                     f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
                     f"• Set the {panel_label} panel manually to extremely low lux.\n"
                     f"• CAPTURE names this stage cabinet_panel_{variant}_<lux> from "
-                    "the measured lux (2 decimal places).\n"
+                    "the measured lux (3 decimal places).\n"
                     f"{hcg_note}"
                     f"• Panel stages sweep high gains only ({gains_txt}) — "
                     f"not the full 1–512 series.\n"
@@ -1750,7 +1753,7 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
                         project_root = Path(st.meta["burst_root"]).parent.parent
                         assign_panel_scene(st, meas, project_root)
                         log(f"Panel stage → {st.meta['scene']} "
-                            f"({meas:.2f} lux measured)", "ok")
+                            f"({meas:.{PANEL_LUX_DECIMALS}f} lux measured)", "ok")
                     else:
                         log("Panel stage: could not measure lux — set light "
                             "manually and retry.", "err")
