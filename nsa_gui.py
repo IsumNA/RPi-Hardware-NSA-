@@ -1984,10 +1984,11 @@ class CttCaptureWizard(tk.Toplevel):
         self.app = master
         import types
         import nsa_ctt_capture as backend
-        from nsa.dataset_layout import MANAGER_SCENES, ensure_manager_scenes
+        from nsa.dataset_layout import MANAGER_SCENES, HCG_PANEL_SCENES, ensure_manager_scenes
         self.backend = backend
         self._types = types
         self.capture_sensor = self.backend.normalize_capture_sensor(capture_sensor)
+        self._hcg_mode = self.backend.capture_sensor_hcg_enabled(self.capture_sensor)
         self.title(f"NAS  ·  Camera capture ({self.capture_sensor})")
         self.configure(bg=WHITE)
 
@@ -2026,14 +2027,15 @@ class CttCaptureWizard(tk.Toplevel):
             value=", ".join(str(g) for g in backend.DEFAULT_GAIN_SWEEP))
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
-        self.scenes_var = tk.StringVar(value=", ".join(MANAGER_SCENES))
+        default_scenes = (HCG_PANEL_SCENES if self._hcg_mode else MANAGER_SCENES)
+        self.scenes_var = tk.StringVar(value=", ".join(default_scenes))
         self._sync_scenes_field()
         self.transfer_var = tk.StringVar(value="rsync")
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
         self.autostart_var = tk.BooleanVar(value=True)
         self.cttcmd_var = tk.StringVar(value="~/ctt-venv/bin/ctt-server")
-        self.autolight_var = tk.BooleanVar(value=True)
+        self.autolight_var = tk.BooleanVar(value=not self._hcg_mode)
         # Copy the finished PI_RAW pairs to the AI-server dataset root (and verify)
         # so training picks them up. Default: {USER}@ai:/opt/datasets/PI_RAW.
         self.publish_var = tk.BooleanVar(value=True)
@@ -2171,6 +2173,16 @@ class CttCaptureWizard(tk.Toplevel):
                  font=font(10, "bold")).grid(row=6, column=0, sticky="w", pady=S(4))
         ttk.Entry(grid, textvariable=self.scenes_var, font=font(10)).grid(
             row=6, column=1, columnspan=3, sticky="ew")
+        scenes_help = (
+            "HCG: name each stage cabinet_panel_<lux> (e.g. cabinet_panel_2) — "
+            "set the panel manually to extremely low lux before each capture. "
+            "Edit the list to add/remove stages (~3 typical)."
+            if self._hcg_mode else
+            "Comma-separated scene folders under PI_RAW/Data/. "
+            "Standard mode uses cabinet_D50_100, cabinet_F11_25, …")
+        tk.Label(grid, text=scenes_help, bg=WHITE, fg=SUBTLE, font=font(8),
+                 wraplength=S(820), justify="left").grid(
+                     row=7, column=0, columnspan=4, sticky="w", pady=(S(2), S(2)))
 
         # Transfer method.
         tfr = tk.Frame(parent, bg=WHITE)
@@ -2221,10 +2233,13 @@ class CttCaptureWizard(tk.Toplevel):
             activebackground=WHITE, font=font(10)).pack(side="left")
         tk.Label(
             parent,
-            text=("Needs a lightSTUDIO-S on the Pi. Scenes named "
-                  "<name>_<illuminant>_<percent> (e.g. cabinet_F11_25 → F11 at 25 %, "
-                  "cabinet_D50_100 → D50 at 100 %) set the box automatically. "
-                  "Tune with the % field + SET if needed."),
+            text=("Needs a lightSTUDIO-S on the Pi. "
+                  + ("HCG: leave auto-light OFF — tune the panel manually to very low lux, "
+                     "then RE-APPLY before CAPTURE. Scene names record cabinet_panel_<lux>."
+                     if self._hcg_mode else
+                     "Scenes named <name>_<illuminant>_<percent> "
+                     "(e.g. cabinet_F11_25 → F11 at 25 %, cabinet_D50_100 → D50 at 100 %) "
+                     "set the box automatically. Tune with the % field + SET if needed.")),
             bg=WHITE, fg=SUBTLE, font=font(8), wraplength=S(860),
             justify="left").pack(anchor="w", pady=(S(2), 0))
 
@@ -2465,16 +2480,22 @@ class CttCaptureWizard(tk.Toplevel):
             self.root_var.set(p)
 
     def _sync_scenes_field(self):
-        """Ensure the Scenes field lists every canonical manager scene."""
-        from nsa.dataset_layout import ensure_manager_scenes
-        merged = ensure_manager_scenes(
-            [s.strip() for s in self.scenes_var.get().split(",") if s.strip()])
+        """Ensure the Scenes field lists every canonical scene for this sensor mode."""
+        from nsa.dataset_layout import ensure_manager_scenes, ensure_hcg_panel_scenes
+        raw = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
+        if self._hcg_mode:
+            merged = ensure_hcg_panel_scenes(raw)
+        else:
+            merged = ensure_manager_scenes(raw)
         self.scenes_var.set(", ".join(merged))
 
     def _args_namespace(self):
-        from nsa.dataset_layout import ensure_manager_scenes
-        scenes = list(ensure_manager_scenes(
-            [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]))
+        from nsa.dataset_layout import ensure_manager_scenes, ensure_hcg_panel_scenes
+        raw = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
+        if self._hcg_mode:
+            scenes = list(ensure_hcg_panel_scenes(raw))
+        else:
+            scenes = list(ensure_manager_scenes(raw))
         return self._types.SimpleNamespace(
             gain=int(self.gain_var.get() or "256"),
             # 0 → calibrate bias/dark/flat at the target gain (the real operating
@@ -2704,18 +2725,29 @@ class CttCaptureWizard(tk.Toplevel):
         self._light_manual_override = False
         self._capture_lux = st.lux  # CTT requires a positive lux for macbeth captures
         is_scene = bool(st.meta.get("is_real_pair"))
+        panel_lux = st.meta.get("panel_lux")
         if is_scene and self._lightbox_present:
             scene = st.meta.get("scene", "")
             illum, scene_pct = self.backend.parse_scene_light(scene)
             self.light_illum_var.set(illum or (self._lightbox_illums[0]
                                                 if self._lightbox_illums else ""))
-            if scene_pct is not None and not self._light_manual_override:
+            if panel_lux is not None:
+                self.light_lbl.config(
+                    text=(f"Panel scene {scene}: set lux manually "
+                          f"(~{panel_lux:g} lux in folder name). "
+                          "Tune panel → SET → RE-APPLY → CAPTURE."),
+                    fg=SUBTLE)
+            elif scene_pct is not None and not self._light_manual_override:
                 self.light_pct_var.set(str(scene_pct))
-            self.light_lbl.config(
-                text=(f"Scene {scene}: {illum or '?'} at "
-                      f"{scene_pct if scene_pct is not None else self.light_pct_var.get()} %."
-                      if illum else "Lightbox ready."),
-                fg=SUBTLE)
+                self.light_lbl.config(
+                    text=(f"Scene {scene}: {illum or '?'} at {scene_pct} %."),
+                    fg=SUBTLE)
+            else:
+                self.light_lbl.config(
+                    text=(f"Scene {scene}: {illum or '?'} at "
+                          f"{scene_pct if scene_pct is not None else self.light_pct_var.get()} %."
+                          if illum else "Lightbox ready — set manually."),
+                    fg=SUBTLE)
             self.light_fr.pack(anchor="w", fill="x", pady=(S(10), 0))
         else:
             self.light_fr.pack_forget()
@@ -2737,7 +2769,8 @@ class CttCaptureWizard(tk.Toplevel):
         st = self._plan[self._idx]
         auto_light = (bool(st.meta.get("is_real_pair")) and self._lightbox_present
                      and bool(self.autolight_var.get())
-                     and not self._light_manual_override)
+                     and not self._light_manual_override
+                     and st.meta.get("panel_lux") is None)
 
         try:
             pct = float(self.light_pct_var.get())
@@ -2808,10 +2841,15 @@ class CttCaptureWizard(tk.Toplevel):
                 text=f"{illum} at {pct:.0f}% → {meas:.0f} lux.  Adjust % + SET if needed.",
                 fg=SUBTLE)
         elif st.meta.get("is_real_pair") and self._lightbox_present:
-            self.light_lbl.config(
-                text="Auto-light off or scene name unparseable "
-                     "(use <name>_<illuminant>_<percent>) — set manually below.",
-                fg=SUBTLE)
+            if st.meta.get("panel_lux") is not None:
+                self.light_lbl.config(
+                    text="Set panel to extremely low lux manually, then SET + RE-APPLY.",
+                    fg=SUBTLE)
+            else:
+                self.light_lbl.config(
+                    text="Auto-light off or scene name unparseable "
+                         "(use <name>_<illuminant>_<percent>) — set manually below.",
+                    fg=SUBTLE)
         self._set_status("Ready to capture.", "ok")
 
     # -- lightbox manual override --------------------------------------------
@@ -2856,6 +2894,8 @@ class CttCaptureWizard(tk.Toplevel):
 
         # Real-pair scenes sweep the whole gain series after this single setup.
         if st.meta.get("gain_sweep"):
+            if self._capture_lux:
+                st.lux = self._capture_lux
             self._set_busy(True)
             self._set_status("Metering, then sweeping the gain series…")
             self._capture_sweep(st, project, incremental)
@@ -4184,9 +4224,11 @@ class App(tk.Tk):
                  font=font(12, "bold")).pack(anchor="w", pady=(0, S(6)))
         tk.Label(
             body,
-            text=("imx662 = standard (low conversion gain).\n"
-                  "imx662h = high conversion gain — the Pi runs "
-                  "v4l2-ctl hcg_enable=1 before the camera starts."),
+            text=("imx662 = standard (low conversion gain) — cabinet_D50_100, "
+                  "cabinet_F11_25, … scenes with auto lightbox.\n"
+                  "imx662h = high conversion gain (hcg_enable=1) — extremely low lux "
+                  "via manual panel; stages named cabinet_panel_<lux> "
+                  "(default: cabinet_panel_10, cabinet_panel_5, cabinet_panel_2)."),
             bg=WHITE, fg=SUBTLE, font=font(9), justify="left",
         ).pack(anchor="w", pady=(0, S(16)))
         btn_row = tk.Frame(body, bg=WHITE)

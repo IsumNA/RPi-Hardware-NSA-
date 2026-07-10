@@ -60,7 +60,9 @@ sys.path.insert(0, str(ROOT))
 from nsa.dataset_layout import (
     IMX662_TARGET_AG_TAGS,
     MANAGER_SCENES,
+    HCG_PANEL_SCENES,
     ensure_manager_scenes,
+    ensure_hcg_panel_scenes,
     resolve_layout,
     scaffold_imx662_project,
 )
@@ -236,6 +238,24 @@ def scene_lightbox_percent(scene: str, *, override: float | None = None) -> floa
     if pct is not None:
         return float(pct)
     return DEFAULT_LIGHTBOX_PERCENT
+
+
+_PANEL_SCENE_RE = re.compile(r"^cabinet_panel_(?P<lux>[\d.]+)$", re.IGNORECASE)
+
+
+def parse_panel_scene_lux(scene: str) -> float | None:
+    """Parse ``cabinet_panel_<lux>`` scene names (HCG manual-panel captures)."""
+    m = _PANEL_SCENE_RE.match(str(scene).strip())
+    if not m:
+        return None
+    try:
+        return float(m.group("lux"))
+    except ValueError:
+        return None
+
+
+def is_panel_scene(scene: str) -> bool:
+    return parse_panel_scene_lux(scene) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -1160,16 +1180,29 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     gain_sweep = parse_gain_sweep(getattr(args, "gain_sweep", None) or DEFAULT_GAIN_SWEEP)
     capture_sensor = normalize_capture_sensor(getattr(args, "capture_sensor", None))
     hcg_enabled = capture_sensor_hcg_enabled(capture_sensor)
-    for scene in ensure_manager_scenes(args.scenes):
+    scene_list = (ensure_hcg_panel_scenes(args.scenes) if hcg_enabled
+                  else ensure_manager_scenes(args.scenes))
+    for scene in scene_list:
         if mode == "real":
             gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
+            panel_lux = parse_panel_scene_lux(scene)
             title = f"REAL PAIR SWEEP  ·  {scene}"
             hcg_note = (
                 "• Pi is set to high conversion gain (HCG) before the camera starts.\n"
                 if hcg_enabled else "")
+            if hcg_enabled:
+                lux_hint = (f"~{panel_lux:g} lux" if panel_lux is not None
+                            else "your target lux")
+                light_line = (
+                    f"• Set the light panel manually to extremely low lux "
+                    f"({lux_hint} — tune until metered exposure looks right).\n"
+                    "• Scene folder records the lux level: cabinet_panel_<lux>.\n")
+            else:
+                light_line = (
+                    "• Light it well (~100%, back off only if CLIPPING flags highlights).\n")
             setup = (
                 f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
-                "• Light it well (~100%, back off only if CLIPPING flags highlights).\n"
+                f"{light_line}"
                 f"{hcg_note}"
                 f"• CAPTURE averages more frames at higher gain for cleaner GT "
                 f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
@@ -1183,6 +1216,8 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 "exp_min": exp_min, "exp_max": exp_max,
                 "capture_sensor": capture_sensor, "hcg_enabled": hcg_enabled,
             }
+            if panel_lux is not None:
+                meta["panel_lux"] = panel_lux
         else:
             title = f"SCENE BURST  ·  {scene}"
             setup = (
@@ -1194,9 +1229,16 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             )
             meta = {"scene": scene}
         # CTT rejects "macbeth"-type captures with no (or non-positive) lux.
-        # The scene-name suffix is intensity %, not lux — use CLI/default here;
-        # the measured lux is filled in after the lightbox is set at capture time.
-        station_lux = args.lux or 500
+        # Panel scenes use the lux suffix as a hint; measured lux wins at capture.
+        panel_lux = parse_panel_scene_lux(scene)
+        if getattr(args, "lux", None) is not None:
+            station_lux = int(args.lux)
+        elif panel_lux is not None:
+            station_lux = max(1, int(round(panel_lux)))
+        elif hcg_enabled:
+            station_lux = 3
+        else:
+            station_lux = 500
         stations.append(Station(
             station_id=f"burst_{scene}",
             title=title,
@@ -1336,7 +1378,9 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
                   "capture_sensor": sensor_tag, "hcg_enabled": hcg_enabled,
                   "requested_gain": g, "actual_gain": actual,
                   "clamped": clamped, "exposure_us": exposure,
-                  "burst_frames": n_frames},
+                  "burst_frames": n_frames,
+                  **({"panel_lux": station.meta["panel_lux"]}
+                     if station.meta.get("panel_lux") is not None else {})},
         )
         recs.append(Recorded(station=gstation, ctt_filenames=fnames))
         done_frames += n_frames
@@ -1354,14 +1398,19 @@ def write_gain_sidecar(pair_dir: Path | str, rec_meta: dict) -> None:
     import json
     pair_dir = Path(pair_dir)
     pair_dir.mkdir(parents=True, exist_ok=True)
-    (pair_dir / "gain.json").write_text(json.dumps({
+    payload = {
         "requested_gain": rec_meta.get("requested_gain"),
         "actual_gain": rec_meta.get("actual_gain"),
         "clamped": bool(rec_meta.get("clamped", False)),
         "exposure_us": rec_meta.get("exposure_us"),
         "capture_sensor": rec_meta.get("capture_sensor"),
         "hcg_enabled": rec_meta.get("hcg_enabled"),
-    }, indent=2), encoding="utf-8")
+    }
+    if rec_meta.get("panel_lux") is not None:
+        payload["panel_lux"] = rec_meta.get("panel_lux")
+    if rec_meta.get("measured_lux") is not None:
+        payload["measured_lux"] = rec_meta.get("measured_lux")
+    (pair_dir / "gain.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -1544,10 +1593,14 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
             extra = ""
             if st.meta.get("is_real_pair"):
                 scene = st.meta.get("scene", "")
-                illum, _ = parse_scene_light(scene)
-                if illum:
-                    pct = scene_lightbox_percent(scene, override=lightbox_percent)
-                    extra += f" · lightbox {illum} at {pct:.0f}%"
+                panel_lux = st.meta.get("panel_lux")
+                if panel_lux is not None:
+                    extra += f" · manual panel ~{panel_lux:g} lux"
+                else:
+                    illum, _ = parse_scene_light(scene)
+                    if illum:
+                        pct = scene_lightbox_percent(scene, override=lightbox_percent)
+                        extra += f" · lightbox {illum} at {pct:.0f}%"
                 pair_root = st.meta.get("pair_root")
                 if pair_root:
                     sensor = st.meta.get("capture_sensor", CAPTURE_SENSOR_IMX662)
@@ -1563,18 +1616,22 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         capture_lux = st.lux
         if st.meta.get("is_real_pair"):
             scene = st.meta.get("scene")
-            illum, _ = parse_scene_light(scene)
-            if illum:
-                try:
-                    pct = scene_lightbox_percent(scene, override=lightbox_percent)
-                    client.set_lightbox(illum, pct)
-                    meas = client._settled_lux()
-                    log(f"Lightbox set to {illum} at {pct:.0f}% "
-                        f"(measured {meas:.0f} lux)", "ok")
-                    if meas > 0:
-                        capture_lux = int(round(meas))  # metadata only
-                except Exception as exc:  # noqa: BLE001
-                    log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
+            if st.meta.get("panel_lux") is None:
+                illum, _ = parse_scene_light(scene)
+                if illum:
+                    try:
+                        pct = scene_lightbox_percent(scene, override=lightbox_percent)
+                        client.set_lightbox(illum, pct)
+                        meas = client._settled_lux()
+                        log(f"Lightbox set to {illum} at {pct:.0f}% "
+                            f"(measured {meas:.0f} lux)", "ok")
+                        if meas > 0:
+                            capture_lux = int(round(meas))  # metadata only
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"Lightbox setup failed: {exc} (proceeding anyway)", "warn")
+            else:
+                log(f"Panel scene {scene}: set light panel manually "
+                    f"(~{st.meta['panel_lux']:g} lux in folder name)", "info")
 
         # Apply controls up-front so the live view reflects the shot settings.
         try:
@@ -2172,7 +2229,9 @@ def main() -> int:
                         "PI_RAW/Data/<scene>/<capture-sensor>_ag<gain>_test.")
     p.add_argument("--gain", type=int, default=256,
                    help="operating/calibration gain (folder imx662_gain<N>)")
-    p.add_argument("--scenes", nargs="+", default=list(MANAGER_SCENES))
+    p.add_argument("--scenes", nargs="+", default=None,
+                   help="scene folder names (default: cabinet_panel_<lux>×3 for "
+                        "imx662h HCG, else manager PI_RAW scenes)")
     p.add_argument("--colour-temp", type=int, default=5000)
     p.add_argument("--lux", type=int, default=None,
                    help="fallback lux metadata for CTT (measured lux used when available)")
@@ -2225,6 +2284,11 @@ def main() -> int:
                    help="do not copy the finished pairs to the AI-server dataset root")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     args = p.parse_args()
+
+    if args.scenes is None:
+        args.scenes = (list(HCG_PANEL_SCENES)
+                       if capture_sensor_hcg_enabled(args.capture_sensor)
+                       else list(MANAGER_SCENES))
 
     PROJECT_NAME = args.project
     banner("CTT → NSA guided capture")
