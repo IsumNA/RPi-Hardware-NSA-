@@ -62,6 +62,7 @@ from nsa.dataset_layout import (
     MANAGER_SCENES,
     HCG_ILLUM_SCENES,
     HCG_PANEL_SLOT_COUNT,
+    HCG_PANEL_GAIN_SWEEP,
     ensure_manager_scenes,
     ensure_hcg_illuminant_scenes,
     resolve_layout,
@@ -1240,8 +1241,10 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     for stage_idx, (scene, stage_meta) in enumerate(stage_specs, 1):
         panel_auto = bool(stage_meta.get("panel_auto_name"))
         panel_lux = parse_panel_scene_lux(scene) if scene else None
+        stage_gain_sweep = (list(HCG_PANEL_GAIN_SWEEP) if panel_auto
+                            else list(gain_sweep))
         if mode == "real":
-            gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
+            gains_txt = ", ".join(f"{g}×" for g in stage_gain_sweep)
             hcg_note = (
                 "• Pi is set to high conversion gain (HCG) before the camera starts.\n"
                 if hcg_enabled else "")
@@ -1255,9 +1258,11 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                     "• CAPTURE names this stage cabinet_panel_<lux> from the "
                     "measured lux (2 decimal places).\n"
                     f"{hcg_note}"
+                    f"• Panel stages sweep high gains only ({gains_txt}) — "
+                    f"not the full 1–512 series.\n"
                     f"• CAPTURE averages more frames at higher gain for cleaner GT "
-                    f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
-                    f"gains {gains_txt}), dropping exposure as gain rises.\n"
+                    f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}), "
+                    f"dropping exposure as gain rises.\n"
                     f"• → PI_RAW/Data/cabinet_panel_<lux>/{capture_sensor}_ag<GAIN>_test/"
                 )
                 scene_key = f"_panel_slot_{stage_meta['panel_slot']}"
@@ -1289,7 +1294,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 scene_key = scene or f"stage_{stage_idx}"
             meta = {
                 "scene": scene or "",
-                "is_real_pair": True, "gain_sweep": list(gain_sweep),
+                "is_real_pair": True, "gain_sweep": stage_gain_sweep,
                 "burst_root": str(project_root / "bursts" / scene_key),
                 "pair_root": str(pi_raw / "Data" / scene_key),
                 "exp_min": exp_min, "exp_max": exp_max,
@@ -2343,7 +2348,7 @@ def main() -> int:
     p.add_argument("--gain", type=int, default=256,
                    help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=None,
-                   help="scene folder names (default: cabinet_D_10,F_5,H_2 + 3 panel "
+                   help="scene folder names (default: cabinet_D_10,F_5,H_2 + 5 panel "
                         "stages for imx662h HCG, else manager PI_RAW scenes)")
     p.add_argument("--colour-temp", type=int, default=5000)
     p.add_argument("--lux", type=int, default=None,

@@ -2175,8 +2175,9 @@ class CttCaptureWizard(tk.Toplevel):
         ttk.Entry(grid, textvariable=self.scenes_var, font=font(10)).grid(
             row=6, column=1, columnspan=3, sticky="ew")
         scenes_help = (
-            "HCG: 6 stages — cabinet_D_10, cabinet_F_5, cabinet_H_2 (auto-light), "
-            "then 3 panel stages named cabinet_panel_<lux> from measured lux at capture."
+            "HCG: 8 stages — cabinet_D_10, cabinet_F_5, cabinet_H_2 (auto-light), "
+            "then 5 panel stages named cabinet_panel_<lux> from measured lux at capture "
+            "(gains 64, 128, 256 only for panels)."
             if self._hcg_mode else
             "Comma-separated scene folders under PI_RAW/Data/. "
             "Standard mode uses cabinet_D50_100, cabinet_F11_25, …")
@@ -2638,11 +2639,12 @@ class CttCaptureWizard(tk.Toplevel):
                     "High conversion gain is active on the Pi.\n\n"
                     f"hcg_enable = 1 (read back OK)\n"
                     f"V4L2 subdev: {hcg_status.get('subdev', '?')}\n\n"
-                    "Capture plan (6 stages):\n"
+                    "Capture plan (8 stages):\n"
                     "  1. cabinet_D_10\n"
                     "  2. cabinet_F_5\n"
                     "  3. cabinet_H_2\n"
-                    "  4–6. cabinet_panel_<lux> — lux from measurement at capture")
+                    "  4–8. cabinet_panel_<lux> — lux from measurement at capture "
+                    "(gains 64, 128, 256 only)")
             else:
                 messagebox.showerror(
                     "HCG not verified",
@@ -4274,8 +4276,9 @@ class App(tk.Tk):
                     "When you CONNECT, the wizard will SSH to the Pi, run "
                     "v4l2-ctl hcg_enable=1 before the camera starts, and read "
                     "the value back to confirm HCG is actually running.\n\n"
-                    "6 stages: cabinet_D_10, cabinet_F_5, cabinet_H_2, "
-                    "then 3× cabinet_panel_<lux> from measured lux.")
+                    "8 stages: cabinet_D_10, cabinet_F_5, cabinet_H_2, "
+                    "then 5× cabinet_panel_<lux> from measured lux "
+                    "(panel gains 64, 128, 256 only).")
             result["v"] = v
             try:
                 dlg.grab_release()
@@ -4292,8 +4295,9 @@ class App(tk.Tk):
             body,
             text=("imx662 = standard (low conversion gain) — cabinet_D50_100, "
                   "cabinet_F11_25, … scenes with auto lightbox.\n"
-                  "imx662h = high conversion gain — 6 stages: D_10, F_5, H_2 "
-                  "(auto-light), then 3× cabinet_panel_<lux> from measured lux. "
+                  "imx662h = high conversion gain — 8 stages: D_10, F_5, H_2 "
+                  "(auto-light, full gain sweep), then 5× cabinet_panel_<lux> "
+                  "from measured lux (panel gains 64, 128, 256 only). "
                   "HCG is verified on CONNECT (hcg_enable=1 read back from Pi)."),
             bg=WHITE, fg=SUBTLE, font=font(9), justify="left",
         ).pack(anchor="w", pady=(0, S(16)))
