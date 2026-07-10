@@ -60,9 +60,10 @@ sys.path.insert(0, str(ROOT))
 from nsa.dataset_layout import (
     IMX662_TARGET_AG_TAGS,
     MANAGER_SCENES,
-    HCG_PANEL_SCENES,
+    HCG_ILLUM_SCENES,
+    HCG_PANEL_SLOT_COUNT,
     ensure_manager_scenes,
-    ensure_hcg_panel_scenes,
+    ensure_hcg_illuminant_scenes,
     resolve_layout,
     scaffold_imx662_project,
 )
@@ -182,6 +183,8 @@ LIGHTBOX_ILLUMINANTS = {
     "F11": "F11",  # F11 fluorescent
     "D50": "D50",  # D50 daylight
     "D65": "D65",  # D65 daylight
+    "D": "D50",    # HCG shorthand: cabinet_D_10
+    "F": "F11",    # HCG shorthand: cabinet_F_5
 }
 
 
@@ -211,7 +214,9 @@ def parse_scene_light(scene: str) -> tuple[str | None, int | None]:
     Examples::
 
         cabinet_D50_100  → ('D50', 100)       # D50 at 100 %
+        cabinet_D_10     → ('D50', 10)        # HCG: D at 10 %
         cabinet_F11_25   → ('F11', 25)        # F11 at 25 %
+        cabinet_F_5      → ('F11', 5)         # HCG: F at 5 %
         cabinet_H_2      → ('Halogen10', 2)   # halogen channel + 2 %
         cabinet_H_10     → ('Halogen10', 10)  # halogen channel + 10 %
 
@@ -256,6 +261,31 @@ def parse_panel_scene_lux(scene: str) -> float | None:
 
 def is_panel_scene(scene: str) -> bool:
     return parse_panel_scene_lux(scene) is not None
+
+
+def panel_scene_from_lux(lux: float) -> str:
+    """``cabinet_panel_<lux>`` with lux rounded to 2 decimal places."""
+    return f"cabinet_panel_{max(0.0, float(lux)):.2f}"
+
+
+def assign_panel_scene(station: Station, lux: float, project_root: Path | str) -> str:
+    """Name a panel stage from measured lux and wire burst/pair paths."""
+    project_root = Path(project_root)
+    scene = panel_scene_from_lux(lux)
+    pi_raw = project_root / "PI_RAW"
+    measured = round(float(lux), 2)
+    station.meta["scene"] = scene
+    station.meta["panel_lux"] = measured
+    station.meta["measured_lux"] = measured
+    station.meta["burst_root"] = str(project_root / "bursts" / scene)
+    station.meta["pair_root"] = str(pi_raw / "Data" / scene)
+    station.dest = project_root / "bursts" / scene / "take01"
+    station.station_id = f"burst_{scene}"
+    station.title = f"REAL PAIR SWEEP  ·  {scene}"
+    station.lux = max(1, int(round(measured)))
+    (station.dest).mkdir(parents=True, exist_ok=True)
+    (pi_raw / "Data" / scene).mkdir(parents=True, exist_ok=True)
+    return scene
 
 
 # --------------------------------------------------------------------------- #
@@ -689,8 +719,11 @@ def set_pi_hcg(ssh: str, enable: bool, subdev: str | None = None,
 
 
 def ensure_pi_hcg(ssh: str | None, want_hcg: bool, subdev: str | None = None,
-                  status: Callable[[str], None] = lambda _m: None) -> str | None:
-    """Configure and verify conversion gain on the Pi before ctt-server opens the camera."""
+                  status: Callable[[str], None] = lambda _m: None) -> dict | None:
+    """Configure and verify conversion gain on the Pi before ctt-server opens the camera.
+
+    Returns a status dict when SSH ran successfully, else None (no SSH, LCG only).
+    """
     if not ssh:
         if want_hcg:
             raise CTTError(
@@ -710,14 +743,14 @@ def ensure_pi_hcg(ssh: str | None, want_hcg: bool, subdev: str | None = None,
                 f"hcg_enable could not be read back from {used} — "
                 "cannot verify high conversion gain is active.")
         status(f"Warning: could not read back hcg_enable from {used}")
-        return used
+        return {"subdev": used, "hcg_enabled": False, "verified": False}
     if actual != want_hcg:
         want_txt = "enabled (1)" if want_hcg else "disabled (0)"
         got_txt = "enabled (1)" if actual else "disabled (0)"
         raise CTTError(
             f"hcg_enable verify failed on {used}: wanted {want_txt}, read {got_txt}.")
     status(f"Verified hcg_enable={'1' if want_hcg else '0'} on {used}")
-    return used
+    return {"subdev": used, "hcg_enabled": bool(want_hcg), "verified": True}
 
 
 def _discover_ctt_server(ssh: str) -> str | None:
@@ -1180,46 +1213,80 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     gain_sweep = parse_gain_sweep(getattr(args, "gain_sweep", None) or DEFAULT_GAIN_SWEEP)
     capture_sensor = normalize_capture_sensor(getattr(args, "capture_sensor", None))
     hcg_enabled = capture_sensor_hcg_enabled(capture_sensor)
-    scene_list = (ensure_hcg_panel_scenes(args.scenes) if hcg_enabled
-                  else ensure_manager_scenes(args.scenes))
-    for scene in scene_list:
+    if hcg_enabled:
+        stage_specs: list[tuple[str | None, dict]] = [
+            (s, {"panel_auto_name": False}) for s in HCG_ILLUM_SCENES
+        ]
+        for slot in range(1, HCG_PANEL_SLOT_COUNT + 1):
+            stage_specs.append((None, {"panel_auto_name": True, "panel_slot": slot}))
+    else:
+        stage_specs = [(s, {"panel_auto_name": False})
+                       for s in ensure_manager_scenes(args.scenes)]
+
+    for stage_idx, (scene, stage_meta) in enumerate(stage_specs, 1):
+        panel_auto = bool(stage_meta.get("panel_auto_name"))
+        panel_lux = parse_panel_scene_lux(scene) if scene else None
         if mode == "real":
             gains_txt = ", ".join(f"{g}×" for g in gain_sweep)
-            panel_lux = parse_panel_scene_lux(scene)
-            title = f"REAL PAIR SWEEP  ·  {scene}"
             hcg_note = (
                 "• Pi is set to high conversion gain (HCG) before the camera starts.\n"
                 if hcg_enabled else "")
-            if hcg_enabled:
-                lux_hint = (f"~{panel_lux:g} lux" if panel_lux is not None
-                            else "your target lux")
-                light_line = (
-                    f"• Set the light panel manually to extremely low lux "
-                    f"({lux_hint} — tune until metered exposure looks right).\n"
-                    "• Scene folder records the lux level: cabinet_panel_<lux>.\n")
+            if panel_auto:
+                slot = int(stage_meta["panel_slot"])
+                title = (f"REAL PAIR SWEEP  ·  Panel stage {stage_idx}/"
+                         f"{len(stage_specs)} (slot {slot})")
+                setup = (
+                    f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
+                    "• Set the light panel manually to extremely low lux.\n"
+                    "• CAPTURE names this stage cabinet_panel_<lux> from the "
+                    "measured lux (2 decimal places).\n"
+                    f"{hcg_note}"
+                    f"• CAPTURE averages more frames at higher gain for cleaner GT "
+                    f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
+                    f"gains {gains_txt}), dropping exposure as gain rises.\n"
+                    f"• → PI_RAW/Data/cabinet_panel_<lux>/{capture_sensor}_ag<GAIN>_test/"
+                )
+                scene_key = f"_panel_slot_{stage_meta['panel_slot']}"
+            elif hcg_enabled:
+                illum, pct = parse_scene_light(scene or "")
+                title = f"REAL PAIR SWEEP  ·  {scene}"
+                setup = (
+                    f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
+                    f"• Stage {stage_idx}/{len(stage_specs)}: auto-light "
+                    f"{illum or '?'} at {pct if pct is not None else '?'} % "
+                    "(extremely low lux).\n"
+                    f"{hcg_note}"
+                    f"• CAPTURE averages more frames at higher gain for cleaner GT "
+                    f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
+                    f"gains {gains_txt}), dropping exposure as gain rises.\n"
+                    f"• → PI_RAW/Data/{scene}/{capture_sensor}_ag<GAIN>_test/"
+                )
+                scene_key = scene or f"stage_{stage_idx}"
             else:
-                light_line = (
-                    "• Light it well (~100%, back off only if CLIPPING flags highlights).\n")
-            setup = (
-                f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
-                f"{light_line}"
-                f"{hcg_note}"
-                f"• CAPTURE averages more frames at higher gain for cleaner GT "
-                f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
-                f"gains {gains_txt}), dropping exposure as gain rises.\n"
-                f"• → PI_RAW/Data/{scene}/{capture_sensor}_ag<GAIN>_test/"
-            )
+                title = f"REAL PAIR SWEEP  ·  {scene}"
+                setup = (
+                    f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
+                    "• Light it well (~100%, back off only if CLIPPING flags highlights).\n"
+                    f"• CAPTURE averages more frames at higher gain for cleaner GT "
+                    f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}; "
+                    f"gains {gains_txt}), dropping exposure as gain rises.\n"
+                    f"• → PI_RAW/Data/{scene}/{capture_sensor}_ag<GAIN>_test/"
+                )
+                scene_key = scene or f"stage_{stage_idx}"
             meta = {
-                "scene": scene, "is_real_pair": True, "gain_sweep": list(gain_sweep),
-                "burst_root": str(project_root / "bursts" / scene),
-                "pair_root": str(pi_raw / "Data" / scene),
+                "scene": scene or "",
+                "is_real_pair": True, "gain_sweep": list(gain_sweep),
+                "burst_root": str(project_root / "bursts" / scene_key),
+                "pair_root": str(pi_raw / "Data" / scene_key),
                 "exp_min": exp_min, "exp_max": exp_max,
                 "capture_sensor": capture_sensor, "hcg_enabled": hcg_enabled,
+                "hcg_stage": stage_idx, "hcg_stage_total": len(stage_specs),
+                **stage_meta,
             }
             if panel_lux is not None:
                 meta["panel_lux"] = panel_lux
         else:
-            title = f"SCENE BURST  ·  {scene}"
+            title = f"SCENE BURST  ·  {scene or ('panel_' + str(stage_meta.get('panel_slot', stage_idx)))}"
             setup = (
                 f"• Rigid tripod, lens cap OFF. Nothing may move during the burst.\n"
                 "• Light it well — this is the CLEAN reference (low-light is\n"
@@ -1227,25 +1294,24 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 f"• CAPTURE meters once, locks exposure/gain, then shoots "
                 f"{args.burst_frames} frames to average."
             )
-            meta = {"scene": scene}
-        # CTT rejects "macbeth"-type captures with no (or non-positive) lux.
-        # Panel scenes use the lux suffix as a hint; measured lux wins at capture.
-        panel_lux = parse_panel_scene_lux(scene)
+            meta = {"scene": scene or "", **stage_meta}
+            scene_key = scene or f"_panel_slot_{stage_meta.get('panel_slot', stage_idx)}"
         if getattr(args, "lux", None) is not None:
             station_lux = int(args.lux)
         elif panel_lux is not None:
             station_lux = max(1, int(round(panel_lux)))
-        elif hcg_enabled:
+        elif panel_auto or hcg_enabled:
             station_lux = 3
         else:
             station_lux = 500
         stations.append(Station(
-            station_id=f"burst_{scene}",
+            station_id=(f"burst_{scene_key}" if not panel_auto
+                        else f"burst_panel_{stage_meta['panel_slot']}"),
             title=title,
             setup=setup,
             image_type="macbeth",
             frames=args.burst_frames,
-            dest=project_root / "bursts" / scene / "take01",
+            dest=project_root / "bursts" / scene_key / "take01",
             naming=lambda i: f"burst_{i:03d}.dng",
             controls=None,  # auto-meter then lock
             colour_temp=args.colour_temp,
@@ -1380,7 +1446,9 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
                   "clamped": clamped, "exposure_us": exposure,
                   "burst_frames": n_frames,
                   **({"panel_lux": station.meta["panel_lux"]}
-                     if station.meta.get("panel_lux") is not None else {})},
+                     if station.meta.get("panel_lux") is not None else {}),
+                  **({"measured_lux": station.meta["measured_lux"]}
+                     if station.meta.get("measured_lux") is not None else {})},
         )
         recs.append(Recorded(station=gstation, ctt_filenames=fnames))
         done_frames += n_frames
@@ -1594,7 +1662,10 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
             if st.meta.get("is_real_pair"):
                 scene = st.meta.get("scene", "")
                 panel_lux = st.meta.get("panel_lux")
-                if panel_lux is not None:
+                panel_auto = st.meta.get("panel_auto_name")
+                if panel_auto:
+                    extra += " · manual panel (name at capture)"
+                elif panel_lux is not None:
                     extra += f" · manual panel ~{panel_lux:g} lux"
                 else:
                     illum, _ = parse_scene_light(scene)
@@ -1616,7 +1687,25 @@ def run_wizard(client: CTTClient, transfer: Transfer, stations: list[Station],
         capture_lux = st.lux
         if st.meta.get("is_real_pair"):
             scene = st.meta.get("scene")
-            if st.meta.get("panel_lux") is None:
+            if st.meta.get("panel_auto_name"):
+                try:
+                    meas = client._settled_lux()
+                    if meas > 0:
+                        capture_lux = int(round(meas))
+                        project_root = Path(st.meta["burst_root"]).parent.parent
+                        assign_panel_scene(st, meas, project_root)
+                        log(f"Panel stage → {st.meta['scene']} "
+                            f"({meas:.2f} lux measured)", "ok")
+                    else:
+                        log("Panel stage: could not measure lux — set light "
+                            "manually and retry.", "err")
+                        if _prompt("[s]kip · [q]uit · [Enter] retry:") == "q":
+                            break
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    log(f"Panel lux measurement failed: {exc}", "err")
+                    continue
+            elif st.meta.get("panel_lux") is None:
                 illum, _ = parse_scene_light(scene)
                 if illum:
                     try:
@@ -2230,8 +2319,8 @@ def main() -> int:
     p.add_argument("--gain", type=int, default=256,
                    help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=None,
-                   help="scene folder names (default: cabinet_panel_<lux>×3 for "
-                        "imx662h HCG, else manager PI_RAW scenes)")
+                   help="scene folder names (default: cabinet_D_10,F_5,H_2 + 3 panel "
+                        "stages for imx662h HCG, else manager PI_RAW scenes)")
     p.add_argument("--colour-temp", type=int, default=5000)
     p.add_argument("--lux", type=int, default=None,
                    help="fallback lux metadata for CTT (measured lux used when available)")
@@ -2286,7 +2375,7 @@ def main() -> int:
     args = p.parse_args()
 
     if args.scenes is None:
-        args.scenes = (list(HCG_PANEL_SCENES)
+        args.scenes = (list(HCG_ILLUM_SCENES)
                        if capture_sensor_hcg_enabled(args.capture_sensor)
                        else list(MANAGER_SCENES))
 

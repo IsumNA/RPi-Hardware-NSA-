@@ -1984,7 +1984,7 @@ class CttCaptureWizard(tk.Toplevel):
         self.app = master
         import types
         import nsa_ctt_capture as backend
-        from nsa.dataset_layout import MANAGER_SCENES, HCG_PANEL_SCENES, ensure_manager_scenes
+        from nsa.dataset_layout import MANAGER_SCENES, HCG_ILLUM_SCENES, ensure_manager_scenes
         self.backend = backend
         self._types = types
         self.capture_sensor = self.backend.normalize_capture_sensor(capture_sensor)
@@ -2027,7 +2027,7 @@ class CttCaptureWizard(tk.Toplevel):
             value=", ".join(str(g) for g in backend.DEFAULT_GAIN_SWEEP))
         self.flatlevels_var = tk.StringVar(value="12")
         self.burst_var = tk.StringVar(value="48")
-        default_scenes = (HCG_PANEL_SCENES if self._hcg_mode else MANAGER_SCENES)
+        default_scenes = (HCG_ILLUM_SCENES if self._hcg_mode else MANAGER_SCENES)
         self.scenes_var = tk.StringVar(value=", ".join(default_scenes))
         self._sync_scenes_field()
         self.transfer_var = tk.StringVar(value="rsync")
@@ -2035,7 +2035,8 @@ class CttCaptureWizard(tk.Toplevel):
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
         self.autostart_var = tk.BooleanVar(value=True)
         self.cttcmd_var = tk.StringVar(value="~/ctt-venv/bin/ctt-server")
-        self.autolight_var = tk.BooleanVar(value=not self._hcg_mode)
+        self.autolight_var = tk.BooleanVar(value=True)
+        self._hcg_status: dict | None = None
         # Copy the finished PI_RAW pairs to the AI-server dataset root (and verify)
         # so training picks them up. Default: {USER}@ai:/opt/datasets/PI_RAW.
         self.publish_var = tk.BooleanVar(value=True)
@@ -2174,9 +2175,8 @@ class CttCaptureWizard(tk.Toplevel):
         ttk.Entry(grid, textvariable=self.scenes_var, font=font(10)).grid(
             row=6, column=1, columnspan=3, sticky="ew")
         scenes_help = (
-            "HCG: name each stage cabinet_panel_<lux> (e.g. cabinet_panel_2) — "
-            "set the panel manually to extremely low lux before each capture. "
-            "Edit the list to add/remove stages (~3 typical)."
+            "HCG: 6 stages — cabinet_D_10, cabinet_F_5, cabinet_H_2 (auto-light), "
+            "then 3 panel stages named cabinet_panel_<lux> from measured lux at capture."
             if self._hcg_mode else
             "Comma-separated scene folders under PI_RAW/Data/. "
             "Standard mode uses cabinet_D50_100, cabinet_F11_25, …")
@@ -2234,8 +2234,9 @@ class CttCaptureWizard(tk.Toplevel):
         tk.Label(
             parent,
             text=("Needs a lightSTUDIO-S on the Pi. "
-                  + ("HCG: leave auto-light OFF — tune the panel manually to very low lux, "
-                     "then RE-APPLY before CAPTURE. Scene names record cabinet_panel_<lux>."
+                  + ("Stages 1–3 auto-light from scene (D_10, F_5, H_2). "
+                     "Stages 4–6: set panel manually; folder becomes "
+                     "cabinet_panel_<measured lux> on CAPTURE."
                      if self._hcg_mode else
                      "Scenes named <name>_<illuminant>_<percent> "
                      "(e.g. cabinet_F11_25 → F11 at 25 %, cabinet_D50_100 → D50 at 100 %) "
@@ -2481,19 +2482,19 @@ class CttCaptureWizard(tk.Toplevel):
 
     def _sync_scenes_field(self):
         """Ensure the Scenes field lists every canonical scene for this sensor mode."""
-        from nsa.dataset_layout import ensure_manager_scenes, ensure_hcg_panel_scenes
+        from nsa.dataset_layout import ensure_manager_scenes, ensure_hcg_illuminant_scenes
         raw = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
         if self._hcg_mode:
-            merged = ensure_hcg_panel_scenes(raw)
+            merged = ensure_hcg_illuminant_scenes(raw)
         else:
             merged = ensure_manager_scenes(raw)
         self.scenes_var.set(", ".join(merged))
 
     def _args_namespace(self):
-        from nsa.dataset_layout import ensure_manager_scenes, ensure_hcg_panel_scenes
+        from nsa.dataset_layout import ensure_manager_scenes, ensure_hcg_illuminant_scenes
         raw = [s.strip() for s in self.scenes_var.get().split(",") if s.strip()]
         if self._hcg_mode:
-            scenes = list(ensure_hcg_panel_scenes(raw))
+            scenes = list(ensure_hcg_illuminant_scenes(raw))
         else:
             scenes = list(ensure_manager_scenes(raw))
         return self._types.SimpleNamespace(
@@ -2542,7 +2543,7 @@ class CttCaptureWizard(tk.Toplevel):
                     scenes=tuple(args.scenes),
                     flat_levels=max(2, args.flat_levels))
                 want_hcg = self.backend.capture_sensor_hcg_enabled(self.capture_sensor)
-                self.backend.ensure_pi_hcg(ssh, want_hcg, status=status)
+                hcg_status = self.backend.ensure_pi_hcg(ssh, want_hcg, status=status)
                 client = self.backend.CTTClient(host, port)
                 # SSH in and start ctt-server if it isn't answering yet.
                 self.backend.ensure_server(
@@ -2555,7 +2556,8 @@ class CttCaptureWizard(tk.Toplevel):
                 client.ensure_project(self.project_var.get().strip())
                 controls = client.get_controls()
                 plan = self.backend.build_plan(project_root, args, controls)
-                self.after(0, lambda: self._connected(client, project_root, plan))
+                self.after(0, lambda: self._connected(
+                    client, project_root, plan, hcg_status))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._connect_fail(str(e)))
 
@@ -2568,10 +2570,11 @@ class CttCaptureWizard(tk.Toplevel):
         self._set_status(f"Connect failed: {err}", "err")
         messagebox.showerror("Connect failed", err)
 
-    def _connected(self, client, project_root, plan):
+    def _connected(self, client, project_root, plan, hcg_status=None):
         self._set_busy(False)
         self._client = client
         self._project_root = project_root
+        self._hcg_status = hcg_status
         self._plan = plan
         self._idx = 0
         self._recorded = []
@@ -2612,12 +2615,34 @@ class CttCaptureWizard(tk.Toplevel):
             self.light_illum_combo.config(values=self._lightbox_illums)
 
         status = f"Connected — camera ready. {len(plan)} stations planned."
-        if self.backend.capture_sensor_hcg_enabled(self.capture_sensor):
-            status += "  HCG verified on Pi."
+        if self._hcg_mode and hcg_status and hcg_status.get("verified"):
+            if hcg_status.get("hcg_enabled"):
+                status += (f"  HCG ON (hcg_enable=1 @ {hcg_status.get('subdev', '?')}).")
+            else:
+                status += "  LCG verified (hcg_enable=0)."
+        elif self._hcg_mode:
+            status += "  HCG: not verified."
         if self._lightbox_present:
             status += f"  Lightbox: {lb.get('model', 'detected')}."
         self._warn_publish_dest()
         self._set_status(status, "ok")
+        if self._hcg_mode and hcg_status and hcg_status.get("hcg_enabled"):
+            if hcg_status.get("verified"):
+                messagebox.showinfo(
+                    "HCG confirmed",
+                    "High conversion gain is active on the Pi.\n\n"
+                    f"hcg_enable = 1 (read back OK)\n"
+                    f"V4L2 subdev: {hcg_status.get('subdev', '?')}\n\n"
+                    "Capture plan (6 stages):\n"
+                    "  1. cabinet_D_10\n"
+                    "  2. cabinet_F_5\n"
+                    "  3. cabinet_H_2\n"
+                    "  4–6. cabinet_panel_<lux> — lux from measurement at capture")
+            else:
+                messagebox.showerror(
+                    "HCG not verified",
+                    "IMX662-H was selected but hcg_enable could not be read back "
+                    "from the Pi. Do not capture until HCG is confirmed.")
         self._show_station_page()
         self._start_preview()
         self._poll_controls()
@@ -2725,17 +2750,18 @@ class CttCaptureWizard(tk.Toplevel):
         self._light_manual_override = False
         self._capture_lux = st.lux  # CTT requires a positive lux for macbeth captures
         is_scene = bool(st.meta.get("is_real_pair"))
-        panel_lux = st.meta.get("panel_lux")
+        panel_auto = bool(st.meta.get("panel_auto_name"))
+        panel_lux = st.meta.get("panel_lux") if not panel_auto else None
         if is_scene and self._lightbox_present:
             scene = st.meta.get("scene", "")
             illum, scene_pct = self.backend.parse_scene_light(scene)
             self.light_illum_var.set(illum or (self._lightbox_illums[0]
                                                 if self._lightbox_illums else ""))
-            if panel_lux is not None:
+            if panel_auto:
+                slot = st.meta.get("panel_slot", "?")
                 self.light_lbl.config(
-                    text=(f"Panel scene {scene}: set lux manually "
-                          f"(~{panel_lux:g} lux in folder name). "
-                          "Tune panel → SET → RE-APPLY → CAPTURE."),
+                    text=(f"Panel stage {slot}: set lux manually. "
+                          "CAPTURE names folder cabinet_panel_<measured lux>."),
                     fg=SUBTLE)
             elif scene_pct is not None and not self._light_manual_override:
                 self.light_pct_var.set(str(scene_pct))
@@ -2770,7 +2796,7 @@ class CttCaptureWizard(tk.Toplevel):
         auto_light = (bool(st.meta.get("is_real_pair")) and self._lightbox_present
                      and bool(self.autolight_var.get())
                      and not self._light_manual_override
-                     and st.meta.get("panel_lux") is None)
+                     and not st.meta.get("panel_auto_name"))
 
         try:
             pct = float(self.light_pct_var.get())
@@ -2841,7 +2867,7 @@ class CttCaptureWizard(tk.Toplevel):
                 text=f"{illum} at {pct:.0f}% → {meas:.0f} lux.  Adjust % + SET if needed.",
                 fg=SUBTLE)
         elif st.meta.get("is_real_pair") and self._lightbox_present:
-            if st.meta.get("panel_lux") is not None:
+            if st.meta.get("panel_auto_name"):
                 self.light_lbl.config(
                     text="Set panel to extremely low lux manually, then SET + RE-APPLY.",
                     fg=SUBTLE)
@@ -2882,6 +2908,30 @@ class CttCaptureWizard(tk.Toplevel):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _prepare_panel_stage(self, st) -> bool:
+        """Measure lux and assign cabinet_panel_<lux> before a panel capture."""
+        lux = self._capture_lux
+        if not lux or lux <= 0:
+            try:
+                lux = self._client._settled_lux()
+            except Exception:  # noqa: BLE001
+                lux = None
+        if not lux or lux <= 0:
+            messagebox.showerror(
+                "Panel stage",
+                "Could not measure lux.\n\n"
+                "Set the panel manually, click SET on the lightbox, "
+                "then RE-APPLY before CAPTURE.")
+            return False
+        scene = self.backend.assign_panel_scene(st, float(lux), self._project_root)
+        self.station_title.config(text=st.title)
+        self.setup_lbl.config(text=st.setup)
+        sensor = st.meta.get("capture_sensor", self.capture_sensor)
+        self.progress_lbl.config(
+            text=f"→ {st.meta['pair_root']}/{sensor}_ag<gain>_test")
+        self._set_status(f"Panel stage → {scene} ({float(lux):.2f} lux)", "ok")
+        return True
+
     def _capture(self):
         if self._busy or not self._plan:
             return
@@ -2894,6 +2944,8 @@ class CttCaptureWizard(tk.Toplevel):
 
         # Real-pair scenes sweep the whole gain series after this single setup.
         if st.meta.get("gain_sweep"):
+            if st.meta.get("panel_auto_name") and not self._prepare_panel_stage(st):
+                return
             if self._capture_lux:
                 st.lux = self._capture_lux
             self._set_busy(True)
@@ -4210,6 +4262,15 @@ class App(tk.Tk):
         result: dict[str, str | None] = {"v": None}
 
         def choose(v: str | None):
+            if v == "imx662h":
+                messagebox.showinfo(
+                    "IMX662-H selected",
+                    "High conversion gain mode.\n\n"
+                    "When you CONNECT, the wizard will SSH to the Pi, run "
+                    "v4l2-ctl hcg_enable=1 before the camera starts, and read "
+                    "the value back to confirm HCG is actually running.\n\n"
+                    "6 stages: cabinet_D_10, cabinet_F_5, cabinet_H_2, "
+                    "then 3× cabinet_panel_<lux> from measured lux.")
             result["v"] = v
             try:
                 dlg.grab_release()
@@ -4226,9 +4287,9 @@ class App(tk.Tk):
             body,
             text=("imx662 = standard (low conversion gain) — cabinet_D50_100, "
                   "cabinet_F11_25, … scenes with auto lightbox.\n"
-                  "imx662h = high conversion gain (hcg_enable=1) — extremely low lux "
-                  "via manual panel; stages named cabinet_panel_<lux> "
-                  "(default: cabinet_panel_10, cabinet_panel_5, cabinet_panel_2)."),
+                  "imx662h = high conversion gain — 6 stages: D_10, F_5, H_2 "
+                  "(auto-light), then 3× cabinet_panel_<lux> from measured lux. "
+                  "HCG is verified on CONNECT (hcg_enable=1 read back from Pi)."),
             bg=WHITE, fg=SUBTLE, font=font(9), justify="left",
         ).pack(anchor="w", pady=(0, S(16)))
         btn_row = tk.Frame(body, bg=WHITE)

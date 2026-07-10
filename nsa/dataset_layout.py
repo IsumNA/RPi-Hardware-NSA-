@@ -43,14 +43,14 @@ MANAGER_SCENES: tuple[str, ...] = (
     "colour_stripes",
 )
 
-# HCG (imx662h): extremely low lux via a manually tuned light panel.  The suffix
-# on ``cabinet_panel_<lux>`` is the lux level you record in the folder name
-# (e.g. cabinet_panel_2, cabinet_panel_5, cabinet_panel_10).
-HCG_PANEL_SCENES: tuple[str, ...] = (
-    "cabinet_panel_10",
-    "cabinet_panel_5",
-    "cabinet_panel_2",
+# HCG (imx662h): 6-stage low-lux capture — illuminant scenes then panel stages
+# whose folder names are set from measured lux at capture time.
+HCG_ILLUM_SCENES: tuple[str, ...] = (
+    "cabinet_D_10",
+    "cabinet_F_5",
+    "cabinet_H_2",
 )
+HCG_PANEL_SLOT_COUNT = 3
 
 
 def ensure_manager_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
@@ -71,20 +71,9 @@ def ensure_manager_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
     return tuple(out)
 
 
-def ensure_hcg_panel_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
-    """Keep the user's panel-scene order; default to ``HCG_PANEL_SCENES`` when empty."""
-    if scenes is None:
-        return HCG_PANEL_SCENES
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in scenes:
-        s = str(raw).strip()
-        if s and s not in seen:
-            out.append(s)
-            seen.add(s)
-    if not out:
-        return HCG_PANEL_SCENES
-    return tuple(out)
+def ensure_hcg_illuminant_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
+    """Fixed illuminant stages for HCG scaffolding (panel stages are named at capture)."""
+    return HCG_ILLUM_SCENES
 
 
 # denoise-hw analogue-gain tags already shot for IMX219 / legacy work.
