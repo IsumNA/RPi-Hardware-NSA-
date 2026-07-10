@@ -33,7 +33,7 @@ sensor:
   #   imx219  -> legacy Camera Module v2 (noisy, messy chroma)
   #   imx662  -> current Starvis 2 (low read noise)
   #   imxng   -> unreleased next-gen low-light Starvis 2 (shot-noise limited)
-  sensor: imx219
+  sensor: imx662
   # Path to a real Bayer RAW frame. If null or missing, the stack synthesises a
   # physically-plausible RAW for the chosen sensor so the demo runs out-of-the-box.
   input_raw: null
@@ -44,12 +44,19 @@ sensor:
   #                          e.g. a cloned repo of IMX219 frames. A frame is picked
   #                          per-seed so re-runs can show different captures.
   real_capture: true
-  dataset_path: datasets/PI_RAW   # denoise-hw PI_RAW layout (run setup_denoise_hw_data.py)
+  # /opt/datasets/PI_RAW is the real, shared capture set on the AI server (many
+  # scenes x the full imx662/imx662h analogue-gain sweep). The repo-relative
+  # "datasets/PI_RAW" is only a tiny bundled synthetic sample for offline demos
+  # off this machine — point back to that if /opt/datasets/PI_RAW isn't present.
+  dataset_path: /opt/datasets/PI_RAW
   # Paired folders (a noisy.* + gt.* per folder, the denoise-hw convention) are
   # auto-detected and used as real ground truth. simulate_noise injects the
   # selected sensor's physics on top of loaded frames (clean -> noisy).
   simulate_noise: false
-  filter: [imx219, ag12]    # denoise-hw test scene filter (cabinet_D50_100/imx219_ag12_test)
+  # "imx662" substring-matches BOTH imx662_ag*_test and imx662h_ag*_test folders
+  # (HCG is a folder-naming variant, not a separate sensor key) — this sweeps
+  # every scene and every gain (ag1..ag512) for both variants.
+  filter: [imx662]
   gain: 256                 # analog gain multiplier (256 = moderate; 512 = stress test)
   # Override the standard deviation of the injected Gaussian read noise, in
   # electrons RMS (the denoise-hw noise-floor knob). null keeps the sensor's
@@ -68,9 +75,10 @@ optimization:
   calibration_steps: 300    # live calibration iterations (batch of augmented crops)
   patch_size: 192           # working resolution for the live demo (square crop)
   # Extended training: after the quick calibration, keep training on EVERY paired
-  # image in the dataset (e.g. all of PI_RAW) for a much stronger denoiser. Off by
-  # default (slower); turn on for best quality when you have a real dataset.
-  extended_train: false
+  # image in the dataset (e.g. all of PI_RAW) for a much stronger denoiser. On by
+  # default now that dataset_path points at the real /opt/datasets/PI_RAW sweep;
+  # set to false to go back to a quick single-folder calibration pass.
+  extended_train: true
   extended_steps: 1500      # optimizer steps for the extended full-dataset pass
   extended_max_side: 1024   # cap image long-side when loading full frames
   # Training objective. name: charbonnier | l1 | l2 | huber | ssim | charbonnier_ssim
