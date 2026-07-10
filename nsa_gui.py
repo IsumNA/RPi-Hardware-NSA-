@@ -1805,7 +1805,7 @@ class NoiseDatasetWizard(tk.Toplevel):
                        f"validation={'PASS' if ok else 'CHECK'}")
                 self.after(0, lambda: self._calibrate_done(out, msg, ok))
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._calibrate_fail(str(exc)))
+                self.after(0, lambda e=exc: self._calibrate_fail(str(e)))
 
         self._set_busy(True)
         self._set_status("Running Phases 2–4 (extract → fit → validate)…")
@@ -1869,7 +1869,7 @@ class NoiseDatasetWizard(tk.Toplevel):
                 wf = manifest.get("workflow", "")
                 self.after(0, lambda: self._synth_done(out, n, wf))
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._synth_fail(str(exc)))
+                self.after(0, lambda e=exc: self._synth_fail(str(e)))
 
         self._set_busy(True)
         self._set_status("Phase 5: synthesizing noisy/gt pairs…")
@@ -1951,7 +1951,7 @@ class NoiseDatasetWizard(tk.Toplevel):
                 ok = validation.get("ok", True)
                 self.after(0, lambda: self._all_done(out_ds, n, ok))
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._synth_fail(str(exc)))
+                self.after(0, lambda e=exc: self._synth_fail(str(e)))
 
         self._set_busy(True)
         threading.Thread(target=chain, daemon=True).start()
@@ -2843,9 +2843,9 @@ class CttCaptureWizard(tk.Toplevel):
                         meas = self._client._settled_lux()
                         light_info = (illum, use_pct, meas)
                 applied = self.backend._apply_controls(self._client, st)
-                self.after(0, lambda: self._applied(applied, light_info))
+                self._ui_call(self._applied, applied, light_info)
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda e=exc: self._set_status(f"Apply failed: {e}", "err"))
+                self._ui_call(self._set_status, f"Apply failed: {exc}", "err")
 
         self._set_busy(True)
         self._set_status("Applying camera settings…" if not auto_light
@@ -2853,6 +2853,8 @@ class CttCaptureWizard(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     def _applied(self, applied: dict, light_info: tuple | None = None):
+        if not self._ui_alive():
+            return
         self._set_busy(False)
         st = self._plan[self._idx]
         mode = "auto-metered then locked" if st.controls is None else "locked"
@@ -2918,12 +2920,13 @@ class CttCaptureWizard(tk.Toplevel):
                 meas = self._client._settled_lux()
                 if meas > 0:
                     self._capture_lux = self.backend.ctt_capture_lux(meas, fallback=1)
-                self.after(0, lambda: self._set_status(
+                self._ui_call(
+                    self._set_status,
                     f"Lightbox set to {illum} at {pct:.0f}% (measured {meas:.0f} lux). "
-                    "Press RE-APPLY to re-lock exposure to this light.", "ok"))
+                    "Press RE-APPLY to re-lock exposure to this light.",
+                    "ok")
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda e=exc: self._set_status(
-                    f"Lightbox set failed: {e}", "err"))
+                self._ui_call(self._set_status, f"Lightbox set failed: {exc}", "err")
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -3363,7 +3366,7 @@ class CttCaptureWizard(tk.Toplevel):
                 self._progress_end()
                 self.after(0, lambda: self._finished(total_placed))
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._finish_fail(str(exc)))
+                self.after(0, lambda e=exc: self._finish_fail(str(e)))
 
         self._set_busy(True)
         threading.Thread(target=work, daemon=True).start()
@@ -3937,8 +3940,9 @@ class App(tk.Tk):
 
         # Initialise dependent UI state, then show the quick-run home screen.
         self._wizard_mode = "home"
-        self._apply_denoise_hw_defaults()
-        self._apply_gui_state(self._load_gui_state())   # last-used settings win
+        saved = self._load_gui_state()
+        self._apply_gui_state(saved)          # restore last wizard session
+        self._apply_denoise_hw_defaults()     # config.yaml wins over stale session
         self._step = 0
         self._on_sensor_change()
         self._on_mode_change()
@@ -4014,7 +4018,7 @@ class App(tk.Tk):
 
         self.filter_var = self._entry_row(
             body, "filter", "Dataset Filter",
-            "Keyword filter for folders (e.g. imx219 ag12)", "imx219 ag12")
+            "Keyword filter for folders (e.g. imx662 or imx219 ag12)", "imx662")
         self.sim_noise_cb = self._check(
             body, "Simulate sensor noise on loaded frames",
             "Inject the selected sensor's physics on top of the real frames.",
@@ -4773,6 +4777,9 @@ class App(tk.Tk):
     def _gui_state(self) -> dict:
         """Snapshot every user-facing wizard choice into a JSON-safe dict."""
         state: dict = {"rows": {}, "entries": {}, "vars": {}}
+        cfg_path = ROOT / "config.yaml"
+        if cfg_path.is_file():
+            state["config_mtime"] = cfg_path.stat().st_mtime
         for key in (self._STATE_SIMPLE_ROWS + self._STATE_MODEL_ROWS
                     + ("model_family", "loss")):
             row = self.rows.get(key)
@@ -4798,6 +4805,14 @@ class App(tk.Tk):
         """Re-apply a saved snapshot, honouring the family/loss render order."""
         if not state:
             return
+        cfg_path = ROOT / "config.yaml"
+        if cfg_path.is_file() and state.get("config_mtime") != cfg_path.stat().st_mtime:
+            # config.yaml changed since this session was saved — don't restore
+            # compilation-profile fields; fresh defaults come from the yaml next.
+            state = {
+                "vars": {k: v for k, v in (state.get("vars") or {}).items()
+                         if k in ("eval_var",)},
+            }
         try:
             rows = state.get("rows", {})
             entries = state.get("entries", {})
