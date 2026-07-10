@@ -43,17 +43,18 @@ MANAGER_SCENES: tuple[str, ...] = (
     "colour_stripes",
 )
 
-# HCG (imx662h): 6-stage low-lux capture — illuminant scenes then panel stages
-# whose folder names are set from measured lux at capture time.
+# HCG (imx662h): illuminant scenes then panel stages whose folder names are
+# set from measured lux at capture time (H / F / N variants).
 HCG_ILLUM_SCENES: tuple[str, ...] = (
     "cabinet_D_10",
     "cabinet_F_5",
     "cabinet_H_2",
 )
-HCG_PANEL_SLOT_COUNT = 6
-HCG_PANEL_SLOTS_PER_VARIANT = 3  # 3× panel_H_<lux>, 3× panel_F_<lux>
-# Panel stages (manual lux) only sweep high gains — skip 1–32×.
-HCG_PANEL_GAIN_SWEEP: tuple[int, ...] = (64, 128, 256)
+HCG_PANEL_VARIANTS: tuple[str, ...] = ("H", "F", "N")
+HCG_PANEL_SLOTS_PER_VARIANT = 3  # 3× panel_H_<lux>, 3× panel_F_<lux>, 3× panel_N_<lux>
+HCG_PANEL_SLOT_COUNT = len(HCG_PANEL_VARIANTS) * HCG_PANEL_SLOTS_PER_VARIANT
+# Panel stages (manual lux) only sweep high gains — skip 1–64×.
+HCG_PANEL_GAIN_SWEEP: tuple[int, ...] = (128, 256, 512)
 
 
 def ensure_manager_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:

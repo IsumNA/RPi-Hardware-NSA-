@@ -2175,9 +2175,10 @@ class CttCaptureWizard(tk.Toplevel):
         ttk.Entry(grid, textvariable=self.scenes_var, font=font(10)).grid(
             row=6, column=1, columnspan=3, sticky="ew")
         scenes_help = (
-            "HCG: 9 stages — cabinet_D_10, cabinet_F_5, cabinet_H_2 (auto-light), "
-            "then 3× cabinet_panel_H_<lux> + 3× cabinet_panel_F_<lux> at capture "
-            "(gains 64, 128, 256 only for panels)."
+            "HCG: 12 stages — cabinet_D_10, cabinet_F_5, cabinet_H_2 (auto-light), "
+            "then 3× cabinet_panel_H_<lux> + 3× cabinet_panel_F_<lux> "
+            "+ 3× cabinet_panel_N_<lux> at capture "
+            "(panel gains 128, 256, 512 only)."
             if self._hcg_mode else
             "Comma-separated scene folders under PI_RAW/Data/. "
             "Standard mode uses cabinet_D50_100, cabinet_F11_25, …")
@@ -2236,8 +2237,8 @@ class CttCaptureWizard(tk.Toplevel):
             parent,
             text=("Needs a lightSTUDIO-S on the Pi. "
                   + ("Stages 1–3 auto-light from scene (D_10, F_5, H_2). "
-                     "Stages 4–9: set halogen (H) or F11 (F) panel manually; folders "
-                     "become cabinet_panel_H_<lux> or cabinet_panel_F_<lux> on CAPTURE."
+                     "Stages 4–12: set halogen (H), F11 (F), or neutral (N) panel "
+                     "manually; folders become cabinet_panel_{H|F|N}_<lux> on CAPTURE."
                      if self._hcg_mode else
                      "Scenes named <name>_<illuminant>_<percent> "
                      "(e.g. cabinet_F11_25 → F11 at 25 %, cabinet_D50_100 → D50 at 100 %) "
@@ -2639,12 +2640,13 @@ class CttCaptureWizard(tk.Toplevel):
                     "High conversion gain is active on the Pi.\n\n"
                     f"hcg_enable = 1 (read back OK)\n"
                     f"V4L2 subdev: {hcg_status.get('subdev', '?')}\n\n"
-                    "Capture plan (9 stages):\n"
+                    "Capture plan (12 stages):\n"
                     "  1. cabinet_D_10\n"
                     "  2. cabinet_F_5\n"
                     "  3. cabinet_H_2\n"
                     "  4–6. cabinet_panel_H_<lux>\n"
-                    "  7–9. cabinet_panel_F_<lux> (gains 64, 128, 256 only)")
+                    "  7–9. cabinet_panel_F_<lux>\n"
+                    "  10–12. cabinet_panel_N_<lux> (gains 128, 256, 512 only)")
             else:
                 messagebox.showerror(
                     "HCG not verified",
@@ -2767,7 +2769,7 @@ class CttCaptureWizard(tk.Toplevel):
             if panel_auto:
                 slot = st.meta.get("panel_slot", "?")
                 variant = st.meta.get("panel_variant", "?")
-                panel_label = "halogen" if variant == "H" else "F11 fluorescent"
+                panel_label = self.backend.PANEL_VARIANT_LABELS.get(variant, variant)
                 self.light_lbl.config(
                     text=(f"Panel {variant} stage {slot}: set {panel_label} manually. "
                           f"CAPTURE → cabinet_panel_{variant}_<measured lux>."),
@@ -2918,13 +2920,11 @@ class CttCaptureWizard(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     def _prepare_panel_stage(self, st) -> bool:
-        """Measure lux and assign cabinet_panel_{H|F}_<lux> before a panel capture."""
-        lux = self._capture_lux
-        if not lux or lux <= 0:
-            try:
-                lux = self._client._settled_lux()
-            except Exception:  # noqa: BLE001
-                lux = None
+        """Measure lux and assign cabinet_panel_{H|F|N}_<lux> before a panel capture."""
+        try:
+            lux = self._client._settled_lux()
+        except Exception:  # noqa: BLE001
+            lux = None
         if not lux or lux <= 0:
             messagebox.showerror(
                 "Panel stage",
@@ -2933,6 +2933,7 @@ class CttCaptureWizard(tk.Toplevel):
                 "then RE-APPLY before CAPTURE.")
             return False
         scene = self.backend.assign_panel_scene(st, float(lux), self._project_root)
+        self._capture_lux = self.backend.ctt_capture_lux(float(lux), fallback=1)
         self.station_title.config(text=st.title)
         self.setup_lbl.config(text=st.setup)
         sensor = st.meta.get("capture_sensor", self.capture_sensor)
@@ -4278,9 +4279,10 @@ class App(tk.Tk):
                     "When you CONNECT, the wizard will SSH to the Pi, run "
                     "v4l2-ctl hcg_enable=1 before the camera starts, and read "
                     "the value back to confirm HCG is actually running.\n\n"
-                    "9 stages: cabinet_D_10, cabinet_F_5, cabinet_H_2, "
+                    "12 stages: cabinet_D_10, cabinet_F_5, cabinet_H_2, "
                     "then 3× cabinet_panel_H_<lux> + 3× cabinet_panel_F_<lux> "
-                    "(panel gains 64, 128, 256 only).")
+                    "+ 3× cabinet_panel_N_<lux> "
+                    "(panel gains 128, 256, 512 only).")
             result["v"] = v
             try:
                 dlg.grab_release()
@@ -4297,10 +4299,10 @@ class App(tk.Tk):
             body,
             text=("imx662 = standard (low conversion gain) — cabinet_D50_100, "
                   "cabinet_F11_25, … scenes with auto lightbox.\n"
-                  "imx662h = high conversion gain — 9 stages: D_10, F_5, H_2 "
-                  "(auto-light, full gain sweep), then 3× cabinet_panel_H_<lux> "
-                  "and 3× cabinet_panel_F_<lux> from measured lux "
-                  "(panel gains 64, 128, 256 only). "
+                  "imx662h = high conversion gain — 12 stages: D_10, F_5, H_2 "
+                  "(auto-light, full gain sweep), then 3× cabinet_panel_H_<lux>, "
+                  "3× cabinet_panel_F_<lux>, and 3× cabinet_panel_N_<lux> from "
+                  "measured lux (panel gains 128, 256, 512 only). "
                   "HCG is verified on CONNECT (hcg_enable=1 read back from Pi)."),
             bg=WHITE, fg=SUBTLE, font=font(9), justify="left",
         ).pack(anchor="w", pady=(0, S(16)))

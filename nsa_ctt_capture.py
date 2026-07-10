@@ -64,6 +64,7 @@ from nsa.dataset_layout import (
     HCG_PANEL_SLOT_COUNT,
     HCG_PANEL_GAIN_SWEEP,
     HCG_PANEL_SLOTS_PER_VARIANT,
+    HCG_PANEL_VARIANTS,
     ensure_manager_scenes,
     ensure_hcg_illuminant_scenes,
     resolve_layout,
@@ -257,11 +258,15 @@ def scene_lightbox_percent(scene: str, *, override: float | None = None) -> floa
 
 
 _PANEL_SCENE_RE = re.compile(
-    r"^cabinet_panel_(?P<variant>H|F)_(?P<lux>[\d.]+)$", re.IGNORECASE)
+    rf"^cabinet_panel_(?P<variant>{'|'.join(HCG_PANEL_VARIANTS)})_(?P<lux>[\d.]+)$",
+    re.IGNORECASE)
+
+
+PANEL_VARIANT_LABELS = {"H": "halogen", "F": "fluorescent (F11)", "N": "neutral"}
 
 
 def parse_panel_scene_lux(scene: str) -> float | None:
-    """Parse ``cabinet_panel_H_<lux>`` / ``cabinet_panel_F_<lux>`` scene names."""
+    """Parse ``cabinet_panel_{H|F|N}_<lux>`` scene names."""
     m = _PANEL_SCENE_RE.match(str(scene).strip())
     if not m:
         return None
@@ -272,7 +277,7 @@ def parse_panel_scene_lux(scene: str) -> float | None:
 
 
 def parse_panel_scene_variant(scene: str) -> str | None:
-    """Return ``H`` or ``F`` from a panel scene name, or None."""
+    """Return ``H``, ``F``, or ``N`` from a panel scene name, or None."""
     m = _PANEL_SCENE_RE.match(str(scene).strip())
     return m.group("variant").upper() if m else None
 
@@ -285,16 +290,27 @@ PANEL_LUX_DECIMALS = 3
 
 
 def panel_scene_from_lux(lux: float, variant: str = "H") -> str:
-    """``cabinet_panel_{H|F}_<lux>`` with lux rounded to 3 decimal places."""
+    """``cabinet_panel_{H|F|N}_<lux>`` with lux rounded to 3 decimal places."""
     v = (variant or "H").strip().upper()
-    if v not in ("H", "F"):
+    if v not in HCG_PANEL_VARIANTS:
         v = "H"
     return f"cabinet_panel_{v}_{max(0.0, float(lux)):.{PANEL_LUX_DECIMALS}f}"
 
 
 def panel_variant_for_slot(slot: int) -> str:
-    """Slots 1–3 → H (halogen panel), 4–6 → F (fluorescent panel)."""
-    return "H" if int(slot) <= HCG_PANEL_SLOTS_PER_VARIANT else "F"
+    """Slots 1–3 → H, 4–6 → F, 7–9 → N."""
+    idx = (max(1, int(slot)) - 1) // HCG_PANEL_SLOTS_PER_VARIANT
+    return HCG_PANEL_VARIANTS[min(idx, len(HCG_PANEL_VARIANTS) - 1)]
+
+
+def is_panel_capture_stage(meta: dict) -> bool:
+    """True for HCG manual-lux panel slots (never use the full GUI gain sweep)."""
+    return bool(meta.get("panel_auto_name")) or is_panel_scene(meta.get("scene") or "")
+
+
+def panel_stage_gain_sweep(meta: dict | None = None) -> list[int]:
+    """Gain list for panel stages — always the fixed high-gain trio."""
+    return list(HCG_PANEL_GAIN_SWEEP)
 
 
 def assign_panel_scene(station: Station, lux: float, project_root: Path | str) -> str:
@@ -315,6 +331,8 @@ def assign_panel_scene(station: Station, lux: float, project_root: Path | str) -
     station.station_id = f"burst_{scene}"
     station.title = f"REAL PAIR SWEEP  ·  {scene}"
     station.lux = ctt_capture_lux(measured, fallback=1)
+    if is_panel_capture_stage(station.meta):
+        station.meta["gain_sweep"] = panel_stage_gain_sweep()
     (station.dest).mkdir(parents=True, exist_ok=True)
     (pi_raw / "Data" / scene).mkdir(parents=True, exist_ok=True)
     return scene
@@ -1267,7 +1285,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
     for stage_idx, (scene, stage_meta) in enumerate(stage_specs, 1):
         panel_auto = bool(stage_meta.get("panel_auto_name"))
         panel_lux = parse_panel_scene_lux(scene) if scene else None
-        stage_gain_sweep = (list(HCG_PANEL_GAIN_SWEEP) if panel_auto
+        stage_gain_sweep = (panel_stage_gain_sweep() if panel_auto
                             else list(gain_sweep))
         if mode == "real":
             gains_txt = ", ".join(f"{g}×" for g in stage_gain_sweep)
@@ -1277,7 +1295,7 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             if panel_auto:
                 slot = int(stage_meta["panel_slot"])
                 variant = stage_meta.get("panel_variant", panel_variant_for_slot(slot))
-                panel_label = "halogen" if variant == "H" else "fluorescent (F11)"
+                panel_label = PANEL_VARIANT_LABELS.get(variant, variant)
                 title = (f"REAL PAIR SWEEP  ·  Panel {variant} "
                          f"stage {stage_idx}/{len(stage_specs)} (slot {slot})")
                 setup = (
@@ -1435,8 +1453,12 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
     if not scene:
         raise CTTError(
             "panel stage has no scene name yet — measure lux and assign "
-            "cabinet_panel_H_<lux> or cabinet_panel_F_<lux> before CAPTURE.")
-    gains = list(meta["gain_sweep"])
+            "cabinet_panel_H_<lux>, cabinet_panel_F_<lux>, or "
+            "cabinet_panel_N_<lux> before CAPTURE.")
+    gains = (panel_stage_gain_sweep(meta) if is_panel_capture_stage(meta)
+             else list(meta.get("gain_sweep") or []))
+    if not gains:
+        raise CTTError("gain sweep has no gains configured for this station.")
     burst_root = Path(meta["burst_root"])
     pair_root = Path(meta["pair_root"])
     sensor_tag = meta.get("capture_sensor", CAPTURE_SENSOR_IMX662)
