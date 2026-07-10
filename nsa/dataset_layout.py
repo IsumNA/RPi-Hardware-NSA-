@@ -50,7 +50,8 @@ HCG_ILLUM_SCENES: tuple[str, ...] = (
     "cabinet_F_5",
     "cabinet_H_2",
 )
-HCG_PANEL_SLOT_COUNT = 5
+HCG_PANEL_SLOT_COUNT = 6
+HCG_PANEL_SLOTS_PER_VARIANT = 3  # 3× panel_H_<lux>, 3× panel_F_<lux>
 # Panel stages (manual lux) only sweep high gains — skip 1–32×.
 HCG_PANEL_GAIN_SWEEP: tuple[int, ...] = (64, 128, 256)
 

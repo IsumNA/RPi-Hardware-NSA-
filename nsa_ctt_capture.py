@@ -63,6 +63,7 @@ from nsa.dataset_layout import (
     HCG_ILLUM_SCENES,
     HCG_PANEL_SLOT_COUNT,
     HCG_PANEL_GAIN_SWEEP,
+    HCG_PANEL_SLOTS_PER_VARIANT,
     ensure_manager_scenes,
     ensure_hcg_illuminant_scenes,
     resolve_layout,
@@ -255,11 +256,12 @@ def scene_lightbox_percent(scene: str, *, override: float | None = None) -> floa
     return DEFAULT_LIGHTBOX_PERCENT
 
 
-_PANEL_SCENE_RE = re.compile(r"^cabinet_panel_(?P<lux>[\d.]+)$", re.IGNORECASE)
+_PANEL_SCENE_RE = re.compile(
+    r"^cabinet_panel_(?P<variant>H|F)_(?P<lux>[\d.]+)$", re.IGNORECASE)
 
 
 def parse_panel_scene_lux(scene: str) -> float | None:
-    """Parse ``cabinet_panel_<lux>`` scene names (HCG manual-panel captures)."""
+    """Parse ``cabinet_panel_H_<lux>`` / ``cabinet_panel_F_<lux>`` scene names."""
     m = _PANEL_SCENE_RE.match(str(scene).strip())
     if not m:
         return None
@@ -269,24 +271,41 @@ def parse_panel_scene_lux(scene: str) -> float | None:
         return None
 
 
+def parse_panel_scene_variant(scene: str) -> str | None:
+    """Return ``H`` or ``F`` from a panel scene name, or None."""
+    m = _PANEL_SCENE_RE.match(str(scene).strip())
+    return m.group("variant").upper() if m else None
+
+
 def is_panel_scene(scene: str) -> bool:
     return parse_panel_scene_lux(scene) is not None
 
 
-def panel_scene_from_lux(lux: float) -> str:
-    """``cabinet_panel_<lux>`` with lux rounded to 2 decimal places."""
-    return f"cabinet_panel_{max(0.0, float(lux)):.2f}"
+def panel_scene_from_lux(lux: float, variant: str = "H") -> str:
+    """``cabinet_panel_{H|F}_<lux>`` with lux rounded to 2 decimal places."""
+    v = (variant or "H").strip().upper()
+    if v not in ("H", "F"):
+        v = "H"
+    return f"cabinet_panel_{v}_{max(0.0, float(lux)):.2f}"
+
+
+def panel_variant_for_slot(slot: int) -> str:
+    """Slots 1–3 → H (halogen panel), 4–6 → F (fluorescent panel)."""
+    return "H" if int(slot) <= HCG_PANEL_SLOTS_PER_VARIANT else "F"
 
 
 def assign_panel_scene(station: Station, lux: float, project_root: Path | str) -> str:
     """Name a panel stage from measured lux and wire burst/pair paths."""
     project_root = Path(project_root)
-    scene = panel_scene_from_lux(lux)
+    variant = station.meta.get("panel_variant") or panel_variant_for_slot(
+        station.meta.get("panel_slot", 1))
+    scene = panel_scene_from_lux(lux, variant)
     pi_raw = project_root / "PI_RAW"
     measured = round(float(lux), 2)
     station.meta["scene"] = scene
     station.meta["panel_lux"] = measured
     station.meta["measured_lux"] = measured
+    station.meta["panel_variant"] = variant
     station.meta["burst_root"] = str(project_root / "bursts" / scene)
     station.meta["pair_root"] = str(pi_raw / "Data" / scene)
     station.dest = project_root / "bursts" / scene / "take01"
@@ -1233,7 +1252,11 @@ def build_plan(project_root: Path, args: argparse.Namespace,
             (s, {"panel_auto_name": False}) for s in HCG_ILLUM_SCENES
         ]
         for slot in range(1, HCG_PANEL_SLOT_COUNT + 1):
-            stage_specs.append((None, {"panel_auto_name": True, "panel_slot": slot}))
+            stage_specs.append((None, {
+                "panel_auto_name": True,
+                "panel_slot": slot,
+                "panel_variant": panel_variant_for_slot(slot),
+            }))
     else:
         stage_specs = [(s, {"panel_auto_name": False})
                        for s in ensure_manager_scenes(args.scenes)]
@@ -1250,20 +1273,23 @@ def build_plan(project_root: Path, args: argparse.Namespace,
                 if hcg_enabled else "")
             if panel_auto:
                 slot = int(stage_meta["panel_slot"])
-                title = (f"REAL PAIR SWEEP  ·  Panel stage {stage_idx}/"
-                         f"{len(stage_specs)} (slot {slot})")
+                variant = stage_meta.get("panel_variant", panel_variant_for_slot(slot))
+                panel_label = "halogen" if variant == "H" else "fluorescent (F11)"
+                title = (f"REAL PAIR SWEEP  ·  Panel {variant} "
+                         f"stage {stage_idx}/{len(stage_specs)} (slot {slot})")
                 setup = (
                     f"• Rigid tripod, lens cap OFF. Nothing may move during the sweep.\n"
-                    "• Set the light panel manually to extremely low lux.\n"
-                    "• CAPTURE names this stage cabinet_panel_<lux> from the "
-                    "measured lux (2 decimal places).\n"
+                    f"• Set the {panel_label} panel manually to extremely low lux.\n"
+                    f"• CAPTURE names this stage cabinet_panel_{variant}_<lux> from "
+                    "the measured lux (2 decimal places).\n"
                     f"{hcg_note}"
                     f"• Panel stages sweep high gains only ({gains_txt}) — "
                     f"not the full 1–512 series.\n"
                     f"• CAPTURE averages more frames at higher gain for cleaner GT "
                     f"(base {args.burst_frames} @ 1×, up to {GT_BURST_MAX_FRAMES}), "
                     f"dropping exposure as gain rises.\n"
-                    f"• → PI_RAW/Data/cabinet_panel_<lux>/{capture_sensor}_ag<GAIN>_test/"
+                    f"• → PI_RAW/Data/cabinet_panel_{variant}_<lux>/"
+                    f"{capture_sensor}_ag<GAIN>_test/"
                 )
                 scene_key = f"_panel_slot_{stage_meta['panel_slot']}"
             elif hcg_enabled:
@@ -1406,7 +1432,7 @@ def capture_gain_sweep(client: CTTClient, project: str, station: Station, *,
     if not scene:
         raise CTTError(
             "panel stage has no scene name yet — measure lux and assign "
-            "cabinet_panel_<lux> before CAPTURE.")
+            "cabinet_panel_H_<lux> or cabinet_panel_F_<lux> before CAPTURE.")
     gains = list(meta["gain_sweep"])
     burst_root = Path(meta["burst_root"])
     pair_root = Path(meta["pair_root"])
@@ -2348,7 +2374,7 @@ def main() -> int:
     p.add_argument("--gain", type=int, default=256,
                    help="operating/calibration gain (folder imx662_gain<N>)")
     p.add_argument("--scenes", nargs="+", default=None,
-                   help="scene folder names (default: cabinet_D_10,F_5,H_2 + 5 panel "
+                   help="scene folder names (default: cabinet_D_10,F_5,H_2 + 6 panel "
                         "stages for imx662h HCG, else manager PI_RAW scenes)")
     p.add_argument("--colour-temp", type=int, default=5000)
     p.add_argument("--lux", type=int, default=None,
