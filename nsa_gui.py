@@ -1711,9 +1711,8 @@ class NoiseDatasetWizard(tk.Toplevel):
     def _build_calib_page(self, parent):
         tk.Label(
             parent,
-            text=("Organise Phase-1 captures: bias/ (lens capped, min exposure), "
-                  "dark/ (lens capped, normal exposure), flat/level_XX/ pairs "
-                  "at 10–15 brightness levels. Repeat per gain and temperature."),
+            text=("Phase-1 folders: bias/ · dark/ · flat/level_XX/ "
+                  "(10–15 brightness levels), per gain and temperature."),
             bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(620),
             justify="left").pack(anchor="w", pady=(0, S(10)))
         self._path_row(parent, "Calibration folder", self.calib_dir, self._browse_calib)
@@ -3775,7 +3774,7 @@ class App(tk.Tk):
         # so windows fit and stay resizable on small Linux panels.
         if not os.environ.get("NSA_UI_SCALE"):
             fit_scale_to_screen(self)
-        self.title("NAS — Neural Architecture Search")
+        self.title("NAS  ·  Neural Architecture Search")
         self.configure(bg=WHITE)
         self._apply_geometry()
         # On Windows we already scale fonts via FT(); applying Tk's own scaling on
@@ -3899,20 +3898,6 @@ class App(tk.Tk):
                      fg=(SUBTLE if enabled else "#C4C4C4"),
                      font=font(9), wraplength=S(560),
                      justify="left").pack(anchor="w")
-
-    def _coming_soon(self, parent, text, desc, badge="COMING SOON"):
-        fr = tk.Frame(parent, bg=WHITE)
-        fr.pack(fill="x", pady=S(6))
-        var = tk.BooleanVar(value=False)
-        top = tk.Frame(fr, bg=WHITE); top.pack(fill="x")
-        cb = tk.Checkbutton(
-            top, text="  " + text, variable=var, state="disabled",
-            bg=WHITE, fg="#B6B6B6", selectcolor=WHITE, activebackground=WHITE,
-            font=font(11), anchor="w", highlightthickness=0, bd=0)
-        cb.pack(side="left")
-        self._badge(top, badge)
-        tk.Label(fr, text="     " + desc, bg=WHITE, fg="#C4C4C4",
-                 font=font(9)).pack(anchor="w")
 
     def _check(self, parent, text, desc, variable, command=None):
         fr = tk.Frame(parent, bg=WHITE)
@@ -4073,8 +4058,8 @@ class App(tk.Tk):
     # -- Individual wizard steps ---------------------------------------------
     def _step_sensor(self, body):
         self._section(body, "PRIMARY INPUT · IMAGE SENSOR")
-        tk.Label(body, text="     Pick the camera module you're optimising for. "
-                 "Everything after this (noise model, data, network) adapts to it.",
+        tk.Label(body, text="     The camera module to optimise for — everything "
+                 "below adapts to it.",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(8)))
         sensor_sel = SensorSelector(body, SENSOR_CARDS, "imx219",
@@ -4084,19 +4069,9 @@ class App(tk.Tk):
 
         self.all_sensors_cb = self._check(
             body, "Test ALL sensor profiles (sweep only)",
-            "Sweep mode only: also vary the sensor (IMX219 · IMX662 · IMX-NG) so the "
-            "leaderboard shows which model suits which camera. Slower (3× the runs).",
+            "Sweep mode: also vary the sensor so the leaderboard shows which model "
+            "suits which camera (3× the runs).",
             self.all_sensors_var, command=self._on_eval_change)
-
-        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(10), 0))
-        self._section(body, "LEVEL 1 · SENSOR GAIN")
-        self.sensor_echo = tk.Label(
-            body, text="", bg=WHITE, fg=RASPBERRY, font=font(9, "bold"),
-            wraplength=S(560), justify="left")
-        self.sensor_echo.pack(anchor="w", pady=(0, S(4)))
-        self._add_rows(body, [
-            ("gain", "Sensor Gain", "Challenge-frame analog gain", [256, 512], 256),
-        ])
 
     def _step_data(self, body):
         self._section(body, "LEVEL 1 · CAPTURE SOURCE")
@@ -4155,15 +4130,14 @@ class App(tk.Tk):
         self._add_rows(body, [
             ("frames", "Temporal Frames",
              "Synthetic GT only — averaged reads for simulated capture", [64, 128, 256], 256),
+            ("gain", "Sensor Gain",
+             "Synthetic/sim only — analog gain of the injected noise", [256, 512], 256),
         ])
-        tk.Label(body, text="     With real paired noisy/gt folders, ground truth comes "
-                 "from disk — temporal frames and gain apply only to synthetic capture "
-                 "(or when “Simulate sensor noise” is on).",
+        tk.Label(body, text="     Real paired folders take ground truth from disk; "
+                 "temporal frames and gain apply only to synthetic capture (or when "
+                 "“Simulate sensor noise” is on).",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(4)))
-        tk.Label(body, text="     Paired noisy/gt folders auto-detected · "
-                 "detail-scored patch selection (denoise-hw logic).",
-                 bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(0, S(4)))
 
         self._section(body, "RUN MODE")
         self._radio(body, "Single Frame Calibration", "single", enabled=True,
@@ -4217,10 +4191,9 @@ class App(tk.Tk):
 
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(14), 0))
         self._section(body, "EXTERNAL MODELS · HUGGING FACE HUB")
-        tk.Label(body, text="     Source pretrained denoisers from the Hub (Apache-2.0 / "
-                 "MIT only). Search, freeze the commit SHA, then click "
-                 "DOWNLOAD & USE — the next RUN COMPILE will load those weights "
-                 "(ONNX or PyTorch) instead of training from scratch.",
+        tk.Label(body, text="     Pretrained denoisers from the Hub (Apache-2.0 / MIT). "
+                 "Freeze a commit, then DOWNLOAD & USE — the next compile loads those "
+                 "weights instead of training.",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(6)))
         hf_row = tk.Frame(body, bg=WHITE); hf_row.pack(fill="x", pady=S(4))
@@ -4246,15 +4219,12 @@ class App(tk.Tk):
         dep_left = tk.Frame(dep_row, bg=WHITE); dep_left.grid(row=0, column=0, sticky="w")
         tk.Label(dep_left, text="Deployment Package", bg=WHITE, fg=INK,
                  font=font(11, "bold")).pack(anchor="w")
-        tk.Label(dep_left, text="Bundle artifacts + flash instructions "
-                 "(device SDK still needed to flash).", bg=WHITE, fg=SUBTLE,
-                 font=font(9)).pack(anchor="w")
+        tk.Label(dep_left, text="Bundle artifacts + flash instructions (SDK "
+                 "still needed to flash). Optional — also on the results screen.",
+                 bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(420),
+                 justify="left").pack(anchor="w")
         RoundButton(dep_row, "BUILD PACKAGE", self._build_deploy, kind="secondary",
                     width=170, height=36).grid(row=0, column=1, sticky="e")
-        tk.Label(body, text="     Optional — you can also export the transferable "
-                 ".zip from the results screen after a compile.", bg=WHITE,
-                 fg=SUBTLE, font=font(9), wraplength=S(560),
-                 justify="left").pack(anchor="w", pady=(S(4), 0))
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
 
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
@@ -6920,7 +6890,7 @@ class App(tk.Tk):
 
     def _show_log(self):
         win = tk.Toplevel(self)
-        win.title("NAS — Full compilation log")
+        win.title("NAS  ·  Full compilation log")
         win.configure(bg=WHITE)
         place_window(win, 820, 560, master=self, min_w=520, min_h=380)
         con = tk.Frame(win, bg=FIELD)
