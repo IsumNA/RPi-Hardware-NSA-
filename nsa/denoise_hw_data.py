@@ -24,11 +24,13 @@ DEFAULT_FILTER = ["imx219", "ag12"]
 # Per-sensor dataset folder keywords (denoise-hw path convention).
 DEFAULT_FILTERS_BY_SENSOR: dict[str, list[str]] = {
     "imx219": ["imx219", "ag12"],
-    # LCG only — "imx662_ag" does NOT match imx662h_* (HCG has different noise).
-    # Use filter ["imx662h"] for a separate HCG model.
-    "imx662": ["imx662_ag"],
-    # No IMX-NG captures exist yet — use the closest Starvis 2 LCG stand-in.
-    "imxng": ["imx662_ag"],
+    # Bare "imx662" substring-matches BOTH imx662_ag*_test (LCG) and
+    # imx662h_ag*_test (HCG) folders, so selecting the IMX662 sensor trains on
+    # every capture from that module. For an LCG-only model use ["imx662_ag"];
+    # for an HCG-only model use ["imx662h"].
+    "imx662": ["imx662"],
+    # No IMX-NG captures exist yet — use the closest Starvis 2 stand-in.
+    "imxng": ["imx662"],
 }
 DEFAULT_DATASET_PATH = "datasets/PI_RAW"
 DEFAULT_REMOTE_PI_RAW = "/opt/datasets/PI_RAW"

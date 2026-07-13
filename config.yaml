@@ -53,12 +53,14 @@ sensor:
   # auto-detected and used as real ground truth. simulate_noise injects the
   # selected sensor's physics on top of loaded frames (clean -> noisy).
   simulate_noise: false
-  # IMPORTANT: use "imx662_ag" (not bare "imx662") — bare "imx662" also matches
-  # imx662h_* HCG folders and mixes two noise regimes in one model.
-  # LCG-only, all gains: [imx662_ag]
-  # LCG at deploy gain only: [imx662_ag, ag256]
-  # HCG-only: [imx662h]
-  filter: [imx662_ag]
+  # The selected sensor drives this filter (see DEFAULT_FILTERS_BY_SENSOR):
+  # bare "imx662" matches BOTH imx662_ag*_test (LCG) and imx662h_ag*_test (HCG),
+  # so the IMX662 sensor trains on every capture from that module.
+  #   both LCG+HCG, all gains: [imx662]
+  #   LCG-only:                [imx662_ag]
+  #   HCG-only:                [imx662h]
+  #   LCG at deploy gain only: [imx662_ag, ag256]
+  filter: [imx662]
   gain: 256                 # analog gain multiplier (256 = moderate; 512 = stress test)
   # Override the standard deviation of the injected Gaussian read noise, in
   # electrons RMS (the denoise-hw noise-floor knob). null keeps the sensor's
