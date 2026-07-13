@@ -123,6 +123,9 @@ output:
 # ---- Pi live testing (GUI LIVE TEST on AI server → Pi camera over SSH) ------
 pi_live:
   enabled: true             # false = local LiveView only
+  # Fallback SSH target. When you connect in the camera-capture wizard, LIVE TEST
+  # reuses THAT same Pi SSH target automatically; this is only used if you never
+  # opened capture this session (no shared target yet).
   ssh_host: pi@10.3.31.153  # lab Pi (or YOUR_USER@10.x.x.x)
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto

@@ -2106,6 +2106,16 @@ class CttCaptureWizard(tk.Toplevel):
         self.transfer_var = tk.StringVar(value="rsync")
         self.ssh_var = tk.StringVar(value="pi@10.3.195.212")
         self.workspace_var = tk.StringVar(value="~/ctt-server-workspace")
+        # Reuse the Pi connection last used here / by LIVE TEST (shared on the app).
+        _pc = getattr(self.app, "pi_conn", None) or {}
+        if _pc.get("host"):
+            self.host_var.set(str(_pc["host"]))
+        if _pc.get("port"):
+            self.port_var.set(str(_pc["port"]))
+        if _pc.get("ssh"):
+            self.ssh_var.set(str(_pc["ssh"]))
+        if _pc.get("workspace"):
+            self.workspace_var.set(str(_pc["workspace"]))
         self.autostart_var = tk.BooleanVar(value=True)
         self.cttcmd_var = tk.StringVar(value="~/ctt-venv/bin/ctt-server")
         self.autolight_var = tk.BooleanVar(value=True)
@@ -2606,6 +2616,17 @@ class CttCaptureWizard(tk.Toplevel):
         autostart = bool(self.autostart_var.get())
         ctt_cmd = self.cttcmd_var.get().strip() or "ctt-server"
         workspace = self.workspace_var.get().strip() or None
+
+        # Share this Pi connection so LIVE TEST reaches the Pi the same way, and
+        # persist it for next time.
+        try:
+            self.app.pi_conn.update({
+                "host": host, "port": self.port_var.get().strip(),
+                "ssh": ssh or "", "workspace": workspace or "",
+            })
+            self.app._save_gui_state()
+        except Exception:  # noqa: BLE001
+            pass
 
         def status(msg):
             self.after(0, lambda: self._set_status(msg))
@@ -3754,6 +3775,10 @@ class App(tk.Tk):
         self.hf_model_id = None
         self.hf_weight = None
         self._live_view = None          # in-app LiveView window (if open)
+        # Shared Pi SSH connection — set by the camera-capture wizard and reused
+        # by LIVE TEST so both reach the Pi the same way (one source of truth).
+        # Persisted in the GUI state so it survives across sessions.
+        self.pi_conn: dict = {}
 
         self._build_chrome()
 
@@ -4872,12 +4897,18 @@ class App(tk.Tk):
                 state["vars"][name] = var.get()
         if getattr(self, "dataset_path", None):
             state["dataset_path"] = self.dataset_path
+        if getattr(self, "pi_conn", None):
+            state["pi_conn"] = dict(self.pi_conn)
         return state
 
     def _apply_gui_state(self, state: dict):
         """Re-apply a saved snapshot, honouring the family/loss render order."""
         if not state:
             return
+        # The Pi SSH connection is not a compilation-profile field, so restore it
+        # even when config.yaml changed (which strips the rest below).
+        if isinstance(state.get("pi_conn"), dict):
+            self.pi_conn = dict(state["pi_conn"])
         cfg_path = ROOT / "config.yaml"
         if cfg_path.is_file() and state.get("config_mtime") != cfg_path.stat().st_mtime:
             # config.yaml changed since this session was saved — don't restore
@@ -5942,7 +5973,8 @@ class App(tk.Tk):
             stop_local_ssh_session()
             if should_use_pi_remote(ROOT):
                 s = load_pi_live_settings(ROOT)
-                stop_live_on_pi(str(s["ssh_host"]), str(s["repo"]))
+                host = (self.pi_conn.get("ssh") or "").strip() or str(s["ssh_host"])
+                stop_live_on_pi(host, str(s["repo"]))
         except Exception:  # noqa: BLE001
             pass
         lv = getattr(self, "_live_view", None)
@@ -5965,13 +5997,18 @@ class App(tk.Tk):
                 return
         self._stop_live_sessions()
         try:
-            from nsa.pi_remote import run_live_on_pi, should_use_pi_remote
+            from nsa.pi_remote import (load_pi_live_settings, run_live_on_pi,
+                                       should_use_pi_remote)
             if should_use_pi_remote(ROOT):
-                err = run_live_on_pi(ROOT)
+                # Reuse the SSH target the camera-capture wizard connected with,
+                # so LIVE TEST reaches the Pi the same way (fall back to pi_live).
+                ssh_host = (self.pi_conn.get("ssh") or "").strip() or None
+                err = run_live_on_pi(ROOT, ssh_host=ssh_host)
                 if err is None:
+                    used = ssh_host or str(load_pi_live_settings(ROOT)["ssh_host"])
                     messagebox.showinfo(
                         "Live testing",
-                        "Started live.py on the Pi's CSI camera over SSH.\n\n"
+                        f"Started live.py on the Pi's CSI camera over SSH ({used}).\n\n"
                         "The RAW | DENOISED window opens on the MONITOR "
                         "ATTACHED TO THE PI. Press q or ESC there to stop.\n\n"
                         "If you click LIVE TEST again, the previous window is "
@@ -6682,9 +6719,16 @@ class App(tk.Tk):
             val = r.get(key)
             if val is not None and key in self.rows:
                 self.rows[key].set(val)
-        # Jump straight to the review step so the loaded config is visible.
+        # Keep the home summary in sync with the freshly loaded config.
+        if hasattr(self, "_refresh_home_summary"):
+            self._refresh_home_summary()
+        # Open the EDITABLE form at the model step so the loaded architecture is
+        # visible and tweakable — not the read-only review page (which is what
+        # "LOAD INTO FORM" is expected to show).
+        model_idx = next((i for i, s in enumerate(self._steps)
+                          if s.get("key") == "model"), 0)
         try:
-            self._goto_step(len(self._steps) - 1)
+            self._goto_step(model_idx)
         except Exception:
             pass
 

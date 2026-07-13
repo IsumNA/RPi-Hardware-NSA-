@@ -310,11 +310,18 @@ def launch_pi_terminal(host: str, remote_cmd: str,
         return f"Could not start SSH session to {host}: {exc}"
 
 
-def run_live_on_pi(project_root: Path | None = None) -> str | None:
-    """Sync model, launch live.py on the Pi over SSH. Returns error text or None."""
+def run_live_on_pi(project_root: Path | None = None,
+                   ssh_host: str | None = None) -> str | None:
+    """Sync model, launch live.py on the Pi over SSH. Returns error text or None.
+
+    ``ssh_host`` overrides ``pi_live.ssh_host`` — the GUI passes the same SSH
+    target the camera-capture wizard uses, so LIVE TEST reaches the Pi the same
+    way. The repo/source/display/venv still come from ``pi_live`` (the capture
+    target only carries user@host).
+    """
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     s = load_pi_live_settings(root)
-    host = str(s["ssh_host"])
+    host = str(ssh_host or s["ssh_host"])
     repo = str(s["repo"])
     source = str(s["source"])
     display = str(s.get("display", "auto"))
