@@ -4788,16 +4788,36 @@ class App(tk.Tk):
         # Buttons are (re)created per step by _render_nav().
 
     def _apply_denoise_hw_defaults(self):
-        """Load config.yaml into the form so quick-run uses the right defaults."""
+        """Load config.yaml into the form so quick-run uses the right defaults.
+
+        Each restoration step is independently guarded: a failure in one field
+        (e.g. rendering the loss/NAFNet-topology detail rows) must not prevent
+        the others — sensor and dataset filter in particular — from being
+        applied. A single try/except around the whole body previously let any
+        one failure silently abort everything after it, leaving the sensor
+        (and its dataset filter) stuck at a stale/default value.
+        """
         try:
             from nsa.config import finalize_dataset_config, load_config, project_root
             from nsa.denoise_hw_data import ensure_project_dataset
             ensure_project_dataset(ROOT)
             cfg = load_config(ROOT / "config.yaml")
             finalize_dataset_config(cfg, ROOT)
+        except Exception:
+            return   # no cfg to apply — nothing more we can do
 
+        def _try(step):
+            try:
+                step()
+            except Exception:
+                pass
+
+        def _set_hardware():
             if cfg.hardware and "hardware" in self.rows:
                 self.rows["hardware"].set(cfg.hardware)
+        _try(_set_hardware)
+
+        def _set_model_family():
             if cfg.model.model_family and "model_family" in self.rows:
                 self.rows["model_family"].set(cfg.model.model_family)
             enc_blocks = list(cfg.model.nafnet_enc_blocks or [])
@@ -4808,6 +4828,9 @@ class App(tk.Tk):
             )
             if "model_family" in self.rows:
                 self._render_model_options()
+        _try(_set_model_family)
+
+        def _set_model_params():
             for key, val in (
                 ("base_channels", cfg.model.base_channels),
                 ("block_depth", cfg.model.block_depth),
@@ -4819,6 +4842,9 @@ class App(tk.Tk):
             ):
                 if key in self.rows and val is not None:
                     self.rows[key].set(val)
+        _try(_set_model_params)
+
+        def _set_train_toggles():
             self.quantize_var.set(cfg.optimization.quantize)
             self.qat_var.set(cfg.optimization.qat)
             self.extended_train_var.set(bool(getattr(cfg.optimization, "extended_train", False)))
@@ -4826,10 +4852,10 @@ class App(tk.Tk):
             if hasattr(self, "_on_extended_toggle"):
                 self._on_extended_toggle()
             self.mode_var.set(cfg.run.mode)
-            if cfg.sensor.real_capture:
-                self.source_var.set("real")
-            else:
-                self.source_var.set("sim")
+        _try(_set_train_toggles)
+
+        def _set_source_and_data():
+            self.source_var.set("real" if cfg.sensor.real_capture else "sim")
             if cfg.sensor.dataset_path:
                 self.dataset_path = cfg.sensor.dataset_path
             if cfg.sensor.filter and hasattr(self, "filter_var"):
@@ -4837,6 +4863,9 @@ class App(tk.Tk):
             if hasattr(self, "noise_std_var"):
                 self.noise_std_var.set(
                     "" if cfg.sensor.noise_std is None else str(cfg.sensor.noise_std))
+        _try(_set_source_and_data)
+
+        def _set_loss():
             lc = getattr(cfg.optimization, "loss", None)
             if lc is not None and "loss" in self.rows:
                 self.rows["loss"].set(lc.name)
@@ -4851,18 +4880,27 @@ class App(tk.Tk):
                     var = self.entries.get(f"w_{str(term).lower()}")
                     if var is not None:
                         var.set(str(wval))
+        _try(_set_loss)
+
+        # Sensor (and everything that depends on it — the dataset filter sync
+        # below) must always be applied, regardless of whether any step above
+        # succeeded, so it never silently lags behind config.yaml.
+        def _set_sensor():
             if cfg.sensor.sensor and "sensor" in self.rows:
                 self.rows["sensor"].set(cfg.sensor.sensor)
+        _try(_set_sensor)
+
+        def _set_dataset_label():
             if hasattr(self, "dataset_label"):
                 label = (self.dataset_path or cfg.sensor.dataset_path
                          or "datasets/PI_RAW (denoise-hw)")
                 self.dataset_label.config(text=str(label), fg=SUBTLE)
-            self._on_source_change()
-            self._on_sensor_change()
-            if hasattr(self, "_home_summary"):
-                self._refresh_home_summary()
-        except Exception:
-            pass
+        _try(_set_dataset_label)
+
+        _try(self._on_source_change)
+        _try(self._on_sensor_change)     # re-syncs the dataset filter to the sensor
+        if hasattr(self, "_home_summary"):
+            _try(self._refresh_home_summary)
 
     # -- Remembered settings (persist wizard choices across launches) ----------
     # Rows whose widgets always exist vs. those created on demand by the
@@ -6475,6 +6513,10 @@ class App(tk.Tk):
         self._rank_rows = data.get("all_results", [])
         self._rank_winner = data.get("winner", {})
         self._rank_target_label = data.get("target_label", "")
+        # Sweep-wide settings (not stored per-row, since they don't vary across
+        # the sweep) — merged into a row's config when it's loaded/run so the
+        # hardware target and gain actually match what produced these results.
+        self._rank_context = {"hardware": data.get("target"), "gain": data.get("gain")}
         # Default the filter to the chip the sweep actually compiled for.
         target = data.get("target", "all")
         self._rank_have_chips = any(r.get("chips") for r in self._rank_rows)
@@ -6719,10 +6761,18 @@ class App(tk.Tk):
                 wdg.bind("<Leave>", lambda _e, ws=cell_widgets, b=bg: [x.configure(bg=b) for x in ws])
 
     def _use_winner(self, winner: dict):
-        self._use_config(winner)
+        # Sweep-wide settings (hardware/gain) aren't stored per-row — merge them
+        # in so the loaded config matches what actually produced this result.
+        self._use_config({**getattr(self, "_rank_context", {}), **winner})
 
     def _use_config(self, r: dict):
-        """Load a ranking row's parameters into the form (single-compile mode)."""
+        """Load a ranking/history row's parameters into the form (single-compile
+        mode). Restores what's actually recorded for that run — sensor, model
+        architecture, hardware target and gain. Loss/dataset-filter/quantize/
+        calibration-steps aren't currently persisted per-run, so those stay at
+        whatever the form/config.yaml already has; a truly exact reload would
+        need the sweep/history record to capture them too.
+        """
         self.sidebar.reset()
         self._build_form()                     # rebuilds self.rows with defaults
         self.eval_var.set("single")
@@ -6731,6 +6781,12 @@ class App(tk.Tk):
         if sensor and sensor != "all" and "sensor" in self.rows:
             self.rows["sensor"].set(sensor)
             self._on_sensor_change()
+        hardware = r.get("hardware")
+        if hardware and "hardware" in self.rows:
+            self.rows["hardware"].set(hardware)
+        gain = r.get("gain")
+        if gain is not None and "gain" in self.rows:
+            self.rows["gain"].set(gain)
         fam = r.get("family")
         if fam and "model_family" in self.rows:
             self.rows["model_family"].set(fam)
@@ -6831,14 +6887,17 @@ class App(tk.Tk):
 
         btns = tk.Frame(pad, bg=WHITE); btns.pack(fill="x", side="bottom")
 
+        # Sweep-wide settings (hardware/gain) aren't stored per-row.
+        merged = {**getattr(self, "_rank_context", {}), **r}
+
         def _run_now():
             dlg.destroy()
-            self._use_config(r)
+            self._use_config(merged)
             self._run()
 
         def _load_only():
             dlg.destroy()
-            self._use_config(r)
+            self._use_config(merged)
 
         RoundButton(btns, "CANCEL", dlg.destroy, kind="secondary",
                     width=110, height=40).pack(side="left")
@@ -7118,6 +7177,8 @@ class App(tk.Tk):
             "conv_type": m.get("conv_type") or win.get("conv_type"),
             "activation": m.get("activation") or win.get("activation"),
             "sensor": rec.get("sensor_key") or rec.get("sensor"),
+            "hardware": rec.get("hardware"),
+            "gain": rec.get("gain"),
         }
         self._use_config(cfg)
 
