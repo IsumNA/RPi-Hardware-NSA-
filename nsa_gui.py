@@ -1631,6 +1631,7 @@ class NoiseDatasetWizard(tk.Toplevel):
         from nsa.dataset_layout import calibration_dir, noise_model_path
         _pi = find_best_project_root() or (ROOT / "datasets" / "PI_RAW")
         _proj, _pi_raw = resolve_layout(_pi)
+        self._proj = _proj      # project root, for auto-fetching per-sensor folders
         self.clean_dir = tk.StringVar(
             value=str(_proj / "clean_scenes") if (_proj / "clean_scenes").is_dir() else "")
         _default_sensor = "imx662"
@@ -1721,13 +1722,18 @@ class NoiseDatasetWizard(tk.Toplevel):
         opts = tk.Frame(parent, bg=WHITE)
         opts.pack(fill="x", pady=(S(8), 0))
         tk.Label(opts, text="Sensor", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
-        ttk.Combobox(opts, textvariable=self.sensor_var, width=10,
-                     values=["imx662", "imx662h", "imx219", "imxng"], state="readonly",
-                     style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
+        sensor_cb = ttk.Combobox(opts, textvariable=self.sensor_var, width=10,
+                                 values=["imx662", "imx662h", "imx219", "imxng"],
+                                 state="readonly", style="Rpi.TCombobox")
+        sensor_cb.pack(side="left", padx=(S(8), S(16)))
+        # Pick the sensor to calibrate → auto-fetch its calibration folder + model.
+        sensor_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_calib_paths())
         tk.Label(opts, text="Gain", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
-        ttk.Combobox(opts, textvariable=self.gain_var, width=6,
-                     values=["256", "512"], state="readonly",
-                     style="Rpi.TCombobox").pack(side="left", padx=(S(8), S(16)))
+        gain_cb = ttk.Combobox(opts, textvariable=self.gain_var, width=6,
+                               values=["256", "512"], state="readonly",
+                               style="Rpi.TCombobox")
+        gain_cb.pack(side="left", padx=(S(8), S(16)))
+        gain_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_calib_paths())
         tk.Label(opts, text="Temp °C", bg=WHITE, fg=INK, font=font(10, "bold")).pack(side="left")
         ttk.Entry(opts, textvariable=self.temp_var, width=6, font=font(10)).pack(side="left",
                                                                                   padx=(S(8), 0))
@@ -1796,6 +1802,25 @@ class NoiseDatasetWizard(tk.Toplevel):
 
     def _set_status(self, text: str, ok: bool = False):
         self.status_lbl.config(text=text, fg=GREEN if ok else SUBTLE)
+
+    def _sync_calib_paths(self):
+        """Auto-fetch the calibration folder + noise-model path for the chosen
+        sensor/gain (imx662 and imx662h keep separate calibration trees)."""
+        from nsa.dataset_layout import calibration_dir, noise_model_path
+        sensor = self.sensor_var.get() or "imx662"
+        try:
+            gain = int(self.gain_var.get())
+        except (TypeError, ValueError):
+            gain = 256
+        cal = calibration_dir(self._proj, sensor, gain)
+        self.calib_dir.set(str(cal))
+        self.model_out.set(str(noise_model_path(self._proj, sensor, gain)))
+        if cal.is_dir():
+            self._set_status(f"Loaded {sensor} gain{gain} calibration folder.", ok=True)
+        else:
+            self._set_status(
+                f"No {sensor} gain{gain} calibration folder yet — expected at "
+                f"{cal}. Capture bias/dark/flat there (or Browse to pick one).")
 
     def _browse_calib(self):
         p = filedialog.askdirectory(title="Phase-1 calibration folder (bias/dark/flat)")
