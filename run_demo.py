@@ -376,7 +376,9 @@ def main() -> int:
                 gain=cfg.sensor.gain, simulate_noise=simulate_noise,
                 seed=cfg.output.seed, temporal_frames=tframes,
                 max_side=int(cfg.optimization.extended_max_side),
-                with_names=True)
+                with_names=True,
+                tile=int(cfg.optimization.extended_tile),
+                tiles_per_image=int(cfg.optimization.extended_tiles_per_image))
         ext_pairs = [(n, c) for _, n, c in ext_named]
         if ext_pairs:
             # Oversample the hard captures: high analogue gain (heavy grain)
@@ -386,9 +388,11 @@ def main() -> int:
                 [c for _, _, c in ext_named],
                 gain_exp=cfg.optimization.gain_emphasis,
                 dark_emphasis=cfg.optimization.dark_emphasis)
-            log(f"Extended training: {len(ext_pairs)} full image(s) from the "
-                f"dataset  ·  {ext_steps} steps (this is the slow, high-quality "
-                f"pass)", "step")
+            src_txt = (f"{len(ext_pairs)} native-res {cfg.optimization.extended_tile}px "
+                       f"tile(s)" if cfg.optimization.extended_tile
+                       else f"{len(ext_pairs)} full image(s)")
+            log(f"Extended training: {src_txt} from the dataset  ·  {ext_steps} "
+                f"steps (this is the slow, high-quality pass)", "step")
             total_w = sum(ext_weights) or 1.0
             top = sorted(zip(ext_weights, (n for n, _, _ in ext_named)),
                          reverse=True)[:3]

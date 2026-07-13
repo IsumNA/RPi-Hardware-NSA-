@@ -462,6 +462,8 @@ def load_training_pairs(
     max_side: int = 1024,
     min_patch: int = 64,
     with_names: bool = False,
+    tile: int = 0,
+    tiles_per_image: int = 4,
 ) -> list:
     """Load EVERY paired capture under ``path`` as full-image (noisy, clean) pairs.
 
@@ -472,7 +474,14 @@ def load_training_pairs(
 
     * paired noisy/gt          -> real ground truth (denoise-hw convention)
     * paired + simulate_noise  -> use gt as clean, inject sensor noise on top
-    Images are downscaled so the longest side is <= ``max_side`` to bound memory.
+
+    ``tile`` > 0 (recommended): cut ``tiles_per_image`` random NATIVE-resolution
+    ``tile``×``tile`` squares from each capture instead of resizing. Downscaling
+    a noisy frame averages the grain away, so a model trained on resized images
+    systematically under-estimates real sensor noise; native tiles preserve the
+    true noise statistics while bounding memory. ``tile`` = 0 restores the
+    legacy resize-to-``max_side`` behaviour.
+
     Returns ``(noisy_rgb, clean_rgb)`` float32 [0,1] pairs — or, with
     ``with_names=True``, ``(folder_name, noisy_rgb, clean_rgb)`` triples so the
     caller can weight sampling by each capture's analogue-gain tag.
@@ -487,14 +496,17 @@ def load_training_pairs(
     except Exception:
         root = str(Path(path).expanduser())
 
-    pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    pairs: list = []
     for i, folder in enumerate(find_paired_folders(root, filter_tokens)):
         pr = _pair_in_folder(folder)
         if pr is None:
             continue
         try:
-            noisy = _cap_long_side(_load_any(pr[0]), max_side)
-            gt = _cap_long_side(_load_any(pr[1]), max_side)
+            noisy = _load_any(pr[0])
+            gt = _load_any(pr[1])
+            if not tile:                         # legacy: bound memory by resizing
+                noisy = _cap_long_side(noisy, max_side)
+                gt = _cap_long_side(gt, max_side)
         except Exception:
             continue
         h = min(noisy.shape[0], gt.shape[0])
@@ -504,6 +516,17 @@ def load_training_pairs(
         noisy, gt = noisy[:h, :w], gt[:h, :w]
         if simulate_noise:                       # gt is clean -> simulate sensor noise
             noisy, gt = _synth_noisy_gt(gt, gain, sensor, temporal_frames, seed + i)
+        if tile and tile > 0:
+            # Native-resolution random tiles: true noise statistics, bounded memory.
+            t = min(int(tile), h, w)
+            rng = np.random.default_rng(seed * 100003 + i)
+            for _k in range(max(1, int(tiles_per_image))):
+                iy = int(rng.integers(0, h - t + 1))
+                ix = int(rng.integers(0, w - t + 1))
+                item = (noisy[iy:iy + t, ix:ix + t].astype(np.float32),
+                        gt[iy:iy + t, ix:ix + t].astype(np.float32))
+                pairs.append((folder.name, *item) if with_names else item)
+            continue
         item = (noisy.astype(np.float32), gt.astype(np.float32))
         pairs.append((folder.name, *item) if with_names else item)
     return pairs

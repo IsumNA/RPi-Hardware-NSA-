@@ -126,7 +126,12 @@ class OptimizationConfig:
     # EVERY paired image in the dataset (PI_RAW) for a much stronger denoiser.
     extended_train: bool = False    # enable the extra full-dataset training pass
     extended_steps: int = 1500      # optimizer steps for the extended pass
-    extended_max_side: int = 1024   # cap image long-side when loading full frames
+    extended_max_side: int = 1024   # legacy resize cap, used only when extended_tile == 0
+    # Native-resolution training tiles: cut N random tile×tile squares from each
+    # capture instead of resizing (downscaling averages the grain away, so the
+    # model under-estimates real noise). 0 = legacy resize-to-max_side.
+    extended_tile: int = 512
+    extended_tiles_per_image: int = 4
     # Training-sample emphasis: w = gain^gain_emphasis · (1 + dark_emphasis·darkness).
     # Oversamples the hard high-analogue-gain, low-intensity captures instead of
     # sampling every folder uniformly. 0 / 0 restores uniform sampling.
@@ -358,6 +363,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extended-max-side", dest="extended_max_side", type=int,
                    help="cap image long-side when loading full frames for extended "
                         "training (default 1024)")
+    p.add_argument("--extended-tile", dest="extended_tile", type=int,
+                   help="native-res training tile size (0 = legacy resize; "
+                        "default 512 — preserves real noise statistics)")
+    p.add_argument("--extended-tiles", dest="extended_tiles_per_image", type=int,
+                   help="random native-res tiles cut per capture (default 4)")
     p.add_argument("--gain-emphasis", dest="gain_emphasis", type=float,
                    help="training-sample weight exponent on analogue gain — "
                         "oversamples high-gain (grainy) captures (default 0.5; "
@@ -457,6 +467,10 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.optimization.extended_steps = max(1, int(args.extended_steps))
     if getattr(args, "extended_max_side", None):
         cfg.optimization.extended_max_side = max(64, int(args.extended_max_side))
+    if getattr(args, "extended_tile", None) is not None:
+        cfg.optimization.extended_tile = max(0, int(args.extended_tile))
+    if getattr(args, "extended_tiles_per_image", None):
+        cfg.optimization.extended_tiles_per_image = max(1, int(args.extended_tiles_per_image))
     if getattr(args, "gain_emphasis", None) is not None:
         cfg.optimization.gain_emphasis = max(0.0, float(args.gain_emphasis))
     if getattr(args, "dark_emphasis", None) is not None:

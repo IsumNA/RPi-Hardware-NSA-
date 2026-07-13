@@ -23,10 +23,13 @@ model:
   conv_type: depthwise      # standard | depthwise  (ignored for nafnet / restormer)
   activation: relu          # relu | gelu | silu  (ignored for nafnet / restormer)
   # Custom multi-scale NAFNet topology (nafnet family only). Leave empty for a
-  # flat NAFNet of block_depth blocks. e.g. encoders [1,2,2] / middle 4 / decoders [2,2,1]
-  nafnet_enc_blocks: []     # per-level encoder NAFBlock counts (U-shaped NAFNet)
-  nafnet_middle_blocks: 1   # bottleneck block count
-  nafnet_dec_blocks: []     # per-level decoder NAFBlock counts
+  # flat NAFNet of block_depth blocks. The U-shaped topology below downsamples
+  # 8x at the bottleneck — the receptive field a flat 4-block model lacks, which
+  # is what removes LOW-FREQUENCY chroma blotches on very grainy captures
+  # (a flat model literally cannot see structure larger than a few dozen px).
+  nafnet_enc_blocks: [2, 2, 4]   # per-level encoder NAFBlock counts (U-shaped NAFNet)
+  nafnet_middle_blocks: 6        # bottleneck block count
+  nafnet_dec_blocks: [2, 2, 2]   # per-level decoder NAFBlock counts
 
 # ---- LEVEL 1 : Sensor / Input ------------------------------------------------
 sensor:
@@ -83,7 +86,12 @@ optimization:
   # 50 LCG pairs (imx662_ag) need more steps than a single-folder pass.
   extended_train: true
   extended_steps: 3000      # optimizer steps for the extended full-dataset pass
-  extended_max_side: 1024   # cap image long-side when loading full frames
+  extended_max_side: 1024   # legacy resize cap — only used when extended_tile: 0
+  # Native-resolution training tiles. Downscaling a noisy frame AVERAGES THE
+  # GRAIN AWAY, so a model trained on resized images under-estimates real noise
+  # and under-denoises at native resolution. Cut random native tiles instead.
+  extended_tile: 512        # tile size in px (0 = legacy resize behaviour)
+  extended_tiles_per_image: 4
   # Training-sample emphasis — weight = gain^gain_emphasis * (1 + dark_emphasis*darkness).
   # Oversamples the hard captures (very grainy high-analogue-gain folders, and
   # low-intensity scenes) instead of giving every folder equal attention.
