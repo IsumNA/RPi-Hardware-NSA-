@@ -1095,6 +1095,237 @@ class LiveView(tk.Toplevel):
             pass
 
 
+class ImageTestView(tk.Toplevel):
+    """Run the last-compiled model on any image the user picks — no camera needed.
+
+    Loads outputs/model.pt (the exact model + engine ``live.load_model`` uses, so
+    it matches deployed behaviour), lets the operator choose an image file, and
+    shows the input beside the denoised output with latency. Optionally injects
+    Gaussian noise first so a clean image still demonstrates the denoiser.
+    """
+
+    PANEL_W = 372  # logical px per panel (scaled by S)
+
+    def __init__(self, master):
+        super().__init__(master, bg=WHITE)
+        self.title("NAS  ·  Test on an image")
+        self.configure(bg=WHITE)
+        self._model = None
+        self._model_name = "MODEL"
+        self._imgs = {}                 # keep PhotoImage refs alive
+        self._logo_img = None
+        self._result = None             # (input_uint8, out_uint8, stats)
+        self.panels = {}
+        self._busy = False
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Escape>", lambda _e: self._on_close())
+        self.update_idletasks()
+        place_window(self, 840, 640, master=master, min_w=560, min_h=440)
+        try:
+            self.transient(master)
+        except Exception:  # noqa: BLE001
+            pass
+        threading.Thread(target=self._load_model_bg, daemon=True).start()
+
+    # -- layout --------------------------------------------------------------
+    def _build_ui(self):
+        pad = S(24)
+        header = tk.Frame(self, bg=WHITE)
+        header.pack(fill="x", padx=pad, pady=(S(18), S(2)))
+        self._logo_img = _load_logo_photo(S(40))
+        if self._logo_img is not None:
+            tk.Label(header, image=self._logo_img, bg=WHITE).pack(
+                side="left", padx=(0, S(12)))
+        htext = tk.Frame(header, bg=WHITE); htext.pack(side="left")
+        tk.Label(htext, text="Test on an image", bg=WHITE, fg=INK,
+                 font=font(19, "bold")).pack(anchor="w")
+        self.status_lbl = tk.Label(htext, text="Loading compiled model…", bg=WHITE,
+                                   fg=SUBTLE, font=font(10))
+        self.status_lbl.pack(anchor="w", pady=(S(1), 0))
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(S(10), 0))
+
+        # -- Controls --------------------------------------------------------
+        ctl = tk.Frame(self, bg=WHITE)
+        ctl.pack(fill="x", padx=pad, pady=(S(10), 0))
+        self.choose_btn = RoundButton(ctl, "CHOOSE IMAGE", self._choose,
+                                      kind="primary", width=160, height=40)
+        self.choose_btn.pack(side="left")
+        self.choose_btn.set_enabled(False)
+        self.save_btn = RoundButton(ctl, "SAVE RESULT", self._save,
+                                    kind="secondary", width=140, height=40)
+        self.save_btn.pack(side="left", padx=(S(8), 0))
+        self.save_btn.set_enabled(False)
+        self._noise_on = tk.BooleanVar(value=False)
+        tk.Checkbutton(ctl, text=" Add noise first", variable=self._noise_on,
+                       bg=WHITE, fg=INK, selectcolor=WHITE, activebackground=WHITE,
+                       highlightthickness=0, font=font(9)).pack(side="right")
+        self._sigma_var = tk.StringVar(value="25")
+        ttk.Entry(ctl, textvariable=self._sigma_var, width=5,
+                  font=font(10)).pack(side="right", padx=(0, S(6)))
+        tk.Label(ctl, text="σ", bg=WHITE, fg=SUBTLE,
+                 font=font(10)).pack(side="right", padx=(0, S(4)))
+
+        # -- Panels ----------------------------------------------------------
+        panels = tk.Frame(self, bg=WHITE)
+        panels.pack(fill="both", expand=True, padx=pad, pady=(S(12), 0))
+        for i, (key, cap) in enumerate((("in", "INPUT"), ("out", "DENOISED"))):
+            col = tk.Frame(panels, bg=WHITE)
+            col.grid(row=0, column=i, sticky="nsew", padx=(0, S(8)) if i == 0 else 0)
+            panels.columnconfigure(i, weight=1, uniform="p")
+            tk.Label(col, text=cap, bg=WHITE, fg=RASPBERRY,
+                     font=font(9, "bold")).pack(anchor="w")
+            lbl = tk.Label(col, text="—", bg=FIELD, fg=SUBTLE, font=font(9),
+                           width=40, height=14)
+            lbl.pack(fill="both", expand=True, pady=(S(4), 0))
+            self.panels[key] = lbl
+
+        self.stat_lbl = tk.Label(self, text="", bg=WHITE, fg=INK, font=font(10, "bold"))
+        self.stat_lbl.pack(anchor="w", padx=pad, pady=(S(8), S(14)))
+
+    # -- model + inference ---------------------------------------------------
+    def _set_status(self, text):
+        self.after(0, lambda: self.status_lbl.config(text=text)
+                   if self.winfo_exists() else None)
+
+    def _load_model_bg(self):
+        try:
+            import live as _live
+            _live.OUT = ROOT / "outputs"
+            _live.CKPT = _live.OUT / "model.pt"
+            _live.ONNX_PATH = _live.OUT / "exported_model.onnx"
+            model, ck = _live.load_model(_live.make_args())
+            m = (ck or {}).get("model", {}) or {}
+            self._model = model
+            self._model_name = str(m.get("family", "model")).upper() or "MODEL"
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Could not load model: {exc}")
+            return
+        self._set_status(f"{self._model_name} ready — choose an image to denoise.")
+        self.after(0, lambda: self.choose_btn.set_enabled(True)
+                   if self.winfo_exists() else None)
+
+    def _choose(self):
+        if self._busy or self._model is None:
+            return
+        path = filedialog.askopenfilename(
+            title="Choose an image to denoise",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.npy *.dng"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self._busy = True
+        self.choose_btn.set_enabled(False)
+        self._set_status("Denoising…")
+        threading.Thread(target=self._process_bg, args=(path,), daemon=True).start()
+
+    def _process_bg(self, path):
+        try:
+            import numpy as np
+            from nsa.raw_io import _load_any
+            from nsa.inference import run
+            rgb = _load_any(Path(path)).astype("float32")
+            if rgb.ndim == 2:
+                rgb = np.stack([rgb] * 3, axis=-1)
+            rgb = rgb[..., :3]
+            # Guard very large images so inference stays quick and in-memory.
+            h, w = rgb.shape[:2]
+            if max(h, w) > 1600:
+                import cv2
+                s = 1600.0 / float(max(h, w))
+                rgb = cv2.resize(rgb, (max(1, int(w * s)), max(1, int(h * s))),
+                                 interpolation=cv2.INTER_AREA)
+            if self._noise_on.get():
+                try:
+                    sigma = max(0.0, float(self._sigma_var.get())) / 255.0
+                except ValueError:
+                    sigma = 0.0
+                if sigma > 0:
+                    rng = np.random.default_rng(0)
+                    rgb = np.clip(rgb + rng.normal(0, sigma, rgb.shape).astype("float32"), 0, 1)
+            out, ms = run(self._model, rgb)
+            drop = self._noise_drop(rgb, out)
+            stats = {"ms": ms, "drop": drop, "res": f"{rgb.shape[1]}×{rgb.shape[0]}"}
+            self._result = (self._to_uint8(rgb), self._to_uint8(out), stats)
+            self.after(0, self._paint_result)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Failed: {exc}")
+        finally:
+            self._busy = False
+            self.after(0, lambda: self.choose_btn.set_enabled(True)
+                       if self.winfo_exists() else None)
+
+    @staticmethod
+    def _to_uint8(rgb):
+        import numpy as np
+        return (np.clip(rgb, 0, 1) * 255.0 + 0.5).astype("uint8")
+
+    @staticmethod
+    def _noise_drop(a, b):
+        """Rough high-frequency reduction % (input→output), a denoising indicator."""
+        import numpy as np
+        def hf(x):
+            dx = np.abs(np.diff(x, axis=1)).mean()
+            dy = np.abs(np.diff(x, axis=0)).mean()
+            return float(dx + dy)
+        h_in = hf(a)
+        if h_in <= 1e-8:
+            return 0.0
+        return max(0.0, (h_in - hf(b)) / h_in * 100.0)
+
+    def _paint_result(self):
+        if not self.winfo_exists() or self._result is None or Image is None:
+            return
+        in_u8, out_u8, st = self._result
+        self._set_panel("in", in_u8)
+        self._set_panel("out", out_u8)
+        self.stat_lbl.config(
+            text=f"{self._model_name}   ·   {st['res']}   ·   {st['ms']:.0f} ms   "
+                 f"·   high-freq -{st['drop']:.0f}%")
+        self.status_lbl.config(text="Done — choose another image, or SAVE RESULT.")
+        self.save_btn.set_enabled(True)
+
+    def _set_panel(self, key, rgb_u8):
+        try:
+            im = Image.fromarray(rgb_u8)
+            pw = S(self.PANEL_W)
+            ph = max(1, int(round(pw * im.height / im.width)))
+            im = im.resize((pw, ph), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(im)
+            self._imgs[key] = photo
+            self.panels[key].config(image=photo, text="")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _save(self):
+        if self._result is None or Image is None:
+            return
+        in_u8, out_u8, _ = self._result
+        try:
+            a, b = Image.fromarray(in_u8), Image.fromarray(out_u8)
+            gap = 6
+            combo = Image.new("RGB", (a.width + gap + b.width, a.height), RASPBERRY)
+            combo.paste(a, (0, 0))
+            combo.paste(b, (a.width + gap, 0))
+            out_dir = ROOT / "outputs"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / "image_test.png"
+            combo.save(path)
+            messagebox.showinfo("Saved", f"Saved input-vs-denoised to:\n{path}")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Save result", str(exc))
+
+    def _on_close(self):
+        master = self.master
+        if getattr(master, "_image_test_view", None) is self:
+            master._image_test_view = None
+        try:
+            self.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class Imx662DataStudio(tk.Toplevel):
     """Browse IMX662 dataset layout: what's needed, what's on disk, GT capture help."""
 
@@ -3799,6 +4030,7 @@ class App(tk.Tk):
         self.hf_model_id = None
         self.hf_weight = None
         self._live_view = None          # in-app LiveView window (if open)
+        self._image_test_view = None    # in-app "test on an image" window (if open)
         # Shared Pi SSH connection — set by the camera-capture wizard and reused
         # by LIVE TEST so both reach the Pi the same way (one source of truth).
         # Persisted in the GUI state so it survives across sessions.
@@ -6082,6 +6314,20 @@ class App(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Live testing", str(exc))
 
+    def _test_image(self):
+        """Run the compiled model on an image the user picks (no camera needed)."""
+        if not (ROOT / "outputs" / "model.pt").exists():
+            if not messagebox.askyesno(
+                "Test on an image",
+                "No compiled model checkpoint (outputs/model.pt) was found yet.\n\n"
+                "It will rebuild and quick-calibrate a model first (a few "
+                "seconds). Continue?"):
+                return
+        try:
+            self._image_test_view = ImageTestView(self)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Test on an image", str(exc))
+
     def _build_deploy(self):
         if not (ROOT / "outputs" / "summary.json").exists():
             messagebox.showinfo(
@@ -6297,6 +6543,8 @@ class App(tk.Tk):
         RoundButton(foot_top, "RUN AGAIN", self._run_again, kind="secondary",
                     width=120, height=40).pack(side="left")
         RoundButton(foot_top, "LIVE TEST", self._live_test, kind="primary",
+                    width=120, height=40).pack(side="left", padx=(S(6), 0))
+        RoundButton(foot_top, "TEST IMAGE", self._test_image, kind="secondary",
                     width=120, height=40).pack(side="left", padx=(S(6), 0))
         RoundButton(foot_top, "FULL LOG", self._show_log, kind="secondary",
                     width=110, height=40).pack(side="right")
