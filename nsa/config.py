@@ -22,7 +22,9 @@ HARDWARE = {
     "intel_npu": "Intel AI Boost (NPU / OpenVINO)",
 }
 MODEL_FAMILIES = ("cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet",
-                  "ffdnet", "drunet", "restormer")
+                  "ffdnet", "drunet", "restormer",
+                  "attn_unet2", "eamamba", "unifyformer",
+                  "remonet", "emvd", "mstmn")
 BASE_CHANNELS = (16, 32, 64)
 BLOCK_DEPTHS = (2, 4, 8)
 CONV_TYPES = ("standard", "depthwise")
@@ -133,6 +135,11 @@ class OutputConfig:
     show_window: bool = True
     seed: int = 662
     export: bool = False        # build a transferable hardware package at the end
+    # Which capture to show in the validation matrix when the dataset spans an
+    # analogue-gain sweep (imx662_ag1..ag512). "high" = noisiest (default, the
+    # meaningful low-light stress test), "low" = cleanest, "first" = dataset
+    # order, or a number (e.g. "512") to prefer the capture closest to that gain.
+    validate_gain: str = "high"
 
 
 @dataclass
@@ -368,6 +375,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--export", dest="export", action="store_true",
                    help="build a transferable hardware deployment package (.zip) at the end")
     p.add_argument("--no-window", action="store_true", help="do not open the validation window")
+    p.add_argument("--validate-gain", dest="validate_gain", metavar="HIGH|LOW|FIRST|<int>",
+                   help="which analogue-gain capture the validation matrix uses when the "
+                        "dataset spans a gain sweep: high=noisiest (default), low=cleanest, "
+                        "first=dataset order, or a gain number (e.g. 512)")
     p.add_argument("--seed", type=int)
     p.add_argument("--hf-model", dest="hf_model",
                    help="frozen Hugging Face model id to run (downloads snapshot if needed)")
@@ -457,6 +468,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.output.export = True
     if args.no_window:
         cfg.output.show_window = False
+    if getattr(args, "validate_gain", None):
+        cfg.output.validate_gain = str(args.validate_gain).strip().lower()
     if args.seed is not None:
         cfg.output.seed = args.seed
     return cfg

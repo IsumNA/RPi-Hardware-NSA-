@@ -453,8 +453,22 @@ def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):
     """
     model.eval()
     outputs = []
-    prev = None
     total_ms = 0.0
+
+    # Video families (ReMoNet/EMVD/MSTMN) carry their own recurrent state, so use
+    # their genuine temporal mechanism instead of the generic IIR blend.
+    step = getattr(model, "temporal_step", None)
+    if callable(step):
+        state = None
+        with torch.no_grad():
+            for noisy in burst:
+                t0 = time.perf_counter()
+                out_t, state = step(to_tensor(noisy), state)
+                total_ms += (time.perf_counter() - t0) * 1000.0
+                outputs.append(np.clip(to_image(out_t), 0.0, 1.0))
+        return outputs, total_ms / max(1, len(burst))
+
+    prev = None
     with torch.no_grad():
         for noisy in burst:
             spatial, dt = run(model, noisy)

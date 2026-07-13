@@ -9,18 +9,30 @@ from __future__ import annotations
 
 from .config import ModelConfig
 
+# eamamba/unifyformer/emvd/mstmn are inherently depthwise (selective scan /
+# multi-scale / depthwise-separable), so conv_type has no effect — pruned from
+# the sweep, shown as "fixed".
 NO_ACTIVATION = frozenset({"nafnet", "restormer"})
-NO_CONV_TYPE = frozenset({"nafnet", "restormer"})
+NO_CONV_TYPE = frozenset({"nafnet", "restormer", "eamamba", "unifyformer",
+                          "emvd", "mstmn"})
 CONVT_FAMILIES = frozenset({"unet", "rednet", "drunet"})
-TRANSFORMER_FAMILIES = frozenset({"restormer"})
+# Recurrent/multi-frame video denoisers: the exported graph is the per-frame
+# spatial core; the temporal recurrence runs in the streaming runtime
+# (inference.temporal_denoise dispatches to each model's temporal_step).
+TEMPORAL_FAMILIES = frozenset({"remonet", "emvd", "mstmn"})
+# Attention/scan graphs whose softmax/LayerNorm/cumulative-scan ops fall back to
+# FP on INT8 accelerators (the compiler flags this).
+TRANSFORMER_FAMILIES = frozenset({"restormer", "eamamba"})
 
 FIXED_NONLINEARITY = {
     "nafnet": "SimpleGate (split × product)",
     "restormer": "GELU gated FFN (fixed)",
+    "eamamba": "sigmoid selection gate + GELU FFN",
+    "unifyformer": "multi-scale DW + GELU FFN",
 }
 
 # block_depth is internally halved per stage for these U-Nets.
-HALVED_DEPTH_FAMILIES = frozenset({"unet", "drunet"})
+HALVED_DEPTH_FAMILIES = frozenset({"unet", "drunet", "attn_unet2"})
 
 # REDNet requires at least two encoder/decoder stages.
 MIN_BLOCK_DEPTH = {"rednet": 2}

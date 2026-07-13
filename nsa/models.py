@@ -519,6 +519,376 @@ class UNetDenoiser(nn.Module):
         return torch.clamp(x + out, 0.0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Two-Stage Attention U-Net + Corrector  (family: attn_unet2)
+# ---------------------------------------------------------------------------
+class _AttnGate(nn.Module):
+    """Additive attention gate (Oktay et al.): reweights encoder skip features by
+    how relevant they are to the decoder's gating signal, so the decoder keeps
+    real structure and suppresses noise carried across the skip connection."""
+
+    def __init__(self, skip_c: int, gate_c: int, inter_c: int):
+        super().__init__()
+        self.wg = nn.Conv2d(gate_c, inter_c, 1)
+        self.wx = nn.Conv2d(skip_c, inter_c, 1)
+        self.psi = nn.Conv2d(inter_c, 1, 1)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, skip, gate):
+        a = self.act(self.wg(gate) + self.wx(skip))
+        return skip * torch.sigmoid(self.psi(a))
+
+
+class _AttnUNet(nn.Module):
+    """Lightweight 2-scale Attention U-Net that predicts the noise residual.
+
+    Upsampling is bilinear resize + conv (not ConvTranspose), which quantizes
+    and exports cleanly to the NPU/accelerator targets.
+    """
+
+    def __init__(self, cfg: ModelConfig, in_c: int = 3):
+        super().__init__()
+        c = cfg.base_channels
+        d = max(1, cfg.block_depth // 2)
+        ct, ac = cfg.conv_type, cfg.activation
+        self.enc1 = nn.Sequential(_conv(in_c, c, ct), _act(ac),
+                                  *[_ConvBlock(c, ct, ac) for _ in range(d)])
+        self.down = nn.Conv2d(c, c * 2, 2, stride=2)
+        self.enc2 = nn.Sequential(*[_ConvBlock(c * 2, ct, ac) for _ in range(d)])
+        self.up_conv = _conv(c * 2, c, ct)
+        self.gate = _AttnGate(c, c, max(1, c // 2))
+        self.dec1 = nn.Sequential(*[_ConvBlock(c, ct, ac) for _ in range(d)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.down(e1))
+        up = F.interpolate(e2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        up = self.up_conv(up)
+        u = up + self.gate(e1, up)
+        return self.tail(self.dec1(u))
+
+
+class _Corrector(nn.Module):
+    """Tiny residual-refinement network. Sees the base clean image + the original
+    noisy frame and predicts only the missing micro-texture / edge correction."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        cc = max(8, cfg.base_channels // 2)
+        ct, ac = cfg.conv_type, cfg.activation
+        self.net = nn.Sequential(
+            nn.Conv2d(6, cc, 3, padding=1), _act(ac),
+            _ConvBlock(cc, ct, ac), _ConvBlock(cc, ct, ac),
+            nn.Conv2d(cc, 3, 3, padding=1))
+
+    def forward(self, base, noisy):
+        return self.net(torch.cat([base, noisy], dim=1))
+
+
+class TwoStageAttnUNetDenoiser(nn.Module):
+    """Two-stage pipeline (NTIRE-style): a lightweight Attention U-Net removes the
+    bulk of the noise to a base clean image, then a tiny residual corrector adds
+    back micro-texture and sharpens edges — separating structural denoising from
+    fine-detail correction to avoid the smudged look of a single small network.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.stage1 = _AttnUNet(cfg)
+        self.stage2 = _Corrector(cfg)
+
+    def forward(self, x):
+        base = torch.clamp(x + self.stage1(x), 0.0, 1.0)   # Stage 1: base clean
+        out = base + self.stage2(base, x)                  # Stage 2: refinement
+        return torch.clamp(out, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# EAMamba — Efficient All-Around Mamba  (family: eamamba)
+# ---------------------------------------------------------------------------
+def _gated_scan(v: torch.Tensor, g: torch.Tensor, dim: int, flip: bool) -> torch.Tensor:
+    """One directional selective scan as a gated cumulative average (O(N))."""
+    if flip:
+        v, g = torch.flip(v, [dim]), torch.flip(g, [dim])
+    y = torch.cumsum(g * v, dim=dim) / torch.cumsum(g, dim=dim).clamp(min=1e-4)
+    return torch.flip(y, [dim]) if flip else y
+
+
+class _SelectiveScan2D(nn.Module):
+    """Multi-head omnidirectional selective scan.
+
+    An efficient, fully ONNX/edge-exportable approximation of Mamba's selective
+    state-space scan: an input-dependent gate selects how much each pixel
+    contributes to a linear (O(N)) cumulative aggregation run in all four spatial
+    directions, giving global context at a fraction of self-attention's cost.
+    (A literal CUDA selective-scan kernel cannot export to ONNX/INT8 for the
+    Hailo/DeepX/NPU targets, so the recurrence is realised with cumulative sums.)
+    """
+
+    def __init__(self, c: int, act: str):
+        super().__init__()
+        self.in_dw = nn.Conv2d(c, c, 3, padding=1, groups=c)
+        self.gate = nn.Conv2d(c, c, 1)
+        self.merge = nn.Conv2d(c * 4, c, 1)
+        self.act = _act(act)
+
+    def forward(self, x):
+        v = self.in_dw(x)
+        g = torch.sigmoid(self.gate(x))
+        outs = [_gated_scan(v, g, 3, False), _gated_scan(v, g, 3, True),
+                _gated_scan(v, g, 2, False), _gated_scan(v, g, 2, True)]
+        return self.act(self.merge(torch.cat(outs, dim=1)))
+
+
+class _EAMambaBlock(nn.Module):
+    def __init__(self, c: int, act: str):
+        super().__init__()
+        self.norm1 = _norm(c)
+        self.scan = _SelectiveScan2D(c, act)
+        self.norm2 = _norm(c)
+        self.ffn = _GDFN(c)
+
+    def forward(self, x):
+        x = x + self.scan(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class EAMambaDenoiser(nn.Module):
+    """EAMamba-style unified denoiser: stacked selective-scan blocks evaluate the
+    whole image globally in linear time, reconstructing fine texture (hair,
+    fabric, grain) with far fewer FLOPs than a vision transformer."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.body = nn.Sequential(
+            *[_EAMambaBlock(c, cfg.activation) for _ in range(cfg.block_depth)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        feat = self.body(self.head(x))
+        return torch.clamp(x + self.tail(feat), 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# UnifyFormer — Hybrid Local-Global Aggregation  (family: unifyformer)
+# ---------------------------------------------------------------------------
+class _MultiScaleLocal(nn.Module):
+    """Parallel depthwise convs at kernels 3/5/7 aggregated by a pointwise mix —
+    multi-scale local context (no global self-attention), so borders and sharp
+    transitions stay intact (no ghosting/halos) while cost stays linear."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.dw3 = nn.Conv2d(c, c, 3, padding=1, groups=c)
+        self.dw5 = nn.Conv2d(c, c, 5, padding=2, groups=c)
+        self.dw7 = nn.Conv2d(c, c, 7, padding=3, groups=c)
+        self.pw = nn.Conv2d(c * 3, c, 1)
+
+    def forward(self, x):
+        return self.pw(torch.cat([self.dw3(x), self.dw5(x), self.dw7(x)], dim=1))
+
+
+class _UnifyBlock(nn.Module):
+    def __init__(self, c: int, act: str):
+        super().__init__()
+        self.norm1 = _norm(c)
+        self.local = _MultiScaleLocal(c)
+        self.mix = nn.Conv2d(c, c, 1)
+        self.act = _act(act)
+        self.norm2 = _norm(c)
+        self.ffn = _GDFN(c)
+
+    def forward(self, x):
+        x = x + self.mix(self.act(self.local(self.norm1(x))))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class UnifyFormerDenoiser(nn.Module):
+    """UnifyFormer-style denoiser for extreme grain/sensor artifacts: multi-scale
+    depthwise-separable local aggregation plus a gated FFN. Linear scaling keeps
+    the footprint compact while structural integrity (edges/borders) is preserved.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.body = nn.Sequential(
+            *[_UnifyBlock(c, cfg.activation) for _ in range(cfg.block_depth)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        feat = self.body(self.head(x))
+        return torch.clamp(x + self.tail(feat), 0.0, 1.0)
+
+
+# ===========================================================================
+# Video / temporal denoisers (families: remonet, emvd, mstmn)
+#
+# The exported artifact and the validation matrix use each model's single-frame
+# `forward(x)` (a real spatial denoiser, trained on the noisy/gt pairs and
+# quantized/exported like every other family). The genuine temporal mechanism
+# lives in `temporal_step(frame, state) -> (clean, state)`, a runtime recurrence
+# over the trained spatial core that `inference.temporal_denoise` dispatches to
+# in temporal / live streaming mode — matching how these run on a Pi 5 (per-frame
+# network + on-device recurrent memory; a stateful recurrent graph does not
+# quantize/deploy cleanly to the NPU targets).
+# ===========================================================================
+class _DWSBlock(nn.Module):
+    """Depthwise-separable 3×3 conv → GroupNorm → act (EMVD/MSTMN unit)."""
+
+    def __init__(self, c: int, act: str):
+        super().__init__()
+        self.dw = nn.Conv2d(c, c, 3, padding=1, groups=c)
+        self.pw = nn.Conv2d(c, c, 1)
+        self.norm = _norm(c)
+        self.act = _act(act)
+
+    def forward(self, x):
+        return self.act(self.norm(self.pw(self.dw(x))))
+
+
+class _ATAB(nn.Module):
+    """Asymmetric Temporal Aggregation Block: fuses current features with the
+    recurrent hidden memory through a motion-aware gate (asymmetric — it leans on
+    the temporal memory where motion is low, on the current frame where it's high)."""
+
+    def __init__(self, c: int, act: str):
+        super().__init__()
+        self.gate = nn.Conv2d(c * 2, c, 3, padding=1)
+        self.dw = nn.Conv2d(c, c, 3, padding=1, groups=c)
+        self.act = _act(act)
+
+    def forward(self, cur, hidden):
+        g = torch.sigmoid(self.gate(torch.cat([cur, hidden], dim=1)))
+        return self.act(self.dw(g * cur + (1.0 - g) * hidden))
+
+
+class ReMoNetDenoiser(nn.Module):
+    """ReMoNet-style recurrent video denoiser: tightly-constrained spatial convs
+    plus an Asymmetric Temporal Aggregation Block that carries a lightweight
+    hidden feature map across frames, so heavy chaotic noise is smoothed over time
+    at a fraction of a 3D-conv video model's cost."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        ct, ac = cfg.conv_type, cfg.activation
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.spatial = nn.Sequential(
+            *[_ConvBlock(c, ct, ac) for _ in range(max(1, cfg.block_depth))])
+        self.atab = _ATAB(c, ac)
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def _features(self, x):
+        return self.spatial(self.head(x))
+
+    def forward(self, x):
+        f = self._features(x)
+        f = self.atab(f, torch.zeros_like(f))       # single-frame: no history
+        return torch.clamp(x + self.tail(f), 0.0, 1.0)
+
+    @torch.no_grad()
+    def temporal_step(self, x, state):
+        f = self._features(x)
+        hidden = state if (state is not None and state.shape == f.shape) \
+            else torch.zeros_like(f)
+        fused = self.atab(f, hidden)
+        out = torch.clamp(x + self.tail(fused), 0.0, 1.0)
+        return out, f                                # new hidden = current feats
+
+
+class EMVDDenoiser(nn.Module):
+    """EMVD-style efficient multi-frame denoiser: a strict Temporal-Fusion →
+    Spatial-Denoising → Spatio-Temporal-Refinement pipeline built from small
+    depthwise-separable 3×3 convs that predict a residual noise update. Trivially
+    stripped under ~500K params and INT8/NEON-friendly for streaming HD on the Pi."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        ac = cfg.activation
+        d = max(2, cfg.block_depth)
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.spatial = nn.Sequential(*[_DWSBlock(c, ac) for _ in range(d // 2)])
+        self.refine = nn.Sequential(*[_DWSBlock(c, ac) for _ in range(d - d // 2)])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def _core(self, x):
+        f = self.spatial(self.head(x))
+        return self.tail(self.refine(f))             # predicted residual noise
+
+    def forward(self, x):
+        return torch.clamp(x + self._core(x), 0.0, 1.0)
+
+    @torch.no_grad()
+    def temporal_step(self, x, state):
+        prev = state if (state is not None and state.shape == x.shape) else None
+        if prev is not None:                         # Stage 1: temporal fusion
+            motion = (x - prev).abs().mean(1, keepdim=True)
+            w = torch.exp(-motion / 0.1)             # low motion -> trust history
+            fused = w * prev + (1.0 - w) * x
+        else:
+            fused = x
+        out = torch.clamp(fused + self._core(fused), 0.0, 1.0)
+        return out, out
+
+
+class _PyrScaleDenoiser(nn.Module):
+    def __init__(self, c: int, act: str, n: int):
+        super().__init__()
+        self.head = nn.Conv2d(3, c, 3, padding=1)
+        self.body = nn.Sequential(*[_DWSBlock(c, act) for _ in range(max(1, n))])
+        self.tail = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, x):
+        return self.tail(self.body(self.head(x)))    # residual for this band
+
+
+class MSTMNDenoiser(nn.Module):
+    """MSTMN-style multi-scale spatio-temporal network: a Gaussian–Laplace pyramid
+    splits each frame into a coarse low-frequency band and a fine detail band,
+    each denoised separately, then recombined. Adaptive Temporal Aggregation blends
+    past and present per pixel by motion, so heavy motion work happens at low
+    resolution — light on CPU cache, kind to Pi 5 thermals during long streams."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        c = cfg.base_channels
+        ac = cfg.activation
+        n = max(1, cfg.block_depth // 2)
+        self.coarse = _PyrScaleDenoiser(c, ac, n)    # low-frequency band
+        self.fine = _PyrScaleDenoiser(c, ac, n)      # high-frequency band
+
+    def _up(self, t, size):
+        return F.interpolate(t, size=size, mode="bilinear", align_corners=False)
+
+    def forward(self, x):
+        hw = x.shape[-2:]
+        g1 = F.avg_pool2d(x, 2)                       # Gaussian downsample
+        lap = x - self._up(g1, hw)                    # Laplacian (fine detail)
+        g1_d = torch.clamp(g1 + self.coarse(g1), 0.0, 1.0)
+        lap_d = lap + self.fine(lap)
+        return torch.clamp(self._up(g1_d, hw) + lap_d, 0.0, 1.0)
+
+    @torch.no_grad()
+    def temporal_step(self, x, state):
+        cur = self.forward(x)                          # multi-scale spatial denoise
+        prev = state if (state is not None and state.shape == cur.shape) else None
+        if prev is not None:                           # adaptive temporal aggregation
+            motion = (x - prev).abs().mean(1, keepdim=True)
+            w = torch.exp(-(motion * motion) / (2.0 * 0.05 * 0.05))  # per-pixel
+            out = w * prev + (1.0 - w) * cur
+        else:
+            out = cur
+        return out, out
+
+
 def build_model(cfg: ModelConfig) -> nn.Module:
     from .model_opts import normalize_model_config
     normalize_model_config(cfg)
@@ -534,6 +904,12 @@ def build_model(cfg: ModelConfig) -> nn.Module:
         "ffdnet": FFDNetDenoiser,
         "drunet": DRUNetDenoiser,
         "restormer": RestormerDenoiser,
+        "attn_unet2": TwoStageAttnUNetDenoiser,
+        "eamamba": EAMambaDenoiser,
+        "unifyformer": UnifyFormerDenoiser,
+        "remonet": ReMoNetDenoiser,
+        "emvd": EMVDDenoiser,
+        "mstmn": MSTMNDenoiser,
     }
     return families[cfg.model_family](cfg)
 

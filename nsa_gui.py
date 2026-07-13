@@ -4135,6 +4135,13 @@ class App(tk.Tk):
         self.filter_var = self._entry_row(
             body, "filter", "Dataset Filter",
             "Keyword filter for folders (e.g. imx662 or imx219 ag12)", "imx662")
+        vg = ConfigRow(
+            body, "Validation Gain",
+            "Which capture the validation matrix tests on across an analog-gain "
+            "sweep: high = noisiest (default), low = cleanest, or a gain (e.g. 512)",
+            ["high", "512", "256", "low", "first"], "high")
+        vg.pack(fill="x", pady=S(6))
+        self.rows["validate_gain"] = vg
         self.sim_noise_cb = self._check(
             body, "Simulate sensor noise on loaded frames",
             "Inject the selected sensor's physics on top of the real frames.",
@@ -4195,9 +4202,12 @@ class App(tk.Tk):
         self.model_intro.pack(anchor="w", pady=(0, S(4)))
         fam_row = ConfigRow(body, "Model Family",
                             "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet · "
-                            "FFDNet · DRUNet · Restormer",
+                            "FFDNet · DRUNet · Restormer · Attn-U-Net² · EAMamba · "
+                            "UnifyFormer · ReMoNet · EMVD · MSTMN (video)",
                             ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet",
-                             "ffdnet", "drunet", "restormer"],
+                             "ffdnet", "drunet", "restormer",
+                             "attn_unet2", "eamamba", "unifyformer",
+                             "remonet", "emvd", "mstmn"],
                             "nafnet", command=self._on_family_change)
         fam_row.pack(fill="x", pady=S(6))
         self.rows["model_family"] = fam_row
@@ -4887,7 +4897,7 @@ class App(tk.Tk):
     # -- Remembered settings (persist wizard choices across launches) ----------
     # Rows whose widgets always exist vs. those created on demand by the
     # model-family / loss selectors (which must be set after re-rendering).
-    _STATE_SIMPLE_ROWS = ("hardware", "sensor", "gain", "steps", "frames")
+    _STATE_SIMPLE_ROWS = ("hardware", "sensor", "gain", "steps", "frames", "validate_gain")
     _STATE_MODEL_ROWS = ("base_channels", "block_depth", "conv_type", "activation")
     _STATE_LOSS_ENTRIES = (("charbonnier_eps", "huber_delta", "ssim_window")
                            + tuple(f"w_{t}" for t in LossSelector.TERMS))
@@ -5254,6 +5264,19 @@ class App(tk.Tk):
                           "topology is set below")
         elif fam == "restormer":
             depth_desc = "Transformer blocks at each scale"
+        elif fam == "attn_unet2":
+            depth_desc = ("Attention-U-Net blocks per stage (internally halved); "
+                          "the Stage-2 corrector is fixed-size")
+        elif fam == "eamamba":
+            depth_desc = "Selective-scan (Mamba) blocks — global context, O(N)"
+        elif fam == "unifyformer":
+            depth_desc = "Multi-scale local-aggregation blocks (kernels 3/5/7)"
+        elif fam == "remonet":
+            depth_desc = "Spatial conv blocks (video — recurrent temporal memory)"
+        elif fam == "emvd":
+            depth_desc = "Depthwise blocks split spatial/refine (video, <500K params)"
+        elif fam == "mstmn":
+            depth_desc = "Pyramid blocks per scale (video — coarse + fine bands)"
         else:
             depth_desc = "Stack depth (conv blocks or residual groups)"
         cfgrow("block_depth", "Block Depth", depth_desc,
@@ -5582,6 +5605,10 @@ class App(tk.Tk):
                 cmd += ["--filter", *tokens]
         else:
             cmd += ["--simulated"]
+
+        vg = self._row_get("validate_gain", "high")
+        if vg:
+            cmd += ["--validate-gain", vg]
 
         self._append_noise_std_cli_args(cmd)
         self._append_loss_cli_args(cmd)

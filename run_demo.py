@@ -58,6 +58,39 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _analog_gain_of(src: dict) -> int:
+    """Parse the analogue gain (``agN``) from a frame source's folder name.
+
+    Dataset folders follow the denoise-hw convention ``imx662_ag<gain>_test``;
+    returns the gain (e.g. 512) or -1 when the name carries no ag tag.
+    """
+    import re
+    name = str(src.get("name") or src.get("noisy") or "").lower()
+    m = re.search(r"ag(\d+)", name)
+    return int(m.group(1)) if m else -1
+
+
+def _order_sources_for_validation(sources: list, mode: str) -> list:
+    """Order frame sources so the representative (panel) frame matches ``mode``.
+
+    ``high`` = noisiest first (highest analogue gain), ``low`` = cleanest first,
+    ``first`` = leave dataset order, or a gain number = closest-to-that first.
+    """
+    mode = (str(mode) or "high").strip().lower()
+    if not sources or mode in ("first", "none", "off", ""):
+        return sources
+    if mode == "high":
+        return sorted(sources, key=_analog_gain_of, reverse=True)
+    if mode == "low":
+        return sorted(sources, key=_analog_gain_of)
+    try:
+        target = int(mode)
+    except ValueError:
+        return sorted(sources, key=_analog_gain_of, reverse=True)
+    return sorted(sources, key=lambda s: (abs(_analog_gain_of(s) - target),
+                                          -_analog_gain_of(s)))
+
+
 def _loss_summary(lc) -> str:
     """Human-readable one-liner for the active loss + its relevant parameter(s)."""
     from nsa.config import DEFAULT_LOSS_WEIGHTS, parse_loss_terms
@@ -171,7 +204,9 @@ def main() -> int:
     # -- Assemble the working frame set (1 frame for single, N for batch) -----
     frames = []
     if real_capture:
-        sources = list_frames(real_source, filter_tokens, limit=n_want)
+        # Fetch every matching capture (no limit yet) so we can pick which
+        # analogue gain drives the validation panel before truncating to n_want.
+        sources = list_frames(real_source, filter_tokens)
         if filter_tokens:
             log(f"Dataset filter: {' '.join(filter_tokens)}  "
                 f"({len(sources)} matching frame(s))", "step")
@@ -180,10 +215,19 @@ def main() -> int:
         # mode any real image is a valid clean source; in plain real mode any real
         # frame is still a genuine capture (better than fabricated pixels).
         if not sources and filter_tokens:
-            sources = list_frames(real_source, None, limit=n_want)
+            sources = list_frames(real_source, None)
             if sources:
                 log(f"No frames matched {' '.join(filter_tokens)!r}; using "
                     f"{len(sources)} unfiltered real frame(s) instead", "warn")
+        # Order so the representative (panel) frame uses the requested analogue
+        # gain — by default the noisiest capture, the low-light stress test.
+        sources = _order_sources_for_validation(sources, cfg.output.validate_gain)
+        if sources:
+            g = _analog_gain_of(sources[0])
+            log(f"Validation frame: {sources[0].get('name', '?')}"
+                + (f"  (analogue gain {g}, mode '{cfg.output.validate_gain}')"
+                   if g > 0 else ""), "info")
+        sources = sources[:n_want]
         for i, s in enumerate(sources):
             try:
                 frames.append(build_frame_from_source(

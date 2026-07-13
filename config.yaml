@@ -119,6 +119,10 @@ output:
   dir: outputs
   show_window: true         # open the 3-panel validation matrix
   seed: 662
+  # Which capture the validation matrix tests on across an analog-gain sweep
+  # (imx662_ag1..ag512): high = noisiest (default, the low-light stress test),
+  # low = cleanest, first = dataset order, or a gain number (e.g. 512).
+  validate_gain: high
 
 # ---- Pi live testing (GUI LIVE TEST on AI server → Pi camera over SSH) ------
 pi_live:
