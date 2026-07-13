@@ -84,6 +84,12 @@ optimization:
   extended_train: true
   extended_steps: 3000      # optimizer steps for the extended full-dataset pass
   extended_max_side: 1024   # cap image long-side when loading full frames
+  # Training-sample emphasis — weight = gain^gain_emphasis * (1 + dark_emphasis*darkness).
+  # Oversamples the hard captures (very grainy high-analogue-gain folders, and
+  # low-intensity scenes) instead of giving every folder equal attention.
+  # ag512-dark ends up sampled ~20-60x more than ag1-bright. 0 / 0 = uniform.
+  gain_emphasis: 0.5        # exponent on the folder's ag<N> analogue gain
+  dark_emphasis: 2.0        # extra weight for dark scenes (mean intensity < 0.35)
   # Training objective. name may be a single term, a '+'-composite of terms
   # (summed as Sum of weight*term), or the charbonnier_ssim preset:
   #   l1 / l2 (mse)    -> plain MAE / MSE (l2 blurs texture; avoid on its own)

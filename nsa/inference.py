@@ -357,12 +357,21 @@ def _augment_pair(x: torch.Tensor, y: torch.Tensor,
 
 
 def _sample_batch(tensors, crop: int, batch: int,
-                  g: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble an augmented minibatch of same-sized crops across frames."""
+                  g: torch.Generator,
+                  weights: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Assemble an augmented minibatch of same-sized crops across frames.
+
+    ``weights`` (one per frame) biases which frames the crops come from —
+    used to oversample the hard high-gain / low-light captures.
+    """
     c = min([crop] + [min(t[0].shape[-2:]) for t in tensors])
+    if weights is not None:
+        idxs = torch.multinomial(weights, batch, replacement=True, generator=g)
+    else:
+        idxs = torch.randint(0, len(tensors), (batch,), generator=g)
     xs, ys = [], []
-    for _ in range(batch):
-        xi, yi = tensors[int(torch.randint(0, len(tensors), (1,), generator=g))]
+    for k in range(batch):
+        xi, yi = tensors[int(idxs[k])]
         h, w = xi.shape[-2:]
         iy = int(torch.randint(0, h - c + 1, (1,), generator=g))
         ix = int(torch.randint(0, w - c + 1, (1,), generator=g))
@@ -375,16 +384,21 @@ def _sample_batch(tensors, crop: int, batch: int,
 
 
 def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
-           crop: int, batch: int, qat: bool, lr: float, loss_fn=None) -> nn.Module:
+           crop: int, batch: int, qat: bool, lr: float, loss_fn=None,
+           weights=None) -> nn.Module:
     """Shared training loop: configurable loss + 8× aug + warmup-cosine LR + grad clip.
 
     Gradient clipping and a short warmup keep even deep transpose-conv nets
     (DRUNet / RED-Net) from diverging at an aggressive learning rate, while the
     minibatch of augmented crops gives stable, low-variance gradients. ``loss_fn``
-    defaults to Charbonnier (see ``build_loss``).
+    defaults to Charbonnier (see ``build_loss``). ``weights`` (one per frame)
+    biases crop sampling towards the hard high-gain / low-light captures.
     """
     if loss_fn is None:
         loss_fn = _charbonnier
+    wt = None
+    if weights is not None and len(weights) == len(tensors):
+        wt = torch.as_tensor(list(weights), dtype=torch.float32).clamp(min=1e-6)
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
     steps = max(1, steps)
@@ -403,7 +417,7 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
         enable_qat(model)
     model.train()
     for i in range(steps):
-        xb, yb = _sample_batch(tensors, crop, batch, g)
+        xb, yb = _sample_batch(tensors, crop, batch, g, weights=wt)
         opt.zero_grad()
         loss = loss_fn(model(xb), yb)
         loss.backward()
@@ -429,18 +443,21 @@ def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
 
 def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
                     progress=None, crop: int = 160, qat: bool = False,
-                    batch: int = 4, lr: float = 3e-3, loss_fn=None) -> nn.Module:
+                    batch: int = 4, lr: float = 3e-3, loss_fn=None,
+                    weights=None) -> nn.Module:
     """Calibrate across a set of (noisy, clean) frames (batch / multi-image fit).
 
     Draws an augmented minibatch of crops across all frames each step — the
     "patches across many images" strategy from denoise-hw, with 8× dihedral
     augmentation, a configurable loss (see ``build_loss``) and gradient clipping
-    for stability.
+    for stability. ``weights`` (one per pair) oversamples the hard high-gain /
+    low-light captures (see ``raw_io.training_sample_weights``).
     """
     if not pairs:
         raise ValueError("calibrate_multi needs at least one (noisy, clean) pair")
     tensors = [(to_tensor(n), to_tensor(c)) for n, c in pairs]
-    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr, loss_fn)
+    return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr,
+                  loss_fn, weights=weights)
 
 
 def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):

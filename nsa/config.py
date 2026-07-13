@@ -127,6 +127,11 @@ class OptimizationConfig:
     extended_train: bool = False    # enable the extra full-dataset training pass
     extended_steps: int = 1500      # optimizer steps for the extended pass
     extended_max_side: int = 1024   # cap image long-side when loading full frames
+    # Training-sample emphasis: w = gain^gain_emphasis · (1 + dark_emphasis·darkness).
+    # Oversamples the hard high-analogue-gain, low-intensity captures instead of
+    # sampling every folder uniformly. 0 / 0 restores uniform sampling.
+    gain_emphasis: float = 0.5      # exponent on the folder's ag<N> analogue gain
+    dark_emphasis: float = 2.0      # extra weight for dark scenes (mean < 0.35)
 
 
 @dataclass
@@ -353,6 +358,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extended-max-side", dest="extended_max_side", type=int,
                    help="cap image long-side when loading full frames for extended "
                         "training (default 1024)")
+    p.add_argument("--gain-emphasis", dest="gain_emphasis", type=float,
+                   help="training-sample weight exponent on analogue gain — "
+                        "oversamples high-gain (grainy) captures (default 0.5; "
+                        "0 = uniform)")
+    p.add_argument("--dark-emphasis", dest="dark_emphasis", type=float,
+                   help="extra training-sample weight for low-intensity scenes "
+                        "(default 2.0; 0 = off)")
     p.add_argument("--loss", dest="loss",
                    help="training loss: a preset (%s), a single term (%s), or a "
                         "'+'-composite e.g. l1+perceptual+edge (default: "
@@ -445,6 +457,10 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.optimization.extended_steps = max(1, int(args.extended_steps))
     if getattr(args, "extended_max_side", None):
         cfg.optimization.extended_max_side = max(64, int(args.extended_max_side))
+    if getattr(args, "gain_emphasis", None) is not None:
+        cfg.optimization.gain_emphasis = max(0.0, float(args.gain_emphasis))
+    if getattr(args, "dark_emphasis", None) is not None:
+        cfg.optimization.dark_emphasis = max(0.0, float(args.dark_emphasis))
     if getattr(args, "loss", None):
         cfg.optimization.loss.name = args.loss
     if getattr(args, "charbonnier_eps", None) is not None:

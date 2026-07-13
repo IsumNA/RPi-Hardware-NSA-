@@ -198,9 +198,18 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         lc.name, charbonnier_eps=lc.charbonnier_eps, huber_delta=lc.huber_delta,
         ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight, weights=lc.weights)
     # Ranking pass: lighter minibatch keeps big sweeps tractable; the winner is
-    # re-fit at full batch by run_demo afterwards.
+    # re-fit at full batch by run_demo afterwards. Sample weights oversample the
+    # hard high-gain / low-light captures (same emphasis as the final compile).
+    from nsa.raw_io import training_sample_weights
+    smp_weights = None
+    if len(frames) > 1:
+        smp_weights = training_sample_weights(
+            [f.source for f in frames], [f.clean_rgb for f in frames],
+            gain_exp=cfg.optimization.gain_emphasis,
+            dark_emphasis=cfg.optimization.dark_emphasis)
     calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
-                    cfg.output.seed, progress=None, batch=2, loss_fn=loss_fn)
+                    cfg.output.seed, progress=None, batch=2, loss_fn=loss_fn,
+                    weights=smp_weights)
 
     psnr_in = float(np.mean([psnr(f.noisy_rgb, f.clean_rgb) for f in frames]))
     psnr_fp32 = float(np.mean(

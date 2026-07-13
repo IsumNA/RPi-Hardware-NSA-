@@ -461,7 +461,8 @@ def load_training_pairs(
     temporal_frames: int = 8,
     max_side: int = 1024,
     min_patch: int = 64,
-) -> list[tuple[np.ndarray, np.ndarray]]:
+    with_names: bool = False,
+) -> list:
     """Load EVERY paired capture under ``path`` as full-image (noisy, clean) pairs.
 
     Unlike :func:`build_frame_from_source` (which returns a single detail crop per
@@ -472,7 +473,9 @@ def load_training_pairs(
     * paired noisy/gt          -> real ground truth (denoise-hw convention)
     * paired + simulate_noise  -> use gt as clean, inject sensor noise on top
     Images are downscaled so the longest side is <= ``max_side`` to bound memory.
-    Returns a list of ``(noisy_rgb, clean_rgb)`` float32 [0,1] arrays.
+    Returns ``(noisy_rgb, clean_rgb)`` float32 [0,1] pairs — or, with
+    ``with_names=True``, ``(folder_name, noisy_rgb, clean_rgb)`` triples so the
+    caller can weight sampling by each capture's analogue-gain tag.
     """
     if not path:
         return []
@@ -501,8 +504,48 @@ def load_training_pairs(
         noisy, gt = noisy[:h, :w], gt[:h, :w]
         if simulate_noise:                       # gt is clean -> simulate sensor noise
             noisy, gt = _synth_noisy_gt(gt, gain, sensor, temporal_frames, seed + i)
-        pairs.append((noisy.astype(np.float32), gt.astype(np.float32)))
+        item = (noisy.astype(np.float32), gt.astype(np.float32))
+        pairs.append((folder.name, *item) if with_names else item)
     return pairs
+
+
+def analog_gain_from_name(name) -> int | None:
+    """Parse the analogue gain from a capture folder name (``…ag<N>…``).
+
+    Dataset folders follow the denoise-hw convention ``imx662_ag<gain>_test``;
+    returns the gain (e.g. 512) or ``None`` when the name carries no ag tag.
+    """
+    import re
+    m = re.search(r"ag(\d+)", str(name or "").lower())
+    return int(m.group(1)) if m else None
+
+
+def training_sample_weights(names, cleans, *, gain_exp: float = 0.5,
+                            dark_emphasis: float = 2.0) -> list[float]:
+    """Per-capture sampling weights emphasising high-gain, low-intensity frames.
+
+    High analogue gain means far heavier grain, and dark scenes are where the
+    denoiser is actually needed — but uniform sampling gives an ag512 dark
+    capture the same training attention as an ag1 bright one. Weight:
+
+        w = gain^gain_exp · (1 + dark_emphasis · darkness)
+
+    where ``darkness`` ramps 0→1 as the clean frame's mean intensity falls
+    below 0.35. With the defaults (sqrt gain, dark ×3), an ag512 dark capture
+    is sampled ~20-60× more often than an ag1 bright one while every folder
+    keeps a non-zero share. Captures without an ag tag get the median gain of
+    the tagged ones (neutral), so mixed datasets stay balanced.
+    """
+    gains = [analog_gain_from_name(n) for n in names]
+    known = [g for g in gains if g]
+    fill = float(np.median(known)) if known else 1.0
+    weights = []
+    for g_val, clean in zip(gains, cleans):
+        gw = float(g_val if g_val else fill) ** max(0.0, float(gain_exp))
+        luma = float(np.mean(clean))
+        dark = min(max((0.35 - luma) / 0.35, 0.0), 1.0)
+        weights.append(gw * (1.0 + max(0.0, float(dark_emphasis)) * dark))
+    return weights
 
 
 def build_frame(

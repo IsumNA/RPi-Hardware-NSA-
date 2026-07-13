@@ -40,7 +40,8 @@ from nsa.inference import (build_loss, calibrate, calibrate_multi,
                            psnr, run, ssim, temporal_denoise)
 from nsa.models import build_model, count_params
 from nsa.raw_io import (build_burst, build_frame, build_frame_from_source,
-                        list_frames, load_training_pairs)
+                        list_frames, load_training_pairs,
+                        training_sample_weights)
 from nsa.sensors import get_sensor, with_noise_std
 from nsa.report import compute_fitness, print_report, print_target_suitability
 from nsa.scaling import render_scaling_chart, scaling_curves
@@ -351,10 +352,16 @@ def main() -> int:
                 progress.update(task, completed=i, loss=loss)
 
             pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
+            cal_weights = None
+            if real_loaded and len(frames) > 1:
+                cal_weights = training_sample_weights(
+                    [f.source for f in frames], [f.clean_rgb for f in frames],
+                    gain_exp=cfg.optimization.gain_emphasis,
+                    dark_emphasis=cfg.optimization.dark_emphasis)
             calibrate_multi(model, pairs, cal_steps,
                             cfg.output.seed, on_step, qat=use_qat,
                             crop=cfg.optimization.patch_size,
-                            loss_fn=loss_fn)
+                            loss_fn=loss_fn, weights=cal_weights)
 
     # -- Optional extended training on the WHOLE dataset ---------------------
     # After the quick calibration, keep training on every paired image in the
@@ -362,17 +369,36 @@ def main() -> int:
     # pretrained HF ONNX graphs (not trainable here).
     ext_steps = int(cfg.optimization.extended_steps)
     if cfg.optimization.extended_train and not hf_onnx and ext_steps > 0:
-        ext_pairs = []
+        ext_named = []
         if real_capture and real_source:
-            ext_pairs = load_training_pairs(
+            ext_named = load_training_pairs(
                 real_source, filter_tokens or None, sensor=sensor,
                 gain=cfg.sensor.gain, simulate_noise=simulate_noise,
                 seed=cfg.output.seed, temporal_frames=tframes,
-                max_side=int(cfg.optimization.extended_max_side))
+                max_side=int(cfg.optimization.extended_max_side),
+                with_names=True)
+        ext_pairs = [(n, c) for _, n, c in ext_named]
         if ext_pairs:
+            # Oversample the hard captures: high analogue gain (heavy grain)
+            # and low-intensity scenes get proportionally more training crops.
+            ext_weights = training_sample_weights(
+                [name for name, _, _ in ext_named],
+                [c for _, _, c in ext_named],
+                gain_exp=cfg.optimization.gain_emphasis,
+                dark_emphasis=cfg.optimization.dark_emphasis)
             log(f"Extended training: {len(ext_pairs)} full image(s) from the "
                 f"dataset  ·  {ext_steps} steps (this is the slow, high-quality "
                 f"pass)", "step")
+            total_w = sum(ext_weights) or 1.0
+            top = sorted(zip(ext_weights, (n for n, _, _ in ext_named)),
+                         reverse=True)[:3]
+            hi_share = 100.0 * sum(
+                w for w, (name, _, _) in zip(ext_weights, ext_named)
+                if (_analog_gain_of({"name": name}) or 0) >= 256) / total_w
+            log(f"Sample emphasis: gain^{cfg.optimization.gain_emphasis:g} · "
+                f"dark×{cfg.optimization.dark_emphasis:g} — ag256+ captures get "
+                f"{hi_share:.0f}% of training crops "
+                f"(heaviest: {', '.join(n for _, n in top)})", "info")
             with Progress(
                 TextColumn("[muted]{task.description}"),
                 BarColumn(complete_style=RPI_GREEN, finished_style=RPI_GREEN),
@@ -389,7 +415,7 @@ def main() -> int:
 
                 calibrate_multi(model, ext_pairs, ext_steps, cfg.output.seed + 1,
                                 on_ext_step, crop=cfg.optimization.patch_size,
-                                qat=use_qat, loss_fn=loss_fn)
+                                qat=use_qat, loss_fn=loss_fn, weights=ext_weights)
             log("Extended training complete — model refined on the full dataset", "ok")
         elif cfg.optimization.extended_train:
             log("Extended training requested but no paired dataset images were "
