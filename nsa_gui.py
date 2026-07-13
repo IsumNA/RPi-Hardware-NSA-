@@ -1105,6 +1105,9 @@ class ImageTestView(tk.Toplevel):
     """
 
     PANEL_W = 372  # logical px per panel (scaled by S)
+    PANEL_H = 300  # max panel height — images are FIT inside W×H (not width-only,
+                   # which let portrait/4:3 images grow taller than the window and
+                   # clip to just their top slice)
 
     def __init__(self, master):
         super().__init__(master, bg=WHITE)
@@ -1289,12 +1292,16 @@ class ImageTestView(tk.Toplevel):
     def _set_panel(self, key, rgb_u8):
         try:
             im = Image.fromarray(rgb_u8)
-            pw = S(self.PANEL_W)
-            ph = max(1, int(round(pw * im.height / im.width)))
-            im = im.resize((pw, ph), Image.LANCZOS)
+            # Fit inside the panel box, preserving aspect — never exceed either
+            # dimension, so tall (portrait) images can't clip to a top slice.
+            pw, ph = S(self.PANEL_W), S(self.PANEL_H)
+            scale = min(pw / im.width, ph / im.height)
+            tw = max(1, int(round(im.width * scale)))
+            th = max(1, int(round(im.height * scale)))
+            im = im.resize((tw, th), Image.LANCZOS)
             photo = ImageTk.PhotoImage(im)
             self._imgs[key] = photo
-            self.panels[key].config(image=photo, text="")
+            self.panels[key].config(image=photo, text="", width=tw, height=th)
         except Exception:  # noqa: BLE001
             pass
 
