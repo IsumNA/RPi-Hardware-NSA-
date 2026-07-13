@@ -23,25 +23,30 @@ import torch.nn as nn
 MAGIC = b"NSA1"
 
 
-def export_onnx(model: nn.Module, patch: int, path: Path) -> Path | None:
+def export_onnx(model: nn.Module, patch: int, path: Path,
+                dynamic: bool = True) -> Path | None:
     """Export the FP32 graph to ONNX.
 
     Returns the path on success, or ``None`` if export is unavailable (e.g. the
     optional ``onnx`` package is not installed) so the pipeline can continue and
     still write the device binary.
+
+    ``dynamic=False`` exports a fixed HxW (preferred for Intel NPU compile).
     """
     model.eval()
     dummy = torch.randn(1, 3, patch, patch)
     try:
-        torch.onnx.export(
-            model,
-            dummy,
-            str(path),
+        kwargs = dict(
             input_names=["raw_rgb"],
             output_names=["denoised_rgb"],
-            dynamic_axes={"raw_rgb": {2: "h", 3: "w"}, "denoised_rgb": {2: "h", 3: "w"}},
-            opset_version=17,
+            opset_version=18,
         )
+        if dynamic:
+            kwargs["dynamic_axes"] = {
+                "raw_rgb": {2: "h", 3: "w"},
+                "denoised_rgb": {2: "h", 3: "w"},
+            }
+        torch.onnx.export(model, dummy, str(path), **kwargs)
         return path
     except Exception:
         try:
@@ -79,8 +84,35 @@ def _pack_int8_weights(model: nn.Module) -> tuple[bytes, list[dict]]:
     return buf.getvalue(), manifest
 
 
-def write_device_artifact(model: nn.Module, cfg, compile_result, path: Path) -> dict:
-    """Write a real, self-describing INT8 device binary (.hef/.bin/.ort)."""
+def write_device_artifact(model: nn.Module, cfg, compile_result, path: Path,
+                          onnx_path: Path | None = None) -> dict:
+    """Write a real, self-describing device binary (.hef/.bin/.ort/.xml).
+
+    For ``intel_npu``, compiles ``onnx_path`` to OpenVINO IR (``.xml`` + ``.bin``)
+    when ONNX is available; otherwise falls back to the packed weight container.
+    """
+    if cfg.hardware == "intel_npu" and onnx_path is not None and Path(onnx_path).is_file():
+        from .openvino_npu import compile_onnx_to_ir, npu_available, npu_device_name
+
+        if not npu_available():
+            raise RuntimeError(
+                "Intel NPU not visible to OpenVINO. Ensure Level Zero NPU libs "
+                "are under .npu_driver/prefix (or installed system-wide) and "
+                "that /dev/accel/accel0 exists."
+            )
+        compiled, xml_path = compile_onnx_to_ir(Path(onnx_path), Path(path), device="NPU")
+        bin_path = xml_path.with_suffix(".bin")
+        total = xml_path.stat().st_size + (bin_path.stat().st_size if bin_path.exists() else 0)
+        return {
+            "path": xml_path,
+            "header_bytes": xml_path.stat().st_size,
+            "weight_bytes": bin_path.stat().st_size if bin_path.exists() else 0,
+            "total_bytes": total,
+            "layers": 0,
+            "device": npu_device_name() or "NPU",
+            "compiled": compiled,
+        }
+
     weights_blob, manifest = _pack_int8_weights(model)
     header = {
         "format": "NSA-Compiled-Network",

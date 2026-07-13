@@ -62,6 +62,14 @@ FLASH = {
             "python -c \"import onnxruntime as ort; ort.InferenceSession('exported_model.onnx')\"",
         ],
     ),
+    "intel_npu": (
+        "Intel AI Boost (NPU via OpenVINO)",
+        [
+            "# On this host with OpenVINO + Intel NPU driver:",
+            "python -c \"from openvino import Core; print(Core().available_devices)\"",
+            "# Then: Core().compile_model('hardware_ready.xml', 'NPU')",
+        ],
+    ),
 }
 
 
@@ -75,7 +83,8 @@ def build_package(summary: dict, out: Path, name: str | None = None,
     for the target is missing.
     """
     target = summary.get("hardware", "hailo8")
-    ext = {"hailo8": ".hef", "deepx": ".bin", "rpi5_cpu": ".ort"}.get(target, ".bin")
+    ext = {"hailo8": ".hef", "deepx": ".bin", "rpi5_cpu": ".ort",
+           "intel_npu": ".xml"}.get(target, ".bin")
     binary = out / f"hardware_ready{ext}"
     onnx = out / "exported_model.onnx"
     panel = out / "validation_panel.png"
@@ -90,6 +99,10 @@ def build_package(summary: dict, out: Path, name: str | None = None,
     pkg.mkdir(parents=True, exist_ok=True)
 
     shutil.copy(binary, pkg / binary.name)
+    # OpenVINO IR companion weights
+    companion = binary.with_suffix(".bin")
+    if target == "intel_npu" and companion.exists():
+        shutil.copy(companion, pkg / companion.name)
     if onnx.exists():
         shutil.copy(onnx, pkg / onnx.name)
     if panel.exists():

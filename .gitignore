@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local Intel NPU Level Zero driver extract (large; not committed)
+.npu_driver/
+
 # Demo outputs (regenerated on every run)
 outputs/
 

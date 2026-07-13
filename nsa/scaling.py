@@ -27,6 +27,7 @@ CHIP_STYLE = {
     "hailo8": {"color": RASPBERRY, "marker": "o"},
     "deepx": {"color": GREEN, "marker": "s"},
     "rpi5_cpu": {"color": "#4A7FC8", "marker": "^"},
+    "intel_npu": {"color": "#0071C5", "marker": "D"},
 }
 
 # Side lengths to sweep (patch = square side in pixels).

@@ -62,6 +62,17 @@ from nsa.visualize import render_panel
 
 console = Console()
 
+
+def _parse_loss_weights(specs) -> dict:
+    """Turn a list of ``TERM=VALUE`` strings into a ``{term: weight}`` dict."""
+    out = {}
+    for spec in (specs or []):
+        term, _, val = str(spec).partition("=")
+        term = term.strip().lower()
+        if term and val.strip():
+            out[term] = float(val)
+    return out
+
 # ---------------------------------------------------------------------------
 # Colours (match nsa/theme.py palette)
 # ---------------------------------------------------------------------------
@@ -185,7 +196,7 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
     lc = cfg.optimization.loss
     loss_fn = build_loss(
         lc.name, charbonnier_eps=lc.charbonnier_eps, huber_delta=lc.huber_delta,
-        ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight)
+        ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight, weights=lc.weights)
     # Ranking pass: lighter minibatch keeps big sweeps tractable; the winner is
     # re-fit at full batch by run_demo afterwards.
     calibrate_multi(model, pairs, cfg.optimization.calibration_steps,
@@ -196,7 +207,7 @@ def _run_candidate(cfg: Config, frames: list) -> SearchResult:
         [psnr(run(model, f.noisy_rgb)[0], f.clean_rgb) for f in frames]
     ))
 
-    quantized = cfg.uses_accelerator and cfg.optimization.quantize
+    quantized = cfg.requires_int8 and cfg.optimization.quantize
     if quantized:
         qmodel = fake_quantize_int8(model)
         psnr_int8 = float(np.mean(
@@ -321,11 +332,22 @@ def _select_winner(results: list[SearchResult], max_latency: "float | None",
             return min(results, key=lambda r: r.latency_ms), False
 
     if prefer == "quality":
-        winner = max(pool, key=lambda r: (r.psnr_out, -r.latency_ms))
+        # Prefer PSNR, but break ties with SSIM / LPIPS so "quality" does not
+        # quietly pick an over-smoothed high-PSNR blur model.
+        def _quality_key(r: SearchResult):
+            ssim_v = r.ssim_out if r.ssim_out is not None else 0.0
+            lpips_v = r.lpips_out if r.lpips_out is not None else 1.0
+            return (r.psnr_out, ssim_v, -lpips_v, -r.latency_ms)
+        winner = max(pool, key=_quality_key)
     elif prefer == "speed":
         winner = min(pool, key=lambda r: (r.latency_ms, -r.psnr_out))
     else:  # balanced
-        winner = max(pool, key=lambda r: r.fitness)
+        # Fitness already blends PSNR/SSIM/LPIPS; among near-ties prefer sharper.
+        def _balanced_key(r: SearchResult):
+            ssim_v = r.ssim_out if r.ssim_out is not None else 0.0
+            lpips_v = r.lpips_out if r.lpips_out is not None else 1.0
+            return (r.fitness, ssim_v, -lpips_v)
+        winner = max(pool, key=_balanced_key)
     return winner, budget_met
 
 
@@ -433,7 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     # Target
-    p.add_argument("--hardware", choices=["rpi5_cpu", "hailo8", "deepx"],
+    p.add_argument("--hardware", choices=["rpi5_cpu", "hailo8", "deepx", "intel_npu"],
                    default="hailo8", help="target accelerator (default: hailo8)")
     # Data source
     p.add_argument("--sensor", choices=["imx219", "imx662", "imxng"],
@@ -442,8 +464,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="analog gain of the test frame (default: 256)")
     p.add_argument("--noise-std", dest="noise_std", type=float, default=None,
                    help="override injected Gaussian read-noise std (electrons RMS, denoise-hw style)")
-    p.add_argument("--loss", dest="loss", choices=list(LOSSES), default="charbonnier",
-                   help="training loss function (default: charbonnier)")
+    p.add_argument("--loss", dest="loss", default="charbonnier",
+                   help="training loss: a preset (%s), a single term, or a "
+                        "'+'-composite e.g. l1+perceptual+edge" % ", ".join(LOSSES))
+    p.add_argument("--loss-weight", dest="loss_weights", action="append",
+                   metavar="TERM=VALUE",
+                   help="weight for a term in a '+'-composite loss (repeatable)")
     p.add_argument("--charbonnier-eps", dest="charbonnier_eps", type=float, default=1e-3,
                    help="Charbonnier epsilon (default: 1e-3)")
     p.add_argument("--huber-delta", dest="huber_delta", type=float, default=1.0,
@@ -624,7 +650,8 @@ def main() -> int:
             loss=LossConfig(
                 name=args.loss, charbonnier_eps=args.charbonnier_eps,
                 huber_delta=args.huber_delta, ssim_window=args.ssim_window,
-                ssim_weight=args.ssim_weight),
+                ssim_weight=args.ssim_weight,
+                weights=_parse_loss_weights(getattr(args, "loss_weights", None))),
         )
         spref = f"{sensor_key:<7} " if multi_sensor else ""
         label = f"{spref}{fam.upper()} {ch}ch×{dep} {ct[:3]} {act}"
@@ -784,7 +811,17 @@ def main() -> int:
         "--gain",          str(args.gain),
         "--steps",         str(args.final_steps),
         "--seed",          str(args.seed),
+        "--no-window",
+        # Prefer structure-aware training so the final run doesn't over-smooth.
+        "--loss", getattr(args, "loss", "charbonnier_ssim") or "charbonnier_ssim",
+        "--ssim-weight", str(getattr(args, "ssim_weight", 0.22)),
+        "--charbonnier-eps", str(getattr(args, "charbonnier_eps", 0.0005)),
+        "--ssim-window", str(getattr(args, "ssim_window", 11)),
+        "--extended-train",
+        "--extended-steps", "3000",
     ]
+    for term, val in _parse_loss_weights(getattr(args, "loss_weights", None)).items():
+        cmd += ["--loss-weight", f"{term}={val:g}"]
     if args.real_capture and args.dataset_path:
         cmd += ["--real", "--dataset", args.dataset_path]
     if args.simulate_noise:

@@ -19,6 +19,7 @@ HARDWARE = {
     "rpi5_cpu": "Raspberry Pi 5 (CPU)",
     "hailo8": "Raspberry Pi 5 + Hailo-8",
     "deepx": "DeepX DX-M1",
+    "intel_npu": "Intel AI Boost (NPU / OpenVINO)",
 }
 MODEL_FAMILIES = ("cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet",
                   "ffdnet", "drunet", "restormer")
@@ -27,7 +28,38 @@ BLOCK_DEPTHS = (2, 4, 8)
 CONV_TYPES = ("standard", "depthwise")
 ACTIVATIONS = ("relu", "gelu", "silu")
 GAINS = (256, 512)
-LOSSES = ("charbonnier", "l1", "l2", "mse", "huber", "ssim", "charbonnier_ssim")
+
+# -- Loss vocabulary ----------------------------------------------------------
+# Individual loss "terms" that can be combined into a composite objective by
+# joining them with '+', e.g. "l1+perceptual+edge". Each term's default weight
+# is what it contributes when several are summed (a lone term is used unscaled).
+LOSS_TERMS = ("l1", "l2", "charbonnier", "huber", "ssim", "perceptual", "edge")
+DEFAULT_LOSS_WEIGHTS = {
+    "l1": 1.0, "l2": 1.0, "charbonnier": 1.0, "huber": 1.0,
+    "ssim": 0.2, "perceptual": 0.1, "edge": 0.05,
+}
+# Named single-selection presets kept for backwards compatibility / convenience.
+# ``charbonnier_ssim`` is a special (1-w)·charbonnier + w·(1-SSIM) blend; the
+# rest expand to a term list via LOSS_ALIASES (or are a bare term name).
+LOSSES = ("charbonnier", "l1", "l2", "mse", "huber", "ssim", "charbonnier_ssim",
+          "l1_perceptual_edge")
+LOSS_ALIASES = {"mse": "l2", "l1_perceptual_edge": "l1+perceptual+edge"}
+
+
+def parse_loss_terms(name: str) -> list:
+    """Split a loss ``name`` into its individual terms (expanding aliases)."""
+    key = (name or "charbonnier").strip().lower()
+    key = LOSS_ALIASES.get(key, key)
+    return [t for t in (s.strip() for s in key.split("+")) if t]
+
+
+def valid_loss(name: str) -> bool:
+    """True if ``name`` is a known preset or a '+'-composite of known terms."""
+    key = (name or "").strip().lower()
+    if key == "charbonnier_ssim":
+        return True
+    terms = parse_loss_terms(key)
+    return bool(terms) and all(t in LOSS_TERMS for t in terms)
 
 
 class ConfigError(ValueError):
@@ -69,11 +101,16 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    name: str = "charbonnier"       # charbonnier | l1 | l2 | huber | ssim | charbonnier_ssim
+    # Single term (charbonnier | l1 | l2 | huber | ssim | perceptual | edge), a
+    # '+'-composite of terms (e.g. "l1+perceptual+edge"), or the charbonnier_ssim
+    # preset. Composite terms are summed using ``weights`` (see DEFAULT_LOSS_WEIGHTS).
+    name: str = "l1_perceptual_edge"
     charbonnier_eps: float = 1e-3   # Charbonnier L2->L1 transition (smaller = sharper)
     huber_delta: float = 1.0        # Huber/smooth-L1 crossover threshold
     ssim_window: int = 11           # Gaussian window for the SSIM term (odd)
-    ssim_weight: float = 0.2        # blend weight for charbonnier_ssim (0..1)
+    ssim_weight: float = 0.2        # blend weight for the charbonnier_ssim preset (0..1)
+    # Per-term weights for '+'-composite losses; empty means DEFAULT_LOSS_WEIGHTS.
+    weights: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -123,11 +160,21 @@ class Config:
 
     @property
     def uses_accelerator(self) -> bool:
+        return self.hardware in ("hailo8", "deepx", "intel_npu")
+
+    @property
+    def requires_int8(self) -> bool:
+        """Hailo/DeepX are INT8-only; Intel NPU runs FP16 OpenVINO graphs natively."""
         return self.hardware in ("hailo8", "deepx")
 
     @property
     def artifact_ext(self) -> str:
-        return {"hailo8": ".hef", "deepx": ".bin", "rpi5_cpu": ".ort"}[self.hardware]
+        return {
+            "hailo8": ".hef",
+            "deepx": ".bin",
+            "rpi5_cpu": ".ort",
+            "intel_npu": ".xml",
+        }[self.hardware]
 
     def validate(self) -> None:
         from .model_opts import MIN_BLOCK_DEPTH, normalize_model_config, uses_activation, uses_conv_type
@@ -141,7 +188,8 @@ class Config:
             (m.block_depth in BLOCK_DEPTHS, "block_depth", m.block_depth, BLOCK_DEPTHS),
             (s.gain in GAINS, "gain", s.gain, GAINS),
             (s.sensor in SENSOR_KEYS, "sensor", s.sensor, SENSOR_KEYS),
-            (self.optimization.loss.name in LOSSES, "loss", self.optimization.loss.name, LOSSES),
+            (valid_loss(self.optimization.loss.name), "loss", self.optimization.loss.name,
+             tuple(LOSSES) + ("<term>+<term>...",)),
         ]
         if uses_conv_type(m.model_family):
             checks.append((m.conv_type in CONV_TYPES, "conv_type", m.conv_type, CONV_TYPES))
@@ -298,8 +346,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extended-max-side", dest="extended_max_side", type=int,
                    help="cap image long-side when loading full frames for extended "
                         "training (default 1024)")
-    p.add_argument("--loss", dest="loss", choices=list(LOSSES),
-                   help="training loss function (default: charbonnier)")
+    p.add_argument("--loss", dest="loss",
+                   help="training loss: a preset (%s), a single term (%s), or a "
+                        "'+'-composite e.g. l1+perceptual+edge (default: "
+                        "l1_perceptual_edge)" % (", ".join(LOSSES), ", ".join(LOSS_TERMS)))
     p.add_argument("--charbonnier-eps", dest="charbonnier_eps", type=float,
                    help="Charbonnier epsilon (L2->L1 transition; smaller = sharper)")
     p.add_argument("--huber-delta", dest="huber_delta", type=float,
@@ -307,7 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ssim-window", dest="ssim_window", type=int,
                    help="Gaussian window size for the SSIM loss term (odd)")
     p.add_argument("--ssim-weight", dest="ssim_weight", type=float,
-                   help="blend weight for charbonnier_ssim (0..1)")
+                   help="blend weight for the charbonnier_ssim preset (0..1)")
+    p.add_argument("--loss-weight", dest="loss_weights", action="append",
+                   metavar="TERM=VALUE",
+                   help="weight for a term in a '+'-composite loss, e.g. "
+                        "--loss-weight perceptual=0.1 (repeatable)")
     p.add_argument("--frames", dest="frames", type=int,
                    help="temporal frames averaged for the synthetic ground truth")
     p.add_argument("--no-quantize", action="store_true", help="disable the INT8 path")
@@ -390,6 +444,11 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.optimization.loss.ssim_window = int(args.ssim_window)
     if getattr(args, "ssim_weight", None) is not None:
         cfg.optimization.loss.ssim_weight = float(args.ssim_weight)
+    for spec in (getattr(args, "loss_weights", None) or []):
+        term, _, val = str(spec).partition("=")
+        term = term.strip().lower()
+        if term and val.strip():
+            cfg.optimization.loss.weights[term] = float(val)
     if getattr(args, "frames", None):
         cfg.data.temporal_frames = args.frames
     if args.no_quantize:

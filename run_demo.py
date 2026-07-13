@@ -60,6 +60,7 @@ def _has_display() -> bool:
 
 def _loss_summary(lc) -> str:
     """Human-readable one-liner for the active loss + its relevant parameter(s)."""
+    from nsa.config import DEFAULT_LOSS_WEIGHTS, parse_loss_terms
     name = lc.name.lower()
     if name == "charbonnier":
         return f"Charbonnier (eps={lc.charbonnier_eps:g})"
@@ -74,13 +75,27 @@ def _loss_summary(lc) -> str:
     if name == "charbonnier_ssim":
         return (f"Charbonnier+SSIM (eps={lc.charbonnier_eps:g}, "
                 f"ssim_weight={lc.ssim_weight:g}, window={lc.ssim_window})")
-    return name
+    # Composite: Σ weight·term (a lone term is unscaled).
+    terms = parse_loss_terms(name)
+    if len(terms) == 1:
+        return terms[0]
+    wmap = dict(DEFAULT_LOSS_WEIGHTS)
+    wmap.update({str(k).lower(): float(v) for k, v in (lc.weights or {}).items()})
+    return " + ".join(f"{wmap.get(t, 1.0):g}·{t}" for t in terms)
 
 
 def main() -> int:
     args = build_parser().parse_args()
     cfg = apply_overrides(load_config(resolve_config_path(args.config, ROOT)), args)
     finalize_dataset_config(cfg, ROOT)
+    if cfg.hardware == "intel_npu":
+        from nsa.openvino_npu import ensure_npu_runtime, npu_available, npu_device_name
+        ensure_npu_runtime()
+        if not npu_available():
+            log("Intel NPU not visible to OpenVINO — check .npu_driver/prefix "
+                "Level Zero libs and /dev/accel/accel0", "err")
+            return 2
+        log(f"Intel NPU ready: {npu_device_name() or 'NPU'}", "ok")
     ds_quality_notice = None
     if cfg.sensor.real_capture and cfg.sensor.dataset_path:
         from nsa.denoise_hw_data import dataset_quality_notice
@@ -273,7 +288,7 @@ def main() -> int:
     lc = cfg.optimization.loss
     loss_fn = build_loss(
         lc.name, charbonnier_eps=lc.charbonnier_eps, huber_delta=lc.huber_delta,
-        ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight)
+        ssim_window=lc.ssim_window, ssim_weight=lc.ssim_weight, weights=lc.weights)
     if cal_steps > 0:
         log(f"Loss: {_loss_summary(lc)}", "step")
     if cal_steps > 0:
@@ -294,6 +309,7 @@ def main() -> int:
             pairs = [(f.noisy_rgb, f.clean_rgb) for f in frames]
             calibrate_multi(model, pairs, cal_steps,
                             cfg.output.seed, on_step, qat=use_qat,
+                            crop=cfg.optimization.patch_size,
                             loss_fn=loss_fn)
 
     # -- Optional extended training on the WHOLE dataset ---------------------
@@ -342,7 +358,7 @@ def main() -> int:
     log(f"FP32 inference complete  ·  forward pass {fwd_ms:.1f} ms (host) "
         f"·  {lbl} {psnr_fp32:.2f} dB", "ok")
 
-    quantized = bool(cfg.uses_accelerator and cfg.optimization.quantize and not hf_onnx)
+    quantized = bool(cfg.requires_int8 and cfg.optimization.quantize and not hf_onnx)
     if quantized:
         qmodel = fake_quantize_int8(model)
         int8_out, _ = run(qmodel, frame.noisy_rgb)
@@ -404,17 +420,44 @@ def main() -> int:
     elif hf_spec and copy_hf_onnx(hf_spec, onnx_path):
         log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
             f"[Hub ONNX: {hf_spec.weight_path.name}]", "ok")
-    elif export_onnx(model, cfg.optimization.patch_size, onnx_path) and onnx_path.exists():
+    elif export_onnx(model, cfg.optimization.patch_size, onnx_path,
+                     dynamic=(cfg.hardware != "intel_npu")) and onnx_path.exists():
         log(f"Wrote {onnx_path}  ({onnx_path.stat().st_size/1024:.1f} KB)  "
             "[FP32 baseline graph]", "ok")
     else:
-        log("ONNX export skipped ('onnx' package unavailable) — "
-            "install it with: pip install onnx", "warn")
+        try:
+            import onnx  # noqa: F401
+            log("ONNX export failed (graph export error) — "
+                "Intel NPU IR compile needs a valid ONNX file", "warn")
+        except ImportError:
+            log("ONNX export skipped ('onnx' package unavailable) — "
+                "install it with: pip install onnx", "warn")
 
     artifact_path = out_dir / f"hardware_ready{cfg.artifact_ext}"
-    info = write_device_artifact(export_model, cfg, result, artifact_path)
-    log(f"Wrote {artifact_path}  ({info['total_bytes']/1024:.1f} KB)  "
-        f"[{result.export_format}, {info['layers']} layers]", "ok")
+    info = write_device_artifact(export_model, cfg, result, artifact_path,
+                                 onnx_path=onnx_path if onnx_path.exists() else None)
+    if cfg.hardware == "intel_npu":
+        if info.get("compiled") is not None:
+            log(f"Wrote {artifact_path}  ({info['total_bytes']/1024:.1f} KB)  "
+                f"[OpenVINO IR → {info.get('device', 'NPU')}]", "ok")
+            from nsa.openvino_npu import denoise_rgb_on_npu
+            try:
+                npu_out, npu_ms = denoise_rgb_on_npu(
+                    info["compiled"], frame_noisy_for_panel, warmup=2, repeats=5)
+                npu_psnr = psnr(npu_out, frame.clean_rgb)
+                log(f"Intel NPU inference  ·  {npu_ms:.2f} ms median  "
+                    f"({1000.0/max(npu_ms, 1e-6):.0f} FPS)  ·  "
+                    f"PSNR {npu_psnr:.2f} dB", "ok")
+                final_out, final_psnr = npu_out, npu_psnr
+                latency_ms = npu_ms
+            except Exception as exc:
+                log(f"Intel NPU inference failed: {exc}", "warn")
+        else:
+            log(f"Wrote {artifact_path}  ({info['total_bytes']/1024:.1f} KB)  "
+                f"[fallback packed weights — NPU IR not built]", "warn")
+    else:
+        log(f"Wrote {artifact_path}  ({info['total_bytes']/1024:.1f} KB)  "
+            f"[{result.export_format}, {info['layers']} layers]", "ok")
 
     # Save the trained FP32 weights so `live.py` can run THIS exact model on a
     # live camera stream without re-training (Level-7 live testing).

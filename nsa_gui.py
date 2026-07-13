@@ -299,7 +299,7 @@ VERDICT_LABEL = {"SUITABLE": "RUNS WELL", "CAVEATS": "WITH CAVEATS",
                  "UNSUITABLE": "NOT REC."}
 VERDICT_RANK = {"SUITABLE": 0, "CAVEATS": 1, "UNSUITABLE": 2}
 CHIP_LABEL = {"all": "ALL CHIPS", "rpi5_cpu": "PI 5 CPU",
-              "hailo8": "HAILO-8", "deepx": "DEEPX"}
+              "hailo8": "HAILO-8", "deepx": "DEEPX", "intel_npu": "INTEL NPU"}
 SENSOR_SHORT = {"imx219": "219", "imx662": "662", "imxng": "NG", "all": "all"}
 
 LEVELS = [
@@ -508,6 +508,72 @@ class ConfigRow(tk.Frame):
     def set_enabled(self, on: bool):
         try:
             self.combo.config(state="readonly" if on else "disabled")
+            self._title_lbl.config(fg=INK if on else "#B6B6B6")
+        except tk.TclError:
+            pass
+
+
+class LossSelector(tk.Frame):
+    """Multi-select loss picker: tick one or more terms and they are summed.
+
+    Exposes the same ``get()`` / ``set()`` / ``set_enabled()`` surface as
+    ``ConfigRow`` so the rest of the form treats it as ``self.rows['loss']``.
+    ``get()`` returns the ticked terms joined with '+' (a single term is bare);
+    ``set()`` also expands the legacy presets back into their terms.
+    """
+
+    TERMS = ("charbonnier", "l1", "l2", "huber", "ssim", "perceptual", "edge")
+    _ALIASES = {"mse": "l2", "l1_perceptual_edge": "l1+perceptual+edge",
+                "charbonnier_ssim": "charbonnier+ssim"}
+
+    def __init__(self, parent, title, desc, default, command=None):
+        super().__init__(parent, bg=WHITE)
+        self.columnconfigure(0, weight=1)
+        self.command = command
+        left = tk.Frame(self, bg=WHITE)
+        left.grid(row=0, column=0, sticky="w")
+        self._title_lbl = tk.Label(left, text=title, bg=WHITE, fg=INK,
+                                   font=font(11, "bold"))
+        self._title_lbl.pack(anchor="w")
+        tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
+
+        self.vars = {t: tk.BooleanVar(value=False) for t in self.TERMS}
+        self._checks = {}
+        grid = tk.Frame(self, bg=WHITE)
+        grid.grid(row=1, column=0, columnspan=2, sticky="w", pady=(S(6), 0))
+        for i, t in enumerate(self.TERMS):
+            cb = tk.Checkbutton(grid, text=t, variable=self.vars[t], bg=WHITE,
+                                fg=INK, font=font(9), selectcolor=WHITE,
+                                activebackground=WHITE, activeforeground=INK,
+                                highlightthickness=0, command=self._changed)
+            cb.grid(row=i // 4, column=i % 4, sticky="w", padx=(0, S(12)))
+            self._checks[t] = cb
+        self.set(default)
+        tk.Frame(self, bg=LINE, height=1).grid(row=2, column=0, columnspan=2,
+                                               sticky="ew", pady=(S(12), 0))
+
+    def _changed(self):
+        if self.command is not None:
+            self.command()
+
+    def _expand(self, value) -> list:
+        key = str(value or "").strip().lower()
+        key = self._ALIASES.get(key, key)
+        return [t for t in (s.strip() for s in key.split("+")) if t in self.vars]
+
+    def get(self):
+        sel = [t for t in self.TERMS if self.vars[t].get()]
+        return "+".join(sel) if sel else "charbonnier"
+
+    def set(self, value):
+        terms = set(self._expand(value)) or {"charbonnier"}
+        for t in self.TERMS:
+            self.vars[t].set(t in terms)
+
+    def set_enabled(self, on: bool):
+        try:
+            for cb in self._checks.values():
+                cb.config(state="normal" if on else "disabled")
             self._title_lbl.config(fg=INK if on else "#B6B6B6")
         except tk.TclError:
             pass
@@ -4108,8 +4174,8 @@ class App(tk.Tk):
     def _step_hw(self, body):
         self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
         self._add_rows(body, [
-            ("hardware", "Target Hardware", "Pi 5 CPU · Hailo-8 (est.) · DeepX (est.)",
-             ["rpi5_cpu", "hailo8", "deepx"], "hailo8"),
+            ("hardware", "Target Hardware", "Pi 5 CPU · Hailo-8 · DeepX · Intel NPU",
+             ["rpi5_cpu", "hailo8", "deepx", "intel_npu"], "intel_npu"),
         ])
         self.hw_note = tk.Label(body, text="", bg=WHITE, fg=SUBTLE, font=font(9),
                                 wraplength=S(560), justify="left")
@@ -4137,11 +4203,10 @@ class App(tk.Tk):
              [150, 300, 500, 800], 300),
         ])
 
-        loss_row = ConfigRow(
+        loss_row = LossSelector(
             body, "Loss Function",
-            "Training objective — parameters below adapt to it",
-            ["charbonnier", "l1", "l2", "huber", "ssim", "charbonnier_ssim"],
-            "charbonnier", command=self._on_loss_change)
+            "Tick one or more terms — several are summed (Loss = Σ weight·term)",
+            "l1_perceptual_edge", command=self._on_loss_change)
         loss_row.pack(fill="x", pady=S(6))
         self.rows["loss"] = loss_row
         self.loss_box = tk.Frame(body, bg=WHITE)
@@ -4368,11 +4433,14 @@ class App(tk.Tk):
     _GOAL_HW = {
         "hailo": "hailo8", "hailo8": "hailo8", "hailo-8": "hailo8",
         "deepx": "deepx", "dx-m1": "deepx", "dxm1": "deepx", "dx m1": "deepx",
+        "intel_npu": "intel_npu", "intel": "intel_npu", "npu": "intel_npu",
+        "ai boost": "intel_npu", "openvino": "intel_npu",
         "rpi5_cpu": "rpi5_cpu", "cpu": "rpi5_cpu", "raspberry": "rpi5_cpu",
         "rpi": "rpi5_cpu", "pi 5": "rpi5_cpu", "pi5": "rpi5_cpu",
     }
     _GOAL_HW_NAMES = {"rpi5_cpu": "Raspberry Pi 5 (CPU)",
-                      "hailo8": "Pi 5 + Hailo-8", "deepx": "DeepX DX-M1"}
+                      "hailo8": "Pi 5 + Hailo-8", "deepx": "DeepX DX-M1",
+                      "intel_npu": "Intel AI Boost (NPU)"}
 
     def _parse_goal(self, text: str) -> dict:
         """Translate a free-text goal into sweep constraints (best-effort)."""
@@ -4532,7 +4600,8 @@ class App(tk.Tk):
         sensor_name = sensor_card["name"] if sensor_card else sensor_key
         hw_key = self._row_get("hardware", "hailo8")
         hw_name = {"rpi5_cpu": "Raspberry Pi 5 (CPU)", "hailo8": "Pi 5 + Hailo-8",
-                   "deepx": "DeepX DX-M1"}.get(hw_key, hw_key)
+                   "deepx": "DeepX DX-M1",
+                   "intel_npu": "Intel AI Boost (NPU)"}.get(hw_key, hw_key)
         fam = self._row_get("model_family", "nafnet")
         model_txt = (f"{fam.upper()}  {self._row_get('base_channels','32')}ch × "
                      f"depth {self._row_get('block_depth','4')}")
@@ -4744,11 +4813,14 @@ class App(tk.Tk):
                 self._render_loss_options()
                 for key, val in (("charbonnier_eps", lc.charbonnier_eps),
                                  ("huber_delta", lc.huber_delta),
-                                 ("ssim_window", lc.ssim_window),
-                                 ("ssim_weight", lc.ssim_weight)):
+                                 ("ssim_window", lc.ssim_window)):
                     var = self.entries.get(key)
                     if var is not None:
                         var.set(str(val))
+                for term, wval in (lc.weights or {}).items():
+                    var = self.entries.get(f"w_{str(term).lower()}")
+                    if var is not None:
+                        var.set(str(wval))
             if cfg.sensor.sensor and "sensor" in self.rows:
                 self.rows["sensor"].set(cfg.sensor.sensor)
             if hasattr(self, "dataset_label"):
@@ -4767,7 +4839,8 @@ class App(tk.Tk):
     # model-family / loss selectors (which must be set after re-rendering).
     _STATE_SIMPLE_ROWS = ("hardware", "sensor", "gain", "steps", "frames")
     _STATE_MODEL_ROWS = ("base_channels", "block_depth", "conv_type", "activation")
-    _STATE_LOSS_ENTRIES = ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight")
+    _STATE_LOSS_ENTRIES = (("charbonnier_eps", "huber_delta", "ssim_window")
+                           + tuple(f"w_{t}" for t in LossSelector.TERMS))
     _STATE_OTHER_ENTRIES = ("filter", "noise_std", "batch", "burst",
                             "naf_enc", "naf_mid", "naf_dec")
     _STATE_BOOL_VARS = ("sim_noise_var", "quantize_var", "qat_var", "all_sensors_var",
@@ -5033,45 +5106,51 @@ class App(tk.Tk):
     def _on_loss_change(self):
         self._render_loss_options()
 
+    # Parameter-field keys the loss box can render (weights + shape params).
+    _LOSS_WEIGHT_KEYS = tuple(f"w_{t}" for t in LossSelector.TERMS)
+    _LOSS_SHAPE_KEYS = ("charbonnier_eps", "huber_delta", "ssim_window")
+
     def _render_loss_options(self):
-        """Show only the parameter fields that the selected loss actually uses."""
+        """Show a weight field per selected term plus the shape params they use."""
+        managed = self._LOSS_WEIGHT_KEYS + self._LOSS_SHAPE_KEYS
         # Preserve any values the user already typed.
-        prev = {}
-        for k in ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight"):
-            var = self.entries.get(k)
-            if var is not None:
-                prev[k] = var.get()
+        prev = {k: self.entries[k].get() for k in managed if k in self.entries}
         for w in self.loss_box.winfo_children():
             w.destroy()
-        for k in ("charbonnier_eps", "huber_delta", "ssim_window", "ssim_weight"):
+        for k in managed:
             self.entries.pop(k, None)
             self.entry_widgets.pop(k, None)
 
         name = self.rows["loss"].get() if "loss" in self.rows else "charbonnier"
+        terms = [t for t in name.lower().split("+") if t]
         defaults = {"charbonnier_eps": "0.001", "huber_delta": "1.0",
-                    "ssim_window": "11", "ssim_weight": "0.2"}
+                    "ssim_window": "11",
+                    "w_l1": "1.0", "w_l2": "1.0", "w_charbonnier": "1.0",
+                    "w_huber": "1.0", "w_ssim": "0.2", "w_perceptual": "0.1",
+                    "w_edge": "0.05"}
 
         def field(key, title, desc):
             self._entry_row(self.loss_box, key, title, desc,
-                            prev.get(key, defaults[key]))
+                            prev.get(key, defaults.get(key, "")))
 
-        if name == "charbonnier":
+        multi = len(terms) > 1
+        if multi:
+            tk.Label(self.loss_box, text="     Loss = Σ weight·term",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(2), 0))
+            for t in terms:
+                field(f"w_{t}", f"{t} weight", f"contribution of the {t} term")
+        # Shape parameters, shown only for whichever terms actually use them.
+        if "charbonnier" in terms:
             field("charbonnier_eps", "Charbonnier eps",
                   "L2→L1 transition — smaller = sharper, larger = smoother")
-        elif name in ("l1", "l2"):
-            tk.Label(self.loss_box,
-                     text=f"     {name.upper()} has no tunable parameters.",
-                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(2), 0))
-        elif name == "huber":
+        if "huber" in terms:
             field("huber_delta", "Huber delta", "L2→L1 crossover threshold")
-        elif name == "ssim":
+        if "ssim" in terms:
             field("ssim_window", "SSIM window", "Gaussian window size (odd, e.g. 11)")
-        elif name == "charbonnier_ssim":
-            field("charbonnier_eps", "Charbonnier eps",
-                  "Pixel-term L2→L1 transition")
-            field("ssim_weight", "SSIM weight",
-                  "Blend: (1-w)·charbonnier + w·(1-SSIM), 0..1")
-            field("ssim_window", "SSIM window", "Gaussian window size (odd, e.g. 11)")
+        if not multi and terms and terms[0] in ("l1", "l2", "perceptual", "edge"):
+            tk.Label(self.loss_box,
+                     text=f"     {terms[0]} has no tunable parameters.",
+                     bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w", pady=(S(2), 0))
 
     def _render_model_options(self):
         """Render only the Level-3 options that apply to the chosen model family.
@@ -5496,30 +5575,40 @@ class App(tk.Tk):
         return cmd
 
     def _append_loss_cli_args(self, cmd):
-        """Append --loss and only the parameter flags the chosen loss uses."""
+        """Append --loss, the shape-param flags, and per-term weights it uses."""
         row = self.rows.get("loss")
         if row is None:
             return
         name = row.get()
         cmd += ["--loss", name]
-        param_flags = {
-            "charbonnier_eps": "--charbonnier-eps",
-            "huber_delta": "--huber-delta",
-            "ssim_window": "--ssim-window",
-            "ssim_weight": "--ssim-weight",
-        }
-        for key, flag in param_flags.items():
+        terms = [t for t in name.lower().split("+") if t]
+
+        def valid(key):
             var = self.entries.get(key)
             if var is None:
-                continue
+                return None
             raw = (var.get() or "").strip()
             if not raw:
-                continue
+                return None
             try:
                 float(raw)
             except ValueError:
-                continue
-            cmd += [flag, raw]
+                return None
+            return raw
+
+        shape_flags = {"charbonnier_eps": "--charbonnier-eps",
+                       "huber_delta": "--huber-delta",
+                       "ssim_window": "--ssim-window"}
+        for key, flag in shape_flags.items():
+            raw = valid(key)
+            if raw is not None:
+                cmd += [flag, raw]
+        # Per-term weights only matter when several terms are summed.
+        if len(terms) > 1:
+            for t in terms:
+                raw = valid(f"w_{t}")
+                if raw is not None:
+                    cmd += ["--loss-weight", f"{t}={raw}"]
 
     def _append_noise_std_cli_args(self, cmd):
         """Append --noise-std when the user typed a valid read-noise override."""
@@ -6416,7 +6505,7 @@ class App(tk.Tk):
     def _render_filter_buttons(self):
         for w in self._rank_filter_row.winfo_children():
             w.destroy()
-        for key in ("all", "rpi5_cpu", "hailo8", "deepx"):
+        for key in ("all", "rpi5_cpu", "hailo8", "deepx", "intel_npu"):
             sel = (key == self._rank_filter)
             RoundButton(self._rank_filter_row, CHIP_LABEL[key],
                         lambda k=key: self._set_rank_filter(k),
@@ -6653,7 +6742,7 @@ class App(tk.Tk):
         if chips:
             tk.Label(pad, text="Runs on these chips", bg=WHITE, fg=INK,
                      font=font(10, "bold")).pack(anchor="w", pady=(S(8), S(2)))
-            for key in ("rpi5_cpu", "hailo8", "deepx"):
+            for key in ("rpi5_cpu", "hailo8", "deepx", "intel_npu"):
                 c = chips.get(key)
                 if not c:
                     continue

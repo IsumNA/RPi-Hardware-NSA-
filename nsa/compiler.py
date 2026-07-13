@@ -44,6 +44,15 @@ CAPS = {
         "format": "DeepX Runtime Binary (.bin)",
         "tops_peak": 25.0,
     },
+    "intel_npu": {
+        "label": "Intel AI Boost (NPU via OpenVINO)",
+        "precision": "fp16",
+        "native_acts": {"relu", "gelu", "silu"},
+        "needs_quant": False,
+        "sram_kb": 500_000,   # shared system memory; not a tiny on-chip SRAM budget
+        "format": "OpenVINO IR (.xml)",
+        "tops_peak": 40.0,    # Core Ultra class INT8 peak (order-of-magnitude)
+    },
 }
 
 
@@ -87,7 +96,7 @@ def _estimate_sram_kb(cfg: Config, bytes_per: int | None = None) -> float:
     weights = (mc.base_channels ** 2) * 9 * mc.block_depth     # 3x3 conv weights
     depthwise_factor = 0.45 if mc.conv_type == "depthwise" else 1.0
     if bytes_per is None:
-        bytes_per = 1 if cfg.uses_accelerator else 2          # int8 vs fp16
+        bytes_per = 1 if cfg.requires_int8 else 2             # int8 vs fp16
     return (act * bytes_per + weights * depthwise_factor * bytes_per) / 1024.0
 
 
@@ -166,7 +175,8 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
     log(f"Activation memory estimate: {res.est_sram_kb:,.0f} KB "
         f"(budget {res.sram_budget_kb:,.0f} KB)", "step")
     pause(0.2)
-    if cfg.uses_accelerator and res.est_sram_kb > res.sram_budget_kb:
+    # Only Hailo/DeepX have tight on-chip SRAM that forces tiling.
+    if cfg.requires_int8 and res.est_sram_kb > res.sram_budget_kb:
         res.tiled = True
         log("Working set exceeds on-chip SRAM -> enabling spatial tiling "
             "(2x2) to fit", "warn")
@@ -177,7 +187,7 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
     pause(0.25)
 
     # -- Pass 4: quantization scheme ------------------------------------------
-    if cfg.uses_accelerator and cfg.optimization.quantize:
+    if cfg.requires_int8 and cfg.optimization.quantize:
         res.quantize = True
         if cfg.optimization.qat and res.quant_scheme != "QAT":
             res.quant_scheme = "QAT"
@@ -195,10 +205,14 @@ def compile_stack(cfg: Config, n_params: int) -> CompileResult:
             res.passes.append("quant:QAT-int8")
         log(f"Calibrating on the live IMX662 frame "
             f"({cfg.optimization.calibration_steps} steps)...", "step")
-    elif cfg.uses_accelerator and not cfg.optimization.quantize:
+    elif cfg.requires_int8 and not cfg.optimization.quantize:
         log("Quantization disabled by flag -> target requires INT8; "
             "results may not fit/run on device", "warn")
         res.warnings.append("INT8 disabled though target is an INT8-only NPU.")
+    elif cfg.hardware == "intel_npu":
+        log(f"Intel NPU keeps {caps['precision'].upper()} OpenVINO graph "
+            "(INT8 optional; not required)", "ok")
+        res.passes.append("quant:none-fp16-ov")
     else:
         log(f"CPU target keeps {caps['precision'].upper()} precision "
             "(no quantization required)", "ok")
@@ -231,12 +245,13 @@ class TargetAssessment:
     notes: list[str] = field(default_factory=list)
 
 
-_ACCELERATORS = ("hailo8", "deepx")
+_INT8_ACCELERATORS = ("hailo8", "deepx")
+_ACCELERATORS = ("hailo8", "deepx", "intel_npu")
 
 
 def assess_targets(cfg: Config, model, quantize_enabled: bool,
                    chosen: str | None = None) -> list[TargetAssessment]:
-    """Score the trained model against every Raspberry Pi-class target chip.
+    """Score the trained model against every supported target chip.
 
     Looks at each chip's spec (precision, native ops, on-chip SRAM budget, the
     compute/latency model) and returns a per-chip verdict so the operator can
@@ -249,7 +264,8 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
     out: list[TargetAssessment] = []
     for key, caps in CAPS.items():
         accel = key in _ACCELERATORS
-        bytes_per = 1 if accel else 2
+        needs_int8 = key in _INT8_ACCELERATORS
+        bytes_per = 1 if needs_int8 else 2
         act_kb = _estimate_sram_kb(cfg, bytes_per=bytes_per)
         budget = float(caps["sram_kb"])
         mem_frac = act_kb / budget if budget else 0.0
@@ -257,8 +273,8 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
 
         tiled = False
         fits = act_kb <= budget
-        if not fits and accel:
-            tiled = True           # accelerators can spill to 2x2 spatial tiles
+        if not fits and needs_int8:
+            tiled = True           # Hailo/DeepX can spill to 2x2 spatial tiles
             fits = True
             notes.append("needs 2×2 spatial tiling to fit on-chip SRAM")
         elif not fits:
@@ -274,18 +290,21 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
         if not act_native and uses_activation(fam):
             notes.append(f"'{effective_activation(cfg.model)}' not native → "
                          f"PWL/QAT approximation")
-        elif fam == "restormer" and accel:
+        elif fam == "restormer" and needs_int8:
             notes.append("GELU FFN + attention use FP fallback on NPUs")
 
-        quantized = accel and quantize_enabled
-        if accel and not quantize_enabled:
+        quantized = needs_int8 and quantize_enabled
+        if needs_int8 and not quantize_enabled:
             notes.append("INT8-only NPU but quantization is disabled")
+        if key == "intel_npu":
+            notes.append("OpenVINO FP16 on Intel AI Boost NPU")
 
-        if cfg.model.model_family in _CONVT_FAMILIES and accel:
+        if cfg.model.model_family in _CONVT_FAMILIES and needs_int8:
             notes.append(f"{cfg.model.model_family.upper()} ConvTranspose "
                          "rewritten to resize+conv")
 
-        transformer_on_npu = cfg.model.model_family in _TRANSFORMER_FAMILIES and accel
+        transformer_on_npu = (
+            cfg.model.model_family in _TRANSFORMER_FAMILIES and needs_int8)
         if transformer_on_npu:
             notes.append(f"{cfg.model.model_family.upper()} LayerNorm/softmax "
                          "attention runs in FP fallback (limited NPU offload)")
@@ -295,10 +314,10 @@ def assess_targets(cfg: Config, model, quantize_enabled: bool,
 
         # -- verdict ---------------------------------------------------------
         verdict = "SUITABLE"
-        if not fits or (accel and not quantize_enabled):
+        if not fits or (needs_int8 and not quantize_enabled):
             verdict = "UNSUITABLE"
         elif (tiled or not act_native or transformer_on_npu
-              or (cfg.model.model_family in _CONVT_FAMILIES and accel)):
+              or (cfg.model.model_family in _CONVT_FAMILIES and needs_int8)):
             verdict = "CAVEATS"
         if fps < 5.0:
             notes.append(f"~{fps:.0f} FPS — well below real-time")

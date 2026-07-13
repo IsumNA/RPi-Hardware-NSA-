@@ -9,10 +9,11 @@
 # =============================================================================
 
 # ---- LEVEL 6 : Export / Target Hardware --------------------------------------
-#   rpi5_cpu  -> Raspberry Pi 5  (ARM Cortex-A76, ONNX FP16)
-#   hailo8    -> Raspberry Pi 5 + Hailo-8 AI HAT  (.hef, INT8)
-#   deepx     -> DeepX DX-M1 M.2 accelerator      (.bin, INT8)
-hardware: hailo8
+#   rpi5_cpu   -> Raspberry Pi 5  (ARM Cortex-A76, ONNX FP16)
+#   hailo8     -> Raspberry Pi 5 + Hailo-8 AI HAT  (.hef, INT8)
+#   deepx      -> DeepX DX-M1 M.2 accelerator      (.bin, INT8)
+#   intel_npu  -> Intel AI Boost NPU via OpenVINO  (.xml, FP16)
+hardware: intel_npu
 
 # ---- LEVEL 3 : Model Architecture --------------------------------------------
 model:
@@ -44,19 +45,20 @@ sensor:
   #                          e.g. a cloned repo of IMX219 frames. A frame is picked
   #                          per-seed so re-runs can show different captures.
   real_capture: true
-  # /opt/datasets/PI_RAW is the real, shared capture set on the AI server (many
-  # scenes x the full imx662/imx662h analogue-gain sweep). The repo-relative
-  # "datasets/PI_RAW" is only a tiny bundled synthetic sample for offline demos
-  # off this machine — point back to that if /opt/datasets/PI_RAW isn't present.
-  dataset_path: /opt/datasets/PI_RAW
+  # Prefer the repo-local datasets/PI_RAW (now holds the real imx662/imx662h
+  # pairs copied from the AI server). On the AI box, finalize_dataset_config
+  # still auto-upgrades this default to /opt/datasets/PI_RAW when present.
+  dataset_path: datasets/PI_RAW
   # Paired folders (a noisy.* + gt.* per folder, the denoise-hw convention) are
   # auto-detected and used as real ground truth. simulate_noise injects the
   # selected sensor's physics on top of loaded frames (clean -> noisy).
   simulate_noise: false
-  # "imx662" substring-matches BOTH imx662_ag*_test and imx662h_ag*_test folders
-  # (HCG is a folder-naming variant, not a separate sensor key) — this sweeps
-  # every scene and every gain (ag1..ag512) for both variants.
-  filter: [imx662]
+  # IMPORTANT: use "imx662_ag" (not bare "imx662") — bare "imx662" also matches
+  # imx662h_* HCG folders and mixes two noise regimes in one model.
+  # LCG-only, all gains: [imx662_ag]
+  # LCG at deploy gain only: [imx662_ag, ag256]
+  # HCG-only: [imx662h]
+  filter: [imx662_ag]
   gain: 256                 # analog gain multiplier (256 = moderate; 512 = stress test)
   # Override the standard deviation of the injected Gaussian read noise, in
   # electrons RMS (the denoise-hw noise-floor knob). null keeps the sensor's
@@ -70,29 +72,38 @@ data:
 
 # ---- LEVEL 4/5 : Optimization & Quantization ---------------------------------
 optimization:
-  quantize: true            # enable INT8 post-training / QAT path
-  qat: false                # true => fake-quant-in-the-loop training (STE)
-  calibration_steps: 300    # live calibration iterations (batch of augmented crops)
+  quantize: false           # Hailo/DeepX need INT8; Intel NPU runs FP16 OpenVINO natively
+  qat: false                # QAT only needed for INT8 NPU targets
+  calibration_steps: 400    # live calibration iterations (batch of augmented crops)
   patch_size: 192           # working resolution for the live demo (square crop)
   # Extended training: after the quick calibration, keep training on EVERY paired
-  # image in the dataset (e.g. all of PI_RAW) for a much stronger denoiser. On by
-  # default now that dataset_path points at the real /opt/datasets/PI_RAW sweep;
-  # set to false to go back to a quick single-folder calibration pass.
+  # image matching the filter — this is where anti-blur quality comes from.
+  # 50 LCG pairs (imx662_ag) need more steps than a single-folder pass.
   extended_train: true
-  extended_steps: 1500      # optimizer steps for the extended full-dataset pass
+  extended_steps: 3000      # optimizer steps for the extended full-dataset pass
   extended_max_side: 1024   # cap image long-side when loading full frames
-  # Training objective. name: charbonnier | l1 | l2 | huber | ssim | charbonnier_ssim
-  #   charbonnier      -> sharp, robust pixel loss (default); tune charbonnier_eps
-  #   l1 / l2 (mse)    -> plain MAE / MSE (no parameters)
+  # Training objective. name may be a single term, a '+'-composite of terms
+  # (summed as Sum of weight*term), or the charbonnier_ssim preset:
+  #   l1 / l2 (mse)    -> plain MAE / MSE (l2 blurs texture; avoid on its own)
+  #   charbonnier      -> sharp, robust pixel loss; tune charbonnier_eps
   #   huber            -> smooth-L1; tune huber_delta (L2->L1 crossover)
   #   ssim             -> structural similarity (1 - SSIM); tune ssim_window
-  #   charbonnier_ssim -> (1-w)*charbonnier + w*(1-SSIM); tune ssim_weight (w)
+  #   perceptual       -> LPIPS (deep-feature) distance; strongly fights blur
+  #   edge             -> gradient-L1; keeps high-frequency detail / sharp edges
+  #   charbonnier_ssim -> (1-w)*charbonnier + w*(1-SSIM) blend; tune ssim_weight (w)
   loss:
-    name: charbonnier
-    charbonnier_eps: 0.001  # smaller = closer to L1 (sharper), larger = smoother
+    # Default anti-blur composite: pixel accuracy (L1) + perceptual (LPIPS) +
+    # edge (gradient) terms. Equivalent to "l1+perceptual+edge".
+    name: l1_perceptual_edge
+    charbonnier_eps: 0.0005  # smaller = closer to L1 (sharper), larger = smoother
     huber_delta: 1.0
-    ssim_window: 11         # odd Gaussian window for the SSIM term
-    ssim_weight: 0.2        # charbonnier_ssim blend weight (0..1)
+    ssim_window: 11          # odd Gaussian window for the SSIM term
+    ssim_weight: 0.22        # charbonnier_ssim blend weight (0..1)
+    # Per-term weights for composite losses (only the selected terms are used).
+    weights:
+      l1: 1.0
+      perceptual: 0.1
+      edge: 0.05
 
 # ---- Run mode ----------------------------------------------------------------
 run:

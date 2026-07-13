@@ -19,6 +19,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# The loss vocabulary (term names, aliases, default weights) lives in config so
+# the CLI/GUI can reason about it without importing torch.
+from .config import DEFAULT_LOSS_WEIGHTS, LOSS_TERMS, parse_loss_terms
+
 # Per-target latency model: (fixed per-frame overhead in ms, ms per GFLOP).
 # These constants are tuned to reproduce realistic on-device frame times for a
 # small denoiser (memory-bound, not compute-bound) - e.g. ~10-20 ms on an NPU,
@@ -28,6 +32,7 @@ LATENCY_MODEL = {
     "hailo8": (4.0, 6.5),
     "deepx": (4.5, 7.0),
     "rpi5_cpu": (14.0, 62.0),
+    "intel_npu": (2.0, 2.5),   # OpenVINO on Intel AI Boost (estimate; measured at export)
 }
 
 
@@ -239,45 +244,99 @@ def _ssim_loss(pred: torch.Tensor, target: torch.Tensor,
     return 1.0 - _ssim_index(pred, target, window)
 
 
-# Registry of the loss functions the compiler can train against. Each entry maps
-# a name to (callable, accepted-parameter-names) so config/CLI/GUI stay in sync.
-LOSSES: dict[str, tuple] = {
-    "charbonnier": (_charbonnier, ("charbonnier_eps",)),
-    "l1": (_l1, ()),
-    "l2": (_l2, ()),
-    "mse": (_l2, ()),
-    "huber": (_huber, ("huber_delta",)),
-    "ssim": (_ssim_loss, ("ssim_window",)),
-    "charbonnier_ssim": (None, ("charbonnier_eps", "ssim_window", "ssim_weight")),
-}
+def _edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """L1 loss on horizontal/vertical image gradients (finite differences).
+
+    Matching gradients directly penalises smeared edges, so the network is
+    pushed to keep high-frequency detail that a pure pixel loss lets it blur
+    away. Cheap, parameter-free and fully differentiable.
+    """
+    pdx = pred[..., :, 1:] - pred[..., :, :-1]
+    pdy = pred[..., 1:, :] - pred[..., :-1, :]
+    tdx = target[..., :, 1:] - target[..., :, :-1]
+    tdy = target[..., 1:, :] - target[..., :-1, :]
+    return (pdx - tdx).abs().mean() + (pdy - tdy).abs().mean()
+
+
+def _perceptual_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Differentiable LPIPS (AlexNet) perceptual loss.
+
+    Reuses the frozen LPIPS network from the metrics path (its parameters carry
+    no gradient, so only the inputs are optimised). Comparing deep feature
+    activations rather than pixels strongly penalises the over-smoothing/blur
+    that L1 alone tolerates.
+    """
+    net = _get_lpips_net().to(device=pred.device, dtype=pred.dtype)
+    p, t = pred, target
+    if p.shape[1] == 1:                        # LPIPS expects 3 channels
+        p = p.repeat(1, 3, 1, 1)
+        t = t.repeat(1, 3, 1, 1)
+    p, t = p * 2.0 - 1.0, t * 2.0 - 1.0        # LPIPS wants [-1, 1]
+    return net(p, t).mean()
+
+
+def _term_loss(term: str, *, charbonnier_eps: float, huber_delta: float,
+               ssim_window: int):
+    """Return the ``loss(pred, target)`` callable for a single loss term."""
+    if term == "l1":
+        return _l1
+    if term == "l2":
+        return _l2
+    if term == "charbonnier":
+        return lambda p, t: _charbonnier(p, t, charbonnier_eps)
+    if term == "huber":
+        return lambda p, t: _huber(p, t, huber_delta)
+    if term == "ssim":
+        return lambda p, t: _ssim_loss(p, t, ssim_window)
+    if term == "perceptual":
+        return _perceptual_loss
+    if term == "edge":
+        return _edge_loss
+    raise KeyError(term)
 
 
 def build_loss(name: str = "charbonnier", *,
                charbonnier_eps: float = 1e-3,
                huber_delta: float = 1.0,
                ssim_window: int = 11,
-               ssim_weight: float = 0.2):
+               ssim_weight: float = 0.2,
+               weights: dict | None = None):
     """Return a ``loss(pred, target) -> scalar`` callable for the named objective.
 
-    Supported names: ``charbonnier`` (eps), ``l1``, ``l2``/``mse``, ``huber``
-    (delta), ``ssim`` (window), and ``charbonnier_ssim`` — a weighted blend
-    ``(1-w)·charbonnier + w·(1-SSIM)`` that pairs pixel accuracy with perceived
-    structure. Unknown names fall back to Charbonnier.
+    ``name`` is one of the individual terms — ``l1``, ``l2``, ``charbonnier``
+    (eps), ``huber`` (delta), ``ssim`` (window), ``perceptual`` (LPIPS), ``edge``
+    (gradient-L1) — or a ``+``-joined composite of them (e.g.
+    ``l1+perceptual+edge``), summed as ``Σ weight_i · term_i``. A lone term is
+    used unscaled; composite weights come from ``weights`` (falling back to
+    ``DEFAULT_LOSS_WEIGHTS``). The special ``charbonnier_ssim`` preset keeps its
+    ``(1-w)·charbonnier + w·(1-SSIM)`` blend. Unknown names fall back to
+    Charbonnier.
     """
-    key = (name or "charbonnier").lower()
-    if key == "l1":
-        return _l1
-    if key in ("l2", "mse"):
-        return _l2
-    if key == "huber":
-        return lambda p, t: _huber(p, t, huber_delta)
-    if key == "ssim":
-        return lambda p, t: _ssim_loss(p, t, ssim_window)
+    key = (name or "charbonnier").strip().lower()
     if key == "charbonnier_ssim":
         w = float(min(max(ssim_weight, 0.0), 1.0))
         return lambda p, t: ((1.0 - w) * _charbonnier(p, t, charbonnier_eps)
                              + w * _ssim_loss(p, t, ssim_window))
-    return lambda p, t: _charbonnier(p, t, charbonnier_eps)
+
+    terms = [t for t in parse_loss_terms(key) if t in LOSS_TERMS] or ["charbonnier"]
+    build = lambda term: _term_loss(term, charbonnier_eps=charbonnier_eps,
+                                    huber_delta=huber_delta, ssim_window=ssim_window)
+    if len(terms) == 1:                       # single term: use it unscaled
+        return build(terms[0])
+
+    wmap = dict(DEFAULT_LOSS_WEIGHTS)
+    if weights:
+        wmap.update({str(k).strip().lower(): float(v) for k, v in weights.items()})
+    parts = [(wmap.get(t, 1.0), build(t)) for t in terms]
+
+    def _composite(p, t):
+        total = None
+        for wt, fn in parts:
+            term_val = wt * fn(p, t)
+            total = term_val if total is None else total + term_val
+        return total
+
+    return _composite
 
 
 def _augment_pair(x: torch.Tensor, y: torch.Tensor,
