@@ -2141,10 +2141,11 @@ class NoiseDatasetWizard(tk.Toplevel):
                     temperature_c=temp_c,
                 )
                 ok = validation.get("ok", True)
+                report = validation.get("report_png")
                 msg = (f"Calibration saved → {out}\n"
                        f"shot a={model.shot_a:.4g}  read={model.read_dist.kind}  "
                        f"validation={'PASS' if ok else 'CHECK'}")
-                self.after(0, lambda: self._calibrate_done(out, msg, ok))
+                self.after(0, lambda: self._calibrate_done(out, msg, ok, report))
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda e=exc: self._calibrate_fail(str(e)))
 
@@ -2152,14 +2153,36 @@ class NoiseDatasetWizard(tk.Toplevel):
         self._set_status("Running Phases 2–4 (extract → fit → validate)…")
         threading.Thread(target=work, daemon=True).start()
 
-    def _calibrate_done(self, out: str, msg: str, ok: bool):
+    def _calibrate_done(self, out: str, msg: str, ok: bool, report_png=None):
         self._set_busy(False)
         self.calib_json.set(out)
         self._set_status(msg, ok=ok)
-        if ok:
+        if report_png and Path(report_png).is_file():
+            self._show_calib_report(report_png)   # visual proof, not just JSON
+        elif ok:
             messagebox.showinfo("Calibration complete", msg + "\n\nClick Next to build the dataset.")
         else:
             messagebox.showwarning("Calibration finished with warnings", msg)
+
+    def _show_calib_report(self, report_png):
+        """Open the calibration report image (PTC / histograms / real-vs-synthetic)."""
+        win = tk.Toplevel(self, bg=WHITE)
+        win.title("NAS  ·  Noise calibration report")
+        win.configure(bg=WHITE)
+        img = _load_scaled_photo(Path(report_png), S(980))
+        if img is not None:
+            self._calib_report_img = img            # keep ref alive
+            tk.Label(win, image=img, bg=WHITE).pack(padx=S(12), pady=S(12))
+        else:
+            tk.Label(win, text=f"Report saved to:\n{report_png}", bg=WHITE, fg=INK,
+                     font=font(10), justify="left").pack(padx=S(20), pady=S(20))
+        RoundButton(win, "OPEN FILE", lambda: self._try_open_os_path(Path(report_png),
+                    "Calibration report"), kind="secondary",
+                    width=140, height=38).pack(pady=(0, S(12)))
+        try:
+            win.transient(self); self._grab_when_ready(win)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _calibrate_fail(self, err: str):
         self._set_busy(False)

@@ -71,4 +71,20 @@ def run_calibration_pipeline(
     )
 
     save_model(model, output_json)
+
+    # Visual report next to the JSON — the numbers mean nothing without seeing
+    # the fit and the real-vs-synthetic noise match.
+    try:
+        from .report import render_calibration_report
+        report_png = Path(output_json).with_suffix(".report.png")
+        real_flat = flat_pairs[-1][0] if flat_pairs else None
+        path = render_calibration_report(
+            model, report_png, shot_mu=shot_mu, shot_var=shot_var,
+            read_samples=read_samples, validation=validation,
+            real_flat=real_flat, seed=seed)
+        if path is not None:
+            validation["report_png"] = str(path)
+    except Exception as exc:  # noqa: BLE001
+        validation["report_error"] = str(exc)
+
     return model, validation

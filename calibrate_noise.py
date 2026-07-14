@@ -44,8 +44,12 @@ from nsa.theme import banner, console, kv_table, log
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--input", "-i", required=True,
+    p.add_argument("--input", "-i",
                    help="Phase-1 calibration folder (bias/, dark/, flat/)")
+    p.add_argument("--from-pairs", dest="from_pairs", metavar="DATASET",
+                   help="fit the model from real noisy/gt PAIRS in this dataset "
+                        "(no bias/dark/flat needed) — one per gain, e.g. "
+                        "--from-pairs datasets/PI_RAW --sensor imx662h --gain 512")
     p.add_argument("--output", "-o", default="models/noise/imx662.json",
                    help="JSON noise model output path")
     p.add_argument("--sensor", default="imx662")
@@ -60,6 +64,25 @@ def main() -> int:
     args = p.parse_args()
 
     banner("Noise calibration  ·  Phases 1–4")
+
+    # From-pairs mode: fit directly from real noisy/gt captures (per gain).
+    if args.from_pairs:
+        from nsa.noise_calib.from_pairs import run_pair_calibration
+        log(f"Fitting from real pairs: {args.from_pairs}  "
+            f"[{args.sensor} @ gain {args.gain}]", "step")
+        model, validation = run_pair_calibration(
+            args.from_pairs, args.output, sensor=args.sensor, gain=args.gain,
+            filter_tokens=[args.sensor], seed=args.seed)
+        log(f"Fitted from {validation['n_pairs']} pair(s): "
+            f"shot_a={model.shot_a:.4g}  read σ={model.read_dist.sigma:.4g}", "ok")
+        log(f"Model → {args.output}", "ok")
+        if validation.get("report_png"):
+            log(f"Visual report → {validation['report_png']}", "ok")
+        return 0
+
+    if not args.input:
+        log("Provide --input (bias/dark/flat folder) or --from-pairs DATASET", "err")
+        return 1
     root = Path(args.input).expanduser().resolve()
 
     try:
@@ -104,6 +127,9 @@ def main() -> int:
     val_path.write_text(json.dumps(validation, indent=2), encoding="utf-8")
     log(f"Model → {args.output}", "ok")
     log(f"Validation report → {val_path}", "ok")
+    if validation.get("report_png"):
+        log(f"Visual report → {validation['report_png']}  "
+            f"(photon-transfer curve, read-noise fit, real-vs-synthetic noise)", "ok")
 
     if not validation.get("ok"):
         log("One or more Phase-4 checks did not pass — review before synthesis",
