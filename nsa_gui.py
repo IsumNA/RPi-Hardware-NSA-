@@ -522,7 +522,8 @@ class LossSelector(tk.Frame):
     ``set()`` also expands the legacy presets back into their terms.
     """
 
-    TERMS = ("charbonnier", "l1", "l2", "huber", "ssim", "perceptual", "edge")
+    TERMS = ("charbonnier", "l1", "l2", "huber", "ssim", "perceptual", "edge",
+             "swt", "swtrel")
     _ALIASES = {"mse": "l2", "l1_perceptual_edge": "l1+perceptual+edge",
                 "charbonnier_ssim": "charbonnier+ssim"}
 
@@ -5476,7 +5477,7 @@ class App(tk.Tk):
                     "ssim_window": "11",
                     "w_l1": "1.0", "w_l2": "1.0", "w_charbonnier": "1.0",
                     "w_huber": "1.0", "w_ssim": "0.2", "w_perceptual": "0.1",
-                    "w_edge": "0.05"}
+                    "w_edge": "0.05", "w_swt": "0.1", "w_swtrel": "0.5"}
 
         def field(key, title, desc):
             self._entry_row(self.loss_box, key, title, desc,
