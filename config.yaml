@@ -143,6 +143,11 @@ output:
   # ag512 frames it improves LPIPS at near-zero PSNR cost (no hallucination —
   # it only restores micro-contrast the denoiser kept but flattened).
   sharpen: 0.5
+  # Auto-copy result images to somewhere you can view them after each compile,
+  # e.g. your laptop. Must be SSH-reachable FROM this machine (sshd running).
+  # Password: export NSA_RESULTS_PASS=... (needs sshpass) or use key-based auth.
+  # Empty = off. Also available on demand via the results screen's SEND RESULTS.
+  results_dest: ""          # e.g. you@laptop:~/nsa_results
 
 # ---- Pi live testing (GUI LIVE TEST on AI server → Pi camera over SSH) ------
 pi_live:

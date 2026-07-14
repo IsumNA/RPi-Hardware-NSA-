@@ -6581,6 +6581,8 @@ class App(tk.Tk):
                     width=100, height=40).pack(side="left", padx=(S(6), 0))
         RoundButton(foot_bot, "OPEN OUTPUTS", self._open_outputs, kind="secondary",
                     width=130, height=40).pack(side="left", padx=(S(6), 0))
+        RoundButton(foot_bot, "SEND RESULTS", self._send_results, kind="secondary",
+                    width=130, height=40).pack(side="left", padx=(S(6), 0))
 
         outer = tk.Frame(self.main, bg=WHITE)
         outer.pack(fill="both", expand=True, padx=pad, pady=(S(6), 0))
@@ -7241,6 +7243,40 @@ class App(tk.Tk):
                 pass
         self.sidebar.reset()
         self._build_form()
+
+    def _send_results(self):
+        """Copy the result images to a viewable SSH destination (e.g. laptop)."""
+        try:
+            from nsa.config import load_config
+            from nsa.results_sync import push_results
+            dest = getattr(self, "_results_dest", "") or ""
+            if not dest:
+                try:
+                    dest = (load_config(ROOT / "config.yaml").output.results_dest or "").strip()
+                except Exception:  # noqa: BLE001
+                    dest = ""
+            dest = simpledialog.askstring(
+                "Send results",
+                "SSH destination for result images\n(e.g. you@laptop:~/nsa_results):",
+                initialvalue=dest, parent=self) or ""
+            dest = dest.strip()
+            if not dest:
+                return
+            self._results_dest = dest
+            pw = None
+            if not os.environ.get("NSA_RESULTS_PASS"):
+                pw = simpledialog.askstring(
+                    "Send results",
+                    f"SSH password for {dest.split(':')[0]}\n"
+                    "(leave blank if key-based login is set up):",
+                    show="*", parent=self) or None
+            ok, msg = push_results(dest, ROOT / "outputs", password=pw)
+            if ok:
+                messagebox.showinfo("Send results", msg or "Sent.")
+            else:
+                messagebox.showerror("Send results", msg)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Send results", str(exc))
 
     def _open_outputs(self):
         path = ROOT / "outputs"

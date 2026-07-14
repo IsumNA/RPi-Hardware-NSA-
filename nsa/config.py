@@ -154,6 +154,11 @@ class OutputConfig:
     # Counters the conditional-mean softness of regression denoisers; measured
     # to improve LPIPS at ~zero PSNR cost on held-out ag512 frames.
     sharpen: float = 0.5
+    # Auto-copy result images (validation panel, denoised outputs, summary) to a
+    # destination you can view — e.g. "you@laptop:~/nsa_results". Empty = off.
+    # Must be SSH-reachable FROM this machine; password via NSA_RESULTS_PASS env
+    # (needs sshpass) or key-based auth. See nsa/results_sync.py.
+    results_dest: str = ""
 
 
 @dataclass
@@ -408,6 +413,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sharpen", dest="sharpen", type=float,
                    help="detail-restore unsharp mask on the denoised output "
                         "(default 0.5; 0 = off)")
+    p.add_argument("--results-dest", dest="results_dest",
+                   help="auto-copy result images to this SSH target after the run, "
+                        "e.g. you@laptop:~/nsa_results (password via NSA_RESULTS_PASS)")
     p.add_argument("--seed", type=int)
     p.add_argument("--hf-model", dest="hf_model",
                    help="frozen Hugging Face model id to run (downloads snapshot if needed)")
@@ -509,6 +517,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.output.validate_gain = str(args.validate_gain).strip().lower()
     if getattr(args, "sharpen", None) is not None:
         cfg.output.sharpen = max(0.0, float(args.sharpen))
+    if getattr(args, "results_dest", None) is not None:
+        cfg.output.results_dest = str(args.results_dest).strip()
     if args.seed is not None:
         cfg.output.seed = args.seed
     return cfg

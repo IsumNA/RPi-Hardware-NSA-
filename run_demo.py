@@ -600,6 +600,12 @@ def main() -> int:
         log("No display detected (headless) — window skipped; "
             "open validation_panel.png to view the result", "info")
 
+    # Auto-copy results to a viewable destination (e.g. your laptop), if set.
+    if getattr(cfg.output, "results_dest", ""):
+        from nsa.results_sync import push_results
+        ok, msg = push_results(cfg.output.results_dest, out_dir)
+        log(f"Results delivery: {msg}", "ok" if ok else "warn")
+
     # ===========================================================================
     # OUTPUT 4 - PARETO FITNESS REPORT
     # ===========================================================================
