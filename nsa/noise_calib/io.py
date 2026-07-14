@@ -16,6 +16,34 @@ def load_linear(path: Path) -> np.ndarray:
     return _load_any(path).astype(np.float32)
 
 
+def load_raw_linear(path: Path) -> np.ndarray:
+    """Load a frame in the TRUE sensor domain for noise calibration.
+
+    For a DNG this returns the raw Bayer plane, black-level subtracted and
+    white-level normalised — linear, NOT demosaiced, NOT gamma-mapped, NOT
+    clipped at black. This is the only domain where read noise is a symmetric
+    zero-mean distribution; ``rawpy.postprocess`` (what ``load_linear`` uses)
+    applies a tone curve that ~2x-inflates shadow noise and clips the negative
+    half at black, which makes the read/shot fits physically wrong.
+
+    Non-raw inputs (PNG/JPG) have no recoverable raw domain, so fall back to
+    processed luma with a warning left to the caller.
+    """
+    p = Path(path)
+    if p.suffix.lower() in (".dng", ".raw", ".arw", ".nef", ".cr2"):
+        import rawpy
+        with rawpy.imread(str(p)) as r:
+            raw = r.raw_image_visible.astype(np.float32)
+            black = float(np.mean(r.black_level_per_channel))
+            white = float(r.white_level)
+        return (raw - black) / max(white - black, 1.0)
+    return to_luma(load_linear(p))
+
+
+def is_raw(path: Path) -> bool:
+    return Path(path).suffix.lower() in (".dng", ".raw", ".arw", ".nef", ".cr2")
+
+
 def to_luma(img: np.ndarray) -> np.ndarray:
     """Single-channel signal for statistics (ITU-R BT.601 on RGB)."""
     if img.ndim == 2:

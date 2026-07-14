@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .io import load_linear, to_luma
+from .io import load_raw_linear, to_luma
 
 
 def extract_read_samples(bias_paths: list[Path], *, holdout: Path | None = None
@@ -18,11 +18,11 @@ def extract_read_samples(bias_paths: list[Path], *, holdout: Path | None = None
     paths = [p for p in bias_paths if p != holdout]
     if not paths:
         raise ValueError("Need at least one bias frame (plus optional holdout)")
-    stack = np.stack([to_luma(load_linear(p)) for p in paths], axis=0)
+    stack = np.stack([load_raw_linear(p) for p in paths], axis=0)
     mean_bias = stack.mean(axis=0)
     residuals = []
     for p in paths:
-        residuals.append(to_luma(load_linear(p)) - mean_bias)
+        residuals.append(load_raw_linear(p) - mean_bias)
     samples = np.concatenate([r.ravel() for r in residuals]).astype(np.float32)
     return samples, holdout
 
@@ -36,12 +36,12 @@ def extract_row_samples(dark_paths: list[Path], *, holdout: Path | None = None
     paths = [p for p in dark_paths if p != holdout]
     if not paths:
         raise ValueError("Need at least one dark frame")
-    stack = np.stack([to_luma(load_linear(p)) for p in paths], axis=0)
+    stack = np.stack([load_raw_linear(p) for p in paths], axis=0)
     mean_dark = stack.mean(axis=0)
     pixel_res = []
     row_res = []
     for p in paths:
-        res = to_luma(load_linear(p)) - mean_dark
+        res = load_raw_linear(p) - mean_dark
         pixel_res.append(res.ravel())
         row_means = res.mean(axis=1)
         row_res.append(row_means - row_means.mean())
@@ -63,7 +63,7 @@ def extract_shot_points(flat_pairs: list[tuple[Path, Path]],
     for pair in flat_pairs:
         if holdout_pair and pair == holdout_pair:
             continue
-        a, b = to_luma(load_linear(pair[0])), to_luma(load_linear(pair[1]))
+        a, b = load_raw_linear(pair[0]), load_raw_linear(pair[1])
         mu = 0.5 * (a + b)
         diff = a - b
         mus.append(float(mu.mean()))
