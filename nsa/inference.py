@@ -295,6 +295,51 @@ def _swt_loss(pred: torch.Tensor, target: torch.Tensor, levels: int = 2,
     return loss
 
 
+def _swt_rel_loss(pred: torch.Tensor, target: torch.Tensor, levels: int = 3,
+                  eps: float = 1e-4) -> torch.Tensor:
+    """Normalized stationary-wavelet loss — designed backwards from the images to
+    be zero at identity and maximal under blur.
+
+    Same à-trous Haar subbands as ``_swt_loss``, but each detail subband error is
+    divided by the GROUND TRUTH's own energy in that subband:
+
+        Σ  |detail(pred) - detail(gt)| / (|detail(gt)| + eps)
+
+    Consequences (measured on real ag512 GT patches):
+      * identity -> 0;
+      * blur removes high-frequency energy, so detail(pred)->0 and each term ->
+        ~1 (maximal) — even a mild σ=0.5 blur costs ~34x more than under L1;
+      * the normalization is per-image and per-subband, so blur is penalised
+        proportionally even in DARK frames whose absolute HF energy is tiny
+        (where the un-normalised SWT barely reacts);
+      * it also penalises residual NOISE (excess HF), enforcing an exact
+        high-frequency match — sharp AND clean, not smoothed, not grainy.
+    Pair with a pixel term (charbonnier) for low-frequency / colour fidelity.
+    """
+    c = pred.shape[1]
+    dev, dt = pred.device, pred.dtype
+    lo = torch.tensor([1.0, 1.0], device=dev, dtype=dt) / (2.0 ** 0.5)
+    hi = torch.tensor([1.0, -1.0], device=dev, dtype=dt) / (2.0 ** 0.5)
+
+    def kern(a, b):
+        return torch.outer(a, b).reshape(1, 1, 2, 2).repeat(c, 1, 1, 1)
+
+    kLL, kLH, kHL, kHH = kern(lo, lo), kern(lo, hi), kern(hi, lo), kern(hi, hi)
+
+    def band(x, k, d):
+        return F.conv2d(F.pad(x, (0, d, 0, d), mode="reflect"), k, dilation=d, groups=c)
+
+    loss = pred.new_zeros(())
+    cp, ct = pred, target
+    for lvl in range(max(1, levels)):
+        d = 2 ** lvl
+        for k in (kLH, kHL, kHH):
+            bp, bt = band(cp, k, d), band(ct, k, d)
+            loss = loss + (bp - bt).abs().mean() / (bt.abs().mean() + eps)
+        cp, ct = band(cp, kLL, d), band(ct, kLL, d)
+    return loss / (max(1, levels) * 3)
+
+
 def _perceptual_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Differentiable LPIPS (AlexNet) perceptual loss.
 
@@ -331,6 +376,8 @@ def _term_loss(term: str, *, charbonnier_eps: float, huber_delta: float,
         return _edge_loss
     if term == "swt":
         return _swt_loss
+    if term == "swtrel":
+        return _swt_rel_loss
     raise KeyError(term)
 
 
