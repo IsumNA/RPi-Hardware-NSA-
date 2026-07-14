@@ -13,12 +13,12 @@
 #   hailo8     -> Raspberry Pi 5 + Hailo-8 AI HAT  (.hef, INT8)
 #   deepx      -> DeepX DX-M1 M.2 accelerator      (.bin, INT8)
 #   intel_npu  -> Intel AI Boost NPU via OpenVINO  (.xml, FP16)
-hardware: intel_npu
+hardware: rpi5_cpu
 
 # ---- LEVEL 3 : Model Architecture --------------------------------------------
 model:
   model_family: nafnet      # cnn|dncnn|unet|rednet|ridnet|nafnet|ffdnet|drunet|restormer
-  base_channels: 32         # 16 | 32 | 64
+  base_channels: 16         # 16 | 32 | 64
   block_depth: 4            # 2  | 4  | 8  (REDNet min 2; UNet/DRUNet halved per stage)
   conv_type: depthwise      # standard | depthwise  (ignored for nafnet / restormer)
   activation: relu          # relu | gelu | silu  (ignored for nafnet / restormer)
@@ -27,9 +27,9 @@ model:
   # 8x at the bottleneck — the receptive field a flat 4-block model lacks, which
   # is what removes LOW-FREQUENCY chroma blotches on very grainy captures
   # (a flat model literally cannot see structure larger than a few dozen px).
-  nafnet_enc_blocks: [2, 2, 4]   # per-level encoder NAFBlock counts (U-shaped NAFNet)
-  nafnet_middle_blocks: 6        # bottleneck block count
-  nafnet_dec_blocks: [2, 2, 2]   # per-level decoder NAFBlock counts
+  nafnet_enc_blocks: [1, 1, 2]   # per-level encoder NAFBlock counts (U-shaped NAFNet)
+  nafnet_middle_blocks: 2        # bottleneck block count
+  nafnet_dec_blocks: [1, 1, 1]   # per-level decoder NAFBlock counts
 
 # ---- LEVEL 1 : Sensor / Input ------------------------------------------------
 sensor:
@@ -63,7 +63,7 @@ sensor:
   #   LCG-only:                [imx662_ag]
   #   HCG-only:                [imx662h]
   #   LCG at deploy gain only: [imx662_ag, ag256]
-  filter: [imx662]
+  filter: [imx662h]
   gain: 256                 # analog gain multiplier (256 = moderate; 512 = stress test)
   # Override the standard deviation of the injected Gaussian read noise, in
   # electrons RMS (the denoise-hw noise-floor knob). null keeps the sensor's
@@ -110,15 +110,16 @@ optimization:
   loss:
     # Default anti-blur composite: pixel accuracy (L1) + perceptual (LPIPS) +
     # edge (gradient) terms. Equivalent to "l1+perceptual+edge".
-    name: l1_perceptual_edge
+    # charbonnier+edge won the Pi5 ag512 search (outputs/pi5_ag512_search):
+    # no perceptual term in TRAINING -> nothing can hallucinate texture.
+    name: charbonnier+edge
     charbonnier_eps: 0.0005  # smaller = closer to L1 (sharper), larger = smoother
     huber_delta: 1.0
     ssim_window: 11          # odd Gaussian window for the SSIM term
     ssim_weight: 0.22        # charbonnier_ssim blend weight (0..1)
     # Per-term weights for composite losses (only the selected terms are used).
     weights:
-      l1: 1.0
-      perceptual: 0.1
+      charbonnier: 1.0
       edge: 0.05
 
 # ---- Run mode ----------------------------------------------------------------
@@ -137,6 +138,11 @@ output:
   # (imx662_ag1..ag512): high = noisiest (default, the low-light stress test),
   # low = cleanest, first = dataset order, or a gain number (e.g. 512).
   validate_gain: high
+  # Detail-restore unsharp mask on the DENOISED output (0 = off). Counters the
+  # soft "conditional mean" look of regression denoisers; measured on held-out
+  # ag512 frames it improves LPIPS at near-zero PSNR cost (no hallucination —
+  # it only restores micro-contrast the denoiser kept but flattened).
+  sharpen: 0.5
 
 # ---- Pi live testing (GUI LIVE TEST on AI server → Pi camera over SSH) ------
 pi_live:

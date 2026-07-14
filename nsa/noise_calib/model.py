@@ -76,8 +76,15 @@ class NoiseModel:
 
 def save_model(model: NoiseModel, path: Path | str) -> None:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(model.to_dict(), indent=2), encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(model.to_dict(), indent=2), encoding="utf-8")
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot write the noise model to {path} (permission denied). The "
+            f"target is likely a read-only shared dataset store. Choose an output "
+            f"path under a writable location (e.g. this repo's models/noise/)."
+        ) from exc
 
 
 def load_model(path: Path | str) -> NoiseModel:

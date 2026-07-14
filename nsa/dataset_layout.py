@@ -87,6 +87,41 @@ def noise_model_path(project_root: Path | str, sensor: str | None, gain: int) ->
     return Path(project_root).expanduser().resolve() / noise_model_rel_path(sensor, gain)
 
 
+def _dir_writable(p: Path) -> bool:
+    """True if we can create/write files under ``p`` (walking up to an existing
+    ancestor, since the leaf dir may not exist yet)."""
+    import os
+    q = Path(p)
+    while not q.exists():
+        if q.parent == q:
+            return False
+        q = q.parent
+    return os.access(q, os.W_OK)
+
+
+def writable_output_root() -> Path:
+    """Base directory for GENERATED artifacts (noise models, scaffolds, etc.).
+
+    The dataset root may be a read-only shared store (e.g. /opt/datasets/PI_RAW
+    owned by another account) — reading captures from it is fine, but writing
+    our outputs there fails with permission denied. Generated artifacts belong
+    in a writable place: prefer the repo itself (always writable — we run from
+    it), then the desktop project, then the user's home.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    from nsa.denoise_hw_data import desktop_pi_raw_path
+    for cand in (repo, desktop_pi_raw_path().parent if desktop_pi_raw_path() else None,
+                 Path.home() / ".nsa"):
+        if cand and _dir_writable(cand):
+            return cand.resolve()
+    return repo.resolve()
+
+
+def writable_noise_model_path(sensor: str | None, gain: int) -> Path:
+    """Where to SAVE a calibrated noise model — always a writable location."""
+    return writable_output_root() / noise_model_rel_path(sensor, gain)
+
+
 def ensure_manager_scenes(scenes: Sequence[str] | None) -> tuple[str, ...]:
     """Keep the user's scene order, then append any ``MANAGER_SCENES`` they omitted."""
     if scenes is None:

@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent
 from nsa.export import export_onnx, write_device_artifact
 from nsa.hf_runner import (calibration_steps_for_hf, copy_hf_onnx,
                            is_hf_pretrained, load_hf_model)
-from nsa.inference import (build_loss, calibrate, calibrate_multi,
+from nsa.inference import (build_loss, calibrate, calibrate_multi, sharpen,
                            estimate_device_latency_ms, fake_quantize_int8, lpips,
                            psnr, run, ssim, temporal_denoise)
 from nsa.models import build_model, count_params
@@ -568,6 +568,13 @@ def main() -> int:
     # OUTPUT 3 - VISUAL VALIDATION MATRIX
     # ===========================================================================
     level_rule(0, "VALIDATION  ·  before / ground-truth / after")
+    # Detail-restore USM on the clean output: counters the conditional-mean
+    # softness of regression denoisers (measured: LPIPS improves, PSNR ~flat).
+    if cfg.output.sharpen > 0:
+        final_out = sharpen(final_out, cfg.output.sharpen)
+        final_psnr = psnr(final_out, frame.clean_rgb)
+        log(f"Detail restore: unsharp mask {cfg.output.sharpen:g} applied to the "
+            f"denoised output", "info")
     panel_path = out_dir / "validation_panel.png"
     meta = {
         "sensor": sensor.label,

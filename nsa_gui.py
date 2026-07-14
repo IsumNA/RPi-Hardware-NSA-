@@ -973,6 +973,9 @@ class LiveView(tk.Toplevel):
 
             self._reconnect.clear()
             t_prev = _t.perf_counter()
+            # Motion-gated temporal accumulation: static regions converge to
+            # ground-truth-grade quality within ~1 s (same class live.py uses).
+            accum = _live.TemporalDenoiser(model)
             try:
                 while not self._stop.is_set() and not self._reconnect.is_set():
                     raw = cam.read()
@@ -996,7 +999,7 @@ class LiveView(tk.Toplevel):
                         if sigma > 0:
                             raw = _live.add_noise_bgr(raw, sigma)
 
-                    out, dt_ms = _live.denoise_bgr(model, raw)
+                    out, dt_ms = accum.step_bgr(raw)
                     n_in, n_out = _live.noise_level(raw), _live.noise_level(out)
 
                     now = _t.perf_counter()
@@ -1169,6 +1172,11 @@ class ImageTestView(tk.Toplevel):
                   font=font(10)).pack(side="right", padx=(0, S(6)))
         tk.Label(ctl, text="σ", bg=WHITE, fg=SUBTLE,
                  font=font(10)).pack(side="right", padx=(0, S(4)))
+        self._sharpen_on = tk.BooleanVar(value=True)
+        tk.Checkbutton(ctl, text=" Detail restore", variable=self._sharpen_on,
+                       bg=WHITE, fg=INK, selectcolor=WHITE, activebackground=WHITE,
+                       highlightthickness=0, font=font(9)).pack(side="right",
+                                                                padx=(0, S(10)))
 
         # -- Panels ----------------------------------------------------------
         panels = tk.Frame(self, bg=WHITE)
@@ -1248,6 +1256,9 @@ class ImageTestView(tk.Toplevel):
                     rng = np.random.default_rng(0)
                     rgb = np.clip(rgb + rng.normal(0, sigma, rgb.shape).astype("float32"), 0, 1)
             out, ms = run(self._model, rgb)
+            if self._sharpen_on.get():
+                from nsa.inference import sharpen
+                out = sharpen(out, 0.5)
             drop = self._noise_drop(rgb, out)
             stats = {"ms": ms, "drop": drop, "res": f"{rgb.shape[1]}×{rgb.shape[0]}"}
             self._result = (self._to_uint8(rgb), self._to_uint8(out), stats)
@@ -1866,7 +1877,7 @@ class NoiseDatasetWizard(tk.Toplevel):
         self.gain_var = tk.StringVar(value="256")
         self.temp_var = tk.StringVar()
         from nsa.dataset_layout import find_best_project_root, resolve_layout
-        from nsa.dataset_layout import calibration_dir, noise_model_path
+        from nsa.dataset_layout import calibration_dir, writable_noise_model_path
         _pi = find_best_project_root() or (ROOT / "datasets" / "PI_RAW")
         _proj, _pi_raw = resolve_layout(_pi)
         self._proj = _proj      # project root, for auto-fetching per-sensor folders
@@ -1874,7 +1885,9 @@ class NoiseDatasetWizard(tk.Toplevel):
             value=str(_proj / "clean_scenes") if (_proj / "clean_scenes").is_dir() else "")
         _default_sensor = "imx662"
         _default_gain = 256
-        self.model_out.set(str(noise_model_path(_proj, _default_sensor, _default_gain)))
+        # Model OUTPUT must go somewhere writable — the dataset project root may
+        # be a read-only shared store (e.g. /opt/datasets/PI_RAW).
+        self.model_out.set(str(writable_noise_model_path(_default_sensor, _default_gain)))
         _cal = calibration_dir(_proj, _default_sensor, _default_gain)
         self.calib_dir.set(str(_cal) if _cal.is_dir() else "")
         self.dataset_out = tk.StringVar(value=str(_pi_raw))
@@ -2043,15 +2056,15 @@ class NoiseDatasetWizard(tk.Toplevel):
     def _sync_calib_paths(self):
         """Auto-fetch the calibration folder + noise-model path for the chosen
         sensor/gain (imx662 and imx662h keep separate calibration trees)."""
-        from nsa.dataset_layout import calibration_dir, noise_model_path
+        from nsa.dataset_layout import calibration_dir, writable_noise_model_path
         sensor = self.sensor_var.get() or "imx662"
         try:
             gain = int(self.gain_var.get())
         except (TypeError, ValueError):
             gain = 256
-        cal = calibration_dir(self._proj, sensor, gain)
+        cal = calibration_dir(self._proj, sensor, gain)          # INPUT (read-only OK)
         self.calib_dir.set(str(cal))
-        self.model_out.set(str(noise_model_path(self._proj, sensor, gain)))
+        self.model_out.set(str(writable_noise_model_path(sensor, gain)))  # OUTPUT
         if cal.is_dir():
             self._set_status(f"Loaded {sensor} gain{gain} calibration folder.", ok=True)
         else:

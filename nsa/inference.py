@@ -501,6 +501,24 @@ def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):
     return outputs, per_frame
 
 
+def sharpen(img: np.ndarray, amount: float = 0.5, sigma: float = 1.2) -> np.ndarray:
+    """Detail-restore unsharp mask for a DENOISED frame (float RGB [0,1]).
+
+    Regression-trained denoisers smooth where noise destroyed detail (they
+    predict the conditional mean), which reads as a soft/plastic look. A light
+    unsharp mask on the already-clean output restores gradient energy to
+    ground-truth level without hallucinating texture — measured on held-out
+    ag512 frames it IMPROVES LPIPS at near-zero PSNR cost (amount 0.4-0.7;
+    see outputs/pi5_ag512_search/sharp_variants.json). Safe on a clean base;
+    do not apply to a still-noisy image (it would amplify the grain).
+    """
+    if amount <= 0:
+        return img
+    import cv2
+    blur = cv2.GaussianBlur(img, (0, 0), max(0.3, float(sigma)))
+    return np.clip(img + float(amount) * (img - blur), 0.0, 1.0)
+
+
 def run(model: nn.Module, noisy: np.ndarray) -> tuple[np.ndarray, float]:
     """Run inference; return the denoised image and measured forward time (ms)."""
     x = to_tensor(noisy)
@@ -547,16 +565,53 @@ def fake_quantize_int8(model: nn.Module, quant_activations: bool = True) -> nn.M
 
 
 def model_gflops(model: nn.Module, patch: int) -> float:
-    """Single-frame compute cost of the model at the working resolution."""
+    """Single-frame compute cost of the model at the working resolution.
+
+    Measured with forward hooks so every conv is billed at its ACTUAL output
+    resolution. The previous static formula only looked at each layer's own
+    stride, ignoring cumulative downsampling — convs inside a U-Net's 1/8-res
+    stage were charged at full resolution, overestimating multi-scale models'
+    cost by up to ~64x (and skewing every latency/fitness ranking built on it).
+    """
     macs = 0
-    for m in model.modules():
+    hooks = []
+
+    def _count(m, _inp, out):
+        nonlocal macs
+        t = out[0] if isinstance(out, (tuple, list)) else out
+        if not (isinstance(t, torch.Tensor) and t.dim() == 4):
+            return
+        out_px = t.shape[-2] * t.shape[-1]
         if isinstance(m, nn.Conv2d):
             cout, cin_g, kh, kw = m.weight.shape
-            out_px = (patch // m.stride[0]) ** 2
             macs += cout * cin_g * kh * kw * out_px
         elif isinstance(m, nn.ConvTranspose2d):
             cin, cout_g, kh, kw = m.weight.shape
-            macs += cin * cout_g * kh * kw * (patch ** 2)
+            macs += cin * cout_g * kh * kw * out_px
+
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+            hooks.append(m.register_forward_hook(_count))
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            model(torch.zeros(1, 3, patch, patch))
+        if was_training:
+            model.train()
+    except Exception:
+        # Fallback: static estimate (own-stride only) if the probe forward fails.
+        macs = 0
+        for m in model.modules():
+            if isinstance(m, nn.Conv2d):
+                cout, cin_g, kh, kw = m.weight.shape
+                macs += cout * cin_g * kh * kw * (patch // m.stride[0]) ** 2
+            elif isinstance(m, nn.ConvTranspose2d):
+                cin, cout_g, kh, kw = m.weight.shape
+                macs += cin * cout_g * kh * kw * (patch ** 2)
+    finally:
+        for h in hooks:
+            h.remove()
     return 2 * macs / 1e9
 
 

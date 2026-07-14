@@ -150,6 +150,10 @@ class OutputConfig:
     # meaningful low-light stress test), "low" = cleanest, "first" = dataset
     # order, or a number (e.g. "512") to prefer the capture closest to that gain.
     validate_gain: str = "high"
+    # Detail-restore unsharp mask applied to the DENOISED output (0 = off).
+    # Counters the conditional-mean softness of regression denoisers; measured
+    # to improve LPIPS at ~zero PSNR cost on held-out ag512 frames.
+    sharpen: float = 0.5
 
 
 @dataclass
@@ -401,6 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="which analogue-gain capture the validation matrix uses when the "
                         "dataset spans a gain sweep: high=noisiest (default), low=cleanest, "
                         "first=dataset order, or a gain number (e.g. 512)")
+    p.add_argument("--sharpen", dest="sharpen", type=float,
+                   help="detail-restore unsharp mask on the denoised output "
+                        "(default 0.5; 0 = off)")
     p.add_argument("--seed", type=int)
     p.add_argument("--hf-model", dest="hf_model",
                    help="frozen Hugging Face model id to run (downloads snapshot if needed)")
@@ -500,6 +507,8 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.output.show_window = False
     if getattr(args, "validate_gain", None):
         cfg.output.validate_gain = str(args.validate_gain).strip().lower()
+    if getattr(args, "sharpen", None) is not None:
+        cfg.output.sharpen = max(0.0, float(args.sharpen))
     if args.seed is not None:
         cfg.output.seed = args.seed
     return cfg
