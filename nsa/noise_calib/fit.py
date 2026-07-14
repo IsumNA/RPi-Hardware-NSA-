@@ -85,6 +85,22 @@ def fit_shot_poisson(mu: np.ndarray, var: np.ndarray) -> float:
     return max(a, 0.0)
 
 
+def fit_variance_curve(mu: np.ndarray, var: np.ndarray) -> list[float] | None:
+    """Quadratic least-squares fit of TOTAL variance vs signal: c0 + c1·μ + c2·μ².
+
+    Raw photon-transfer is linear, but in the processed/clipped RGB domain the
+    curve bends over (clipping suppresses variance near black and white), so a
+    quadratic captures it far better than a line. Returns ``[c0, c1, c2]`` or
+    ``None`` if there are too few points to fit.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    var = np.asarray(var, dtype=np.float64)
+    if mu.size < 3:
+        return None
+    coeffs = np.polyfit(mu, var, 2)          # highest power first
+    return [float(coeffs[2]), float(coeffs[1]), float(coeffs[0])]  # c0, c1, c2
+
+
 def quant_scale_from_adc(adc_bits: int) -> float:
     """Quantisation noise: ±½ LSB in normalised [0,1] units."""
     levels = max(2 ** int(adc_bits), 2)
@@ -109,17 +125,21 @@ def build_noise_model(
     read_dist = fit_read_distribution(read_samples)
     row_dist, row_strength = fit_row_distribution(row_samples, pixel_dark_samples)
     shot_a = fit_shot_poisson(shot_mu, shot_var)
+    var_curve = fit_variance_curve(shot_mu, shot_var)
     notes = []
     if read_dist.kind == "gamma":
         notes.append("Read noise: Gamma fit beat Gaussian on bias residuals")
     if row_dist is not None:
         notes.append(f"Row noise detected (strength {row_strength:.3f})")
+    if var_curve is not None and var_curve[2] < -1e-6:
+        notes.append("Photon-transfer curve bends over (clipping) — quadratic fit used")
     return NoiseModel(
         sensor=sensor,
         gain=gain,
         temperature_c=temperature_c,
         adc_bits=adc_bits,
         shot_a=shot_a,
+        var_curve=var_curve,
         read_dist=read_dist,
         row_dist=row_dist,
         row_strength=row_strength,

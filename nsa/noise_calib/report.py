@@ -82,8 +82,14 @@ def render_calibration_report(
     if len(shot_mu):
         a.scatter(shot_mu, shot_var, s=36, c=_REAL, label="measured", zorder=3)
         xs = np.linspace(0, float(np.max(shot_mu)) * 1.05 + 1e-6, 100)
-        a.plot(xs, model.shot_a * xs + read_var, c=_FIT, lw=2,
-               label=f"fit: {model.shot_a:.3g}·μ + {read_var:.3g}")
+        curve = getattr(model, "var_curve", None)
+        if curve:
+            c0, c1, c2 = curve
+            a.plot(xs, c0 + c1 * xs + c2 * xs * xs, c=_FIT, lw=2,
+                   label=f"quadratic fit ({c2:+.3g}μ²{c1:+.3g}μ{c0:+.3g})")
+        else:
+            a.plot(xs, model.shot_a * xs + read_var, c=_FIT, lw=2,
+                   label=f"linear fit: {model.shot_a:.3g}·μ + {read_var:.3g}")
     a.set_title("Photon-transfer curve", color=_INK)
     a.set_xlabel("signal μ"); a.set_ylabel("noise variance")
     a.legend(fontsize=8); a.grid(True, color=_GRID)

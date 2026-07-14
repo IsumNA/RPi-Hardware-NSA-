@@ -35,7 +35,13 @@ class NoiseModel:
     gain: int = 256
     temperature_c: float | None = None
     adc_bits: int = 12
-    shot_a: float = 0.0                 # Poisson scale (variance = a · signal)
+    shot_a: float = 0.0                 # Poisson scale (variance = a · signal); linear fallback
+    # Quadratic TOTAL-variance curve var(μ) = c0 + c1·μ + c2·μ² fitted to the
+    # measured (signal, residual-variance) points. In the processed/clipped RGB
+    # domain the photon-transfer curve is NOT linear — variance is squeezed to
+    # ~0 at both black and white — so a line badly misfits. When present this
+    # supersedes shot_a for the signal-dependent noise magnitude.
+    var_curve: list | None = None       # [c0, c1, c2]
     read_dist: DistributionFit = field(default_factory=lambda: DistributionFit("gaussian"))
     row_dist: DistributionFit | None = None
     row_strength: float = 0.0           # relative weight of per-row component
@@ -63,6 +69,7 @@ class NoiseModel:
             temperature_c=d.get("temperature_c"),
             adc_bits=int(d.get("adc_bits", 12)),
             shot_a=float(d.get("shot_a", 0.0)),
+            var_curve=list(d["var_curve"]) if d.get("var_curve") else None,
             read_dist=rd,
             row_dist=row,
             row_strength=float(d.get("row_strength", 0.0)),

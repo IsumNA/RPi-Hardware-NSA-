@@ -38,13 +38,21 @@ def synthesize_noisy(
     clean = np.clip(clean.astype(np.float32), 0.0, 1.0)
     noisy = clean.copy()
 
-    if include_shot and model.shot_a > 0:
-        # Gaussian approximation to Poisson: σ = sqrt(a · μ)
-        if clean.ndim == 2:
+    if include_shot:
+        curve = getattr(model, "var_curve", None)
+        if curve:
+            # Signal-dependent variance from the fitted quadratic TOTAL-variance
+            # curve, minus the read floor (added separately) to avoid double
+            # counting. Handles the clipped-RGB bend a linear a·μ can't.
+            c0, c1, c2 = curve
+            total = c0 + c1 * clean + c2 * clean * clean
+            read_var = float(model.read_dist.sigma) ** 2 if include_read else 0.0
+            shot_std = np.sqrt(np.maximum(total - read_var, 0.0))
+            noisy += rng.normal(0.0, 1.0, size=clean.shape).astype(np.float32) * shot_std
+        elif model.shot_a > 0:
+            # Gaussian approx to Poisson: σ = sqrt(a·μ) (raw-domain linear fallback)
             shot_std = np.sqrt(np.maximum(model.shot_a * clean, 0.0))
-        else:
-            shot_std = np.sqrt(np.maximum(model.shot_a * clean, 0.0))
-        noisy += rng.normal(0.0, 1.0, size=clean.shape).astype(np.float32) * shot_std
+            noisy += rng.normal(0.0, 1.0, size=clean.shape).astype(np.float32) * shot_std
 
     if include_read:
         noisy += _sample_dist(model.read_dist, clean.shape, rng)
