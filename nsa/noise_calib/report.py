@@ -27,10 +27,39 @@ from .synthesize import synthesize_noisy
 _INK, _GRID, _REAL, _SIM, _FIT = "#1A1A1A", "#DDDDDD", "#C41E3A", "#2E7D6B", "#E8912D"
 
 
+def _robust_sigma(x: np.ndarray) -> float:
+    """Outlier-resistant noise scale: 1.4826·MAD (≈ σ for a Gaussian).
+
+    Plain std is dominated by hot/dead/impulse pixels — which made amplified
+    noise crops render as flat grey (real grain washed out) with sparse black
+    specks (the defective pixels). MAD ignores those outliers.
+    """
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    s = 1.4826 * float(mad)
+    return s if s > 1e-6 else (float(x.std()) or 1e-6)
+
+
 def _amp(residual: np.ndarray) -> np.ndarray:
-    """Contrast-stretch a zero-mean noise field to [0,1] (±3σ -> full range)."""
-    s = float(residual.std()) or 1e-6
+    """Contrast-stretch a zero-mean noise field to [0,1] using a ROBUST scale,
+    so real grain is visible and defective pixels don't set the range."""
+    s = _robust_sigma(residual)
     return np.clip(residual / (6.0 * s) + 0.5, 0.0, 1.0)
+
+
+def _hist_pair(ax, real: np.ndarray, sim: np.ndarray, real_label: str) -> None:
+    """Overlay real vs synthetic noise histograms on a ROBUST window.
+
+    Range is ±5·robust-σ (not min/max) so hot/dead-pixel outliers can't collapse
+    the whole distribution into one spike-at-zero bin; labels report robust σ.
+    """
+    import numpy as _np
+    rs, ss = _robust_sigma(real), _robust_sigma(sim)
+    lim = 5.0 * max(rs, ss, 1e-6)
+    ax.hist(real.ravel(), bins=80, range=(-lim, lim), density=True,
+            color=_REAL, alpha=0.5, label=f"{real_label} (σ≈{rs:.4g})")
+    ax.hist(sim.ravel(), bins=80, range=(-lim, lim), density=True,
+            color=_SIM, alpha=0.5, label=f"SYNTHETIC (σ≈{ss:.4g})")
 
 
 def _highpass(img: np.ndarray, k: int = 31) -> np.ndarray:
@@ -120,12 +149,7 @@ def render_calibration_report(
         real_resid = real - clean
         sim = synthesize_noisy(np.asarray(clean_rgb, np.float32)[:h, :w], model, rng)
         sim_resid = to_luma(sim) - clean
-        lo = float(min(real_resid.min(), sim_resid.min()))
-        hi = float(max(real_resid.max(), sim_resid.max()))
-        a.hist(real_resid.ravel(), bins=80, range=(lo, hi), density=True,
-               color=_REAL, alpha=0.5, label=f"REAL noisy-gt (σ={real_resid.std():.4g})")
-        a.hist(sim_resid.ravel(), bins=80, range=(lo, hi), density=True,
-               color=_SIM, alpha=0.5, label=f"SYNTHETIC (σ={sim_resid.std():.4g})")
+        _hist_pair(a, real_resid, sim_resid, "REAL noisy-gt")
     elif real_flat is not None and Path(real_flat).is_file():
         real = to_luma(load_linear(Path(real_flat)))
         mean = float(real.mean())
@@ -136,12 +160,7 @@ def render_calibration_report(
         sim = synthesize_noisy(const, model, rng)   # 2D in -> 2D out
         real_resid = _highpass(real)
         sim_resid = _highpass(sim)
-        lo = min(real_resid.min(), sim_resid.min())
-        hi = max(real_resid.max(), sim_resid.max())
-        a.hist(real_resid.ravel(), bins=80, range=(lo, hi), density=True,
-               color=_REAL, alpha=0.5, label=f"REAL (σ={real_resid.std():.4g})")
-        a.hist(sim_resid.ravel(), bins=80, range=(lo, hi), density=True,
-               color=_SIM, alpha=0.5, label=f"SYNTHETIC (σ={sim_resid.std():.4g})")
+        _hist_pair(a, real_resid, sim_resid, "REAL")
     else:
         a.text(0.5, 0.5, "no real flat frame\nfor comparison",
                ha="center", va="center", color="#999")
