@@ -35,10 +35,13 @@ GAINS = (256, 512)
 # Individual loss "terms" that can be combined into a composite objective by
 # joining them with '+', e.g. "l1+perceptual+edge". Each term's default weight
 # is what it contributes when several are summed (a lone term is used unscaled).
-LOSS_TERMS = ("l1", "l2", "charbonnier", "huber", "ssim", "perceptual", "edge")
+LOSS_TERMS = ("l1", "l2", "charbonnier", "huber", "ssim", "perceptual", "edge", "swt")
 DEFAULT_LOSS_WEIGHTS = {
     "l1": 1.0, "l2": 1.0, "charbonnier": 1.0, "huber": 1.0,
     "ssim": 0.2, "perceptual": 0.1, "edge": 0.05,
+    # Stationary-wavelet loss: multi-scale subband matching, the anti-blur
+    # upgrade over the single-band 'edge' term.
+    "swt": 0.1,
 }
 # Named single-selection presets kept for backwards compatibility / convenience.
 # ``charbonnier_ssim`` is a special (1-w)·charbonnier + w·(1-SSIM) blend; the

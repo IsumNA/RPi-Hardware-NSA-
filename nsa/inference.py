@@ -258,6 +258,43 @@ def _edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (pdx - tdx).abs().mean() + (pdy - tdy).abs().mean()
 
 
+def _swt_loss(pred: torch.Tensor, target: torch.Tensor, levels: int = 2,
+              detail_weight: float = 1.0) -> torch.Tensor:
+    """Stationary (undecimated) Haar wavelet loss.
+
+    Decomposes pred and target into wavelet subbands — low-frequency structure
+    (LL) plus horizontal / vertical / diagonal detail (LH/HL/HH) — at multiple
+    scales via the à-trous (dilated, no-downsample) algorithm, then L1-matches
+    them. Because the high-frequency detail subbands get their own gradient, the
+    model is forced to reproduce sharp micro-texture instead of the blurry
+    average an L1/L2 pixel loss rewards. Fully differentiable, training-only,
+    zero inference cost. Generalises ``_edge_loss`` (a crude 1-band version).
+    """
+    c = pred.shape[1]
+    dev, dt = pred.device, pred.dtype
+    lo = torch.tensor([1.0, 1.0], device=dev, dtype=dt) / (2.0 ** 0.5)
+    hi = torch.tensor([1.0, -1.0], device=dev, dtype=dt) / (2.0 ** 0.5)
+
+    def kern(a, b):                       # separable 2x2 -> depthwise kernel
+        return torch.outer(a, b).reshape(1, 1, 2, 2).repeat(c, 1, 1, 1)
+
+    kLL, kLH, kHL, kHH = kern(lo, lo), kern(lo, hi), kern(hi, lo), kern(hi, hi)
+
+    def band(x, k, d):                    # 'same'-size stationary subband
+        xp = F.pad(x, (0, d, 0, d), mode="reflect")
+        return F.conv2d(xp, k, dilation=d, groups=c)
+
+    loss = pred.new_zeros(())
+    cp, ct = pred, target
+    for lvl in range(max(1, levels)):
+        d = 2 ** lvl
+        for k in (kLH, kHL, kHH):         # detail subbands
+            loss = loss + detail_weight * (band(cp, k, d) - band(ct, k, d)).abs().mean()
+        cp, ct = band(cp, kLL, d), band(ct, kLL, d)   # descend on LL (stationary)
+    loss = loss + (cp - ct).abs().mean()  # final coarse structure
+    return loss
+
+
 def _perceptual_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Differentiable LPIPS (AlexNet) perceptual loss.
 
@@ -292,6 +329,8 @@ def _term_loss(term: str, *, charbonnier_eps: float, huber_delta: float,
         return _perceptual_loss
     if term == "edge":
         return _edge_loss
+    if term == "swt":
+        return _swt_loss
     raise KeyError(term)
 
 
@@ -517,6 +556,55 @@ def sharpen(img: np.ndarray, amount: float = 0.5, sigma: float = 1.2) -> np.ndar
     import cv2
     blur = cv2.GaussianBlur(img, (0, 0), max(0.3, float(sigma)))
     return np.clip(img + float(amount) * (img - blur), 0.0, 1.0)
+
+
+class _LocalAvgPool2d(nn.Module):
+    """Local windowed average that REPLACES a global ``AdaptiveAvgPool2d(1)`` at
+    test time (Test-time Local Converter, TLC).
+
+    A model with global channel attention learns statistics over the small
+    training patch, but at inference the global pool averages over the whole
+    (much larger) frame — a train/test mismatch that costs quality. Averaging
+    over a local window the size of the training patch restores the training
+    statistics, giving a free PSNR bump with no retraining. Output keeps the
+    full HxW (the following 1x1 conv + broadcast multiply are unchanged), so the
+    channel attention becomes spatially adaptive.
+    """
+
+    def __init__(self, window: int):
+        super().__init__()
+        self.window = int(window)
+
+    def forward(self, x):
+        k = min(self.window, x.shape[-2], x.shape[-1])
+        if k <= 1:
+            return x.mean(dim=(2, 3), keepdim=True)
+        k = k if k % 2 == 1 else k - 1                # odd -> symmetric 'same'
+        return F.avg_pool2d(x, k, stride=1, padding=k // 2, count_include_pad=False)
+
+
+def apply_tlc(model: nn.Module, window: int = 192) -> nn.Module:
+    """Swap every global ``AdaptiveAvgPool2d`` for a local window (TLC).
+
+    Reversible via :func:`remove_tlc`. ``window`` should be the training patch
+    size (crop) the model was calibrated on.
+    """
+    swapped = []
+    for m in model.modules():
+        for name, child in list(m.named_children()):
+            if isinstance(child, nn.AdaptiveAvgPool2d):
+                setattr(m, name, _LocalAvgPool2d(window))
+                swapped.append((m, name, child))
+    model._tlc_swapped = swapped
+    return model
+
+
+def remove_tlc(model: nn.Module) -> nn.Module:
+    """Restore the original global pools after :func:`apply_tlc`."""
+    for m, name, orig in getattr(model, "_tlc_swapped", []):
+        setattr(m, name, orig)
+    model._tlc_swapped = []
+    return model
 
 
 def run(model: nn.Module, noisy: np.ndarray) -> tuple[np.ndarray, float]:
