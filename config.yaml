@@ -108,13 +108,15 @@ optimization:
   #   edge             -> gradient-L1; keeps high-frequency detail / sharp edges
   #   charbonnier_ssim -> (1-w)*charbonnier + w*(1-SSIM) blend; tune ssim_weight (w)
   loss:
-    # Anti-blur composite: sharp pixel loss (charbonnier, for brightness/colour)
-    # + NORMALIZED stationary-wavelet loss (swtrel). swtrel = per-subband HF
-    # error / GT's own subband energy: 0 at identity, maximal under blur, and
-    # penalises blur PROPORTIONALLY even in dark frames (unlike absolute SWT).
-    # Enforces an exact high-frequency match -> sharp AND clean. No perceptual
-    # term in TRAINING, so nothing can hallucinate texture.
-    name: charbonnier+swtrel
+    # Anti-blur composite: charbonnier (brightness/colour + noise) + a LIGHT
+    # stationary-wavelet term (swt). This is the A/B winner on held-out ag512
+    # (beat plain 'edge'; PSNR +0.14 dB, LPIPS -7%) and does NOT over-smooth.
+    # NOTE: 'swtrel' (normalized SWT) is a great blur METRIC but a bad training
+    # LOSS — at heavy weight it over-smooths ("removes noise but smudges"),
+    # because wavelet-L1 still targets the blurry posterior mean and its
+    # normalization over-weights low-energy fine detail in dark frames. Keep
+    # swt weight small; avoid swtrel as a training term.
+    name: charbonnier+swt
     charbonnier_eps: 0.0005  # smaller = closer to L1 (sharper), larger = smoother
     huber_delta: 1.0
     ssim_window: 11          # odd Gaussian window for the SSIM term
@@ -122,7 +124,7 @@ optimization:
     # Per-term weights for composite losses (only the selected terms are used).
     weights:
       charbonnier: 1.0
-      swtrel: 0.5
+      swt: 0.1
 
 # ---- Run mode ----------------------------------------------------------------
 run:
