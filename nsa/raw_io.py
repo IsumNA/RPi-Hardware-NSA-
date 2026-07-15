@@ -250,23 +250,34 @@ def _fit_min_side(img: np.ndarray, size: int) -> np.ndarray:
     return img
 
 
+# Preference order when a folder holds more than one file for the same role
+# (e.g. a leftover noisy.png next to a real noisy.dng) — always prefer the raw
+# capture, then the highest-precision derived format, over an 8-bit PNG.
+_EXT_RANK = {".dng": 0, ".raw": 1, ".npy": 1, ".tif": 2, ".tiff": 2,
+            ".png": 3, ".jpg": 4, ".jpeg": 4, ".bmp": 4, ".webp": 4}
+
+
 def _pair_in_folder(folder: Path) -> tuple[Path, Path] | None:
     """Return (noisy, gt) paths if `folder` holds a paired capture, else None.
 
     Mirrors denoise-hw's noisy.dng / gt.dng convention but accepts any supported
-    extension so it also works without rawpy (e.g. noisy.png + gt.png).
+    extension so it also works without rawpy (e.g. noisy.png + gt.png). When a
+    folder has more than one candidate for a role (a stale noisy.png left next
+    to a real noisy.dng), the raw/highest-precision file always wins.
     """
     noisy = gt = None
+    noisy_rank = gt_rank = 99
     for f in folder.iterdir():
         if not f.is_file():
             continue
         stem, ext = f.stem.lower(), f.suffix.lower()
         if ext not in SUPPORTED_EXTS:
             continue
-        if stem == "noisy":
-            noisy = f
-        elif stem in ("gt", "clean", "reference"):
-            gt = f
+        rank = _EXT_RANK.get(ext, 9)
+        if stem == "noisy" and rank < noisy_rank:
+            noisy, noisy_rank = f, rank
+        elif stem in ("gt", "clean", "reference") and rank < gt_rank:
+            gt, gt_rank = f, rank
     if noisy is not None and gt is not None:
         return noisy, gt
     return None
@@ -451,6 +462,29 @@ def _cap_long_side(img: np.ndarray, max_side: int) -> np.ndarray:
                       interpolation=cv2.INTER_AREA)
 
 
+def _find_burst_dir(dataset_root: Path, folder: Path) -> Path | None:
+    """Map a PI_RAW test folder (``<scene>/imx662[h]_ag<N>_test``) to its raw
+    burst directory (``imx662_project/bursts/<scene>/ag<N>``), if one exists.
+
+    The single ``noisy.dng`` copied into a PI_RAW folder is just one frame from
+    a much larger burst (up to 512 raw frames) captured at that scene/gain.
+    Finding the sibling burst lets training draw a different real frame per
+    crop instead of reusing the same one repeatedly.
+    """
+    import re
+    m = re.match(r"imx662h?_ag(\d+)_test$", folder.name)
+    if not m:
+        return None
+    gain_tag = f"ag{m.group(1)}"
+    scene = folder.parent.name
+    for base in (dataset_root.parent / "imx662_project" / "bursts",
+                 dataset_root / "imx662_project" / "bursts"):
+        d = base / scene / gain_tag
+        if d.is_dir() and len(list(d.glob("*.dng"))) > 1:
+            return d
+    return None
+
+
 def load_training_pairs(
     path: str | None,
     filter_tokens: list[str] | None = None,
@@ -464,6 +498,7 @@ def load_training_pairs(
     with_names: bool = False,
     tile: int = 0,
     tiles_per_image: int = 4,
+    use_burst_frames: bool = True,
 ) -> list:
     """Load EVERY paired capture under ``path`` as full-image (noisy, clean) pairs.
 
@@ -520,10 +555,25 @@ def load_training_pairs(
             # Native-resolution random tiles: true noise statistics, bounded memory.
             t = min(int(tile), h, w)
             rng = np.random.default_rng(seed * 100003 + i)
+            burst_dir = (_find_burst_dir(Path(root), folder)
+                        if use_burst_frames and not simulate_noise else None)
+            burst_files = sorted(burst_dir.glob("*.dng")) if burst_dir else None
             for _k in range(max(1, int(tiles_per_image))):
+                src = noisy
+                if burst_files:
+                    # A different real captured frame per crop (up to 512 in
+                    # the burst) instead of reusing the one noisy.dng copy —
+                    # exposes the model to far more real noise realizations.
+                    fpath = burst_files[int(rng.integers(0, len(burst_files)))]
+                    try:
+                        frame = _load_any(fpath)
+                        fh, fw = min(frame.shape[0], h), min(frame.shape[1], w)
+                        src = frame[:fh, :fw]
+                    except Exception:
+                        src = noisy
                 iy = int(rng.integers(0, h - t + 1))
                 ix = int(rng.integers(0, w - t + 1))
-                item = (noisy[iy:iy + t, ix:ix + t].astype(np.float32),
+                item = (src[iy:iy + t, ix:ix + t].astype(np.float32),
                         gt[iy:iy + t, ix:ix + t].astype(np.float32))
                 pairs.append((folder.name, *item) if with_names else item)
             continue
