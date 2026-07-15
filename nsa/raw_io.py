@@ -64,7 +64,8 @@ def _synthetic_scene(h: int, w: int, seed: int) -> np.ndarray:
         cy, cx = rng.integers(0, h), rng.integers(0, w)
         cv2.circle(img, (int(cx), int(cy)), rng.integers(2, 5), (0.95, 0.95, 0.9), -1)
 
-    img = cv2.GaussianBlur(img, (0, 0), 0.6)
+    # Do NOT Gaussian-blur the clean scene. A soft GT teaches every denoiser to
+    # blur; real multi-frame averages of a static target keep full edge contrast.
     return np.clip(img, 0.0, 1.0).astype(np.float32)
 
 
@@ -139,6 +140,54 @@ def resolve_dataset(path: str | None, seed: int) -> Path | None:
     return None
 
 
+def _load_dng_linear_rgb(path: Path) -> np.ndarray:
+    """DNG → linear RGB [0,1] with the SAME pipeline used to build burst GT.
+
+    Critical: ``rawpy.postprocess`` defaults apply a camera gamma (~sRGB) and a
+    different demosaic than OpenCV's Bayer path. Training noisy(gamma-ISP) against
+    gt(linear OpenCV demosaic of a Bayer mean) is a domain mismatch — the network
+    learns a soft compromise and can never match the sharp linear GT.
+
+    We black-subtract, white-normalise, and demosaic with ``COLOR_BAYER_RG2RGB``
+    exactly like ``scratchpad/build_dng_pairs.demosaic_mean`` / packed-RAW GT.
+    """
+    import rawpy
+    with rawpy.imread(str(path)) as raw:
+        bayer = raw.raw_image_visible.astype(np.float32)
+        black = float(np.mean(raw.black_level_per_channel))
+        white = float(raw.white_level)
+        # Prefer documented CFA; fall back to RGGB (IMX662).
+        pattern = None
+        try:
+            pattern = raw.raw_pattern
+        except Exception:
+            pattern = None
+    norm = np.clip((bayer - black) / max(white - black, 1.0), 0.0, 1.0)
+    return _demosaic_bayer_norm(norm, pattern)
+
+
+def _demosaic_bayer_norm(norm01: np.ndarray, pattern=None) -> np.ndarray:
+    """Normalised Bayer [0,1] → linear RGB [0,1] via OpenCV."""
+    b16 = (np.clip(norm01, 0, 1) * 65535.0 + 0.5).astype(np.uint16)
+    # IMX662 / most Pi DNGs are RGGB. raw_pattern is 2x2 with color indices.
+    code = cv2.COLOR_BAYER_RG2RGB
+    if pattern is not None:
+        try:
+            p = np.asarray(pattern).reshape(2, 2)
+            # rawpy: 0=R, 1=G, 2=B, 3=G
+            key = tuple(int(x) for x in p.ravel())
+            code = {
+                (0, 1, 3, 2): cv2.COLOR_BAYER_RG2RGB,
+                (1, 0, 2, 3): cv2.COLOR_BAYER_GR2RGB,
+                (3, 2, 0, 1): cv2.COLOR_BAYER_BG2RGB,
+                (2, 3, 1, 0): cv2.COLOR_BAYER_GB2RGB,
+            }.get(key, cv2.COLOR_BAYER_RG2RGB)
+        except Exception:
+            pass
+    rgb16 = cv2.cvtColor(b16, code)
+    return rgb16.astype(np.float32) / 65535.0
+
+
 def _load_any(path: Path) -> np.ndarray:
     """Decode any supported frame file to normalised linear RGB [0, 1]."""
     suffix = path.suffix.lower()
@@ -149,10 +198,7 @@ def _load_any(path: Path) -> np.ndarray:
         return arr / max(float(arr.max()), 1e-6)
     if suffix == ".dng":
         try:
-            import rawpy
-            with rawpy.imread(str(path)) as raw:
-                rgb = raw.postprocess(no_auto_bright=True, output_bps=16)
-            return rgb.astype(np.float32) / 65535.0
+            return _load_dng_linear_rgb(path)
         except Exception as exc:
             raise RuntimeError(f"DNG support needs 'rawpy' (pip install rawpy): {exc}")
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -161,7 +207,13 @@ def _load_any(path: Path) -> np.ndarray:
     if img.ndim == 2:
         return _demosaic(img.astype(np.float32) / max(float(img.max()), 1e-6))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
-    return img / max(float(img.max()), 1e-6)
+    # 16-bit TIF GTs from build_dng_pairs are already linear; 8-bit PNGs are
+    # display-referred. Normalise by bit-depth, not per-image max (max-norm
+    # desynchronises noisy/gt scales when highlight clipping differs).
+    if img.dtype == np.float32 and img.max() <= 1.0:
+        return np.clip(img, 0.0, 1.0)
+    scale = 65535.0 if img.max() > 255.5 else 255.0
+    return np.clip(img / scale, 0.0, 1.0)
 
 
 def load_real_raw(path: str, patch: int) -> np.ndarray:

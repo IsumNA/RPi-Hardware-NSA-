@@ -1,82 +1,83 @@
-# GT-matching denoiser — what was wrong, what to run
+# Genuinely solving the blur problem
 
-## Do you understand the brief?
+## What you asked for
 
-Yes. You need a denoiser whose output looks like the **~100-frame temporal
-average** (sharp, clean, same as your burst GT) — not a soft/plastic version of
-it. Pair-trained RGB models kept blurring no matter which loss you tried.
+Denoise IMX662 / IMX662H so the output looks like the **~100-frame average**
+(the ground truth) — clean **and** sharp, not plastic-blurred.
 
-## Why everything blurred before
+## What was actually wrong
 
-1. **Regression to the mean.** L1 / L2 / Charbonnier / SWT minimise average
-   error. At high analogue gain, fine texture looks like noise, so the optimal
-   PSNR answer *is* to blur it. Changing the loss weight cannot invent photons.
-2. **Training on one noisy PNG vs one average.** The burst’s noise diversity
-   never reached the model.
-3. **Soft GT targets.** Some pair-building paths used a small frame count
-   (`burst/4` ≈ 12 as a floor / pull subset). A 12-frame average still has
-   residual grain *and* is softer than a 100-frame GT — the network learns to
-   match that soft target.
-4. **RGB / demosaic domain.** Demosaic correlates noise and already softens
-   detail; packed RAW is the right place to denoise.
+1. **Single-frame neural regression cannot equal a 100-frame average.**  
+   L1/Charbonnier/SWT learn the conditional mean. At high gain that mean is soft.
+   Changing the loss does not create photons.
 
-## The solution in this repo
+2. **Domain mismatch (real bug).**  
+   Noisy DNGs were loaded with `rawpy.postprocess` (camera gamma / ISP demosaic).
+   GT was a linear Bayer mean + OpenCV demosaic. The network was trained across
+   two different image formations → soft compromise. **Fixed** in `nsa/raw_io.py`
+   (`_load_dng_linear_rgb`).
 
-**Multi-frame RAW fusion trained to match a 100-frame average.**
+3. **Synthetic demo GT was pre-blurred.**  
+   `_synthetic_scene` applied `GaussianBlur(σ=0.6)` to the clean target, so every
+   demo taught “blur is correct”. **Removed.**
 
-| Piece | Role |
-|-------|------|
-| `nsa/gt_match.py` | Burst discovery, anti-blur loss, `BurstFusionDenoiser` |
-| `train_gt_match.py` | Train on AI server against real DNG bursts |
-| `infer_gt_match.py` | K=1 single frame, or K=8–32 burst fusion |
+4. **Pair builder used too few frames in places** (`burst/4` ≈ 12). **Fixed** to
+   require / pull ~100 frames.
 
-### Train (AI server, GPU + real bursts)
+## The actual solution
 
 ```bash
-python train_gt_match.py \
-  --bursts datasets/imx662_project/bursts \
-  --gains 128 256 512 \
-  --gt-frames 100 \
-  --max-frames 8 \
-  --steps 8000 \
-  --out outputs/gt_match
+# THIS is how you get the 100-frame look — because it IS the 100-frame method:
+python solve_denoise.py \
+  --burst datasets/imx662_project/bursts/<scene>/ag512 \
+  --max-frames 100 \
+  --out outputs/solved.png
 ```
 
-- GT = mean of the first **100** packed RAW frames  
-- Inputs = **held-out** frames, randomly stacked as K=1..8  
-- Loss = Charbonnier + edge + high-frequency FFT (anti-blur)  
-- Writes `gt_match_denoiser.pt`, `metrics.json`, `panel.png`  
-  (panel columns: NOISY | K=1 | K=max | GT)
+`nsa/solve.merge_burst` aligns (ECC) and averages in linear RGB — the same
+definition as your GT. No network required for perfect match on a static scene.
 
-### Infer
+### Single frame (when you truly have only one)
 
 ```bash
-# best quality when you have a burst (approaches the 100-frame look)
-python infer_gt_match.py --ckpt outputs/gt_match/gt_match_denoiser.pt \
-  --burst datasets/imx662_project/bursts/cabinet_H_2/ag512 \
-  --max-frames 16 --out outputs/fused.png
-
-# single frame (as sharp as one noisy capture allows)
-python infer_gt_match.py --ckpt outputs/gt_match/gt_match_denoiser.pt \
-  --input path/to/noisy.dng --out outputs/single.png
+python solve_denoise.py --input noisy.dng --out outputs/solved_single.png
 ```
 
-### Smoke test (no DNGs)
+Dual-domain preserve (bilateral base + SNR-gated detail). Keeps resolution-bar
+contrast better than L1-NAFNet; still cannot invent 100-frame SNR.
+
+### Live / streaming
+
+Use the existing temporal accumulator in `live.py` (motion-gated running mean).
+Let it reach K≈32–100 on a static scene — that converges to the same answer.
+
+### Optional neural polish (after merge is correct)
 
 ```bash
-python train_gt_match.py --synth --steps 200 --out outputs/gt_match_synth
+python train_gt_match.py --bursts datasets/imx662_project/bursts \
+  --gt-frames 100 --max-frames 8 --steps 8000
 ```
 
-## Honest limit
+Trains packed-RAW fusion to *approximate* the merge with fewer frames. It is a
+speed/quality tradeoff, not a substitute for averaging when you have the burst.
 
-**One noisy frame cannot contain the information of 100 independent reads.**
-K=1 can get close and stay sharper than old RGB training; **K≥8–16 at
-inference** is what actually looks like your long average. For live static
-scenes, capture a short burst (or temporal accumulate) and fuse — do not expect
-magic from a single grainy frame.
+## Proof (no camera)
 
-## Also fixed
+```bash
+python solve_denoise.py --proof --out-dir outputs/solve_proof
+```
 
-- Pair derive pull default **100** frames (`NSA_GT_PULL_MAX`)
-- GUI no longer uses `burst/4` (~12) as the GT floor
-- `scratchpad/raw_train_ai.py` redirects here (old stride-6 recipe retired)
+Panel columns: **clean | noisy | blurry-L1-like | single-preserve | 100-merge**.
+Metrics in `proof_metrics.json` — merge recovery of chirp contrast should be ≈1.
+
+## Bottom line
+
+| Situation | What to run | Looks like 100-frame GT? |
+|-----------|-------------|---------------------------|
+| Have a burst (static) | `solve_denoise.py --burst … --max-frames 100` | **Yes (identical method)** |
+| Live static | `live.py` temporal accumulate to K≈100 | **Yes (approaches)** |
+| One frame only | `--input` preserve / RAW net | Partial — physics limit |
+
+If the product requirement is “must look like the average”, the product must
+**capture or accumulate multiple frames**. No single-frame network will honestly
+do that at high analogue gain without blur or hallucination.
