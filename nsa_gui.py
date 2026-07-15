@@ -3398,8 +3398,10 @@ class CttCaptureWizard(tk.Toplevel):
             self._ui_call(self._set_status, msg, kind)
 
         scene = st.meta.get("scene", "scene")
-        # Read Tk vars on the main thread before spawning the worker.
-        min_frames = max(2, int(self.burst_var.get() or "48") // 4)
+        # Floor for GT averaging — use most of the burst, never burst/4 (~12),
+        # which produced soft targets no denoiser can beat.
+        burst_n = max(8, int(self.burst_var.get() or "48"))
+        min_frames = max(32, burst_n)
         to_dataset, publish_dest, _project_pi_raw, pair_out_pi_raw, needs_remote_pub = (
             self._dataset_output())
 
@@ -3783,7 +3785,8 @@ class CttCaptureWizard(tk.Toplevel):
 
             def work():
                 out = []
-                min_frames = max(2, int(self.burst_var.get() or "48") // 4)
+                burst_n = max(8, int(self.burst_var.get() or "48"))
+                min_frames = max(32, burst_n)
                 to_dataset, publish_dest, project_pi_raw, output_pi_raw, needs_remote = (
                     self._dataset_output())
                 todo = []
@@ -3878,7 +3881,7 @@ class CttCaptureWizard(tk.Toplevel):
                 try:
                     manifest = burst_folder_to_gt(
                         str(rec.station.dest), str(gt_path),
-                        min_frames=max(2, int(self.burst_var.get() or "48") // 4))
+                        min_frames=max(32, int(self.burst_var.get() or "48")))
                     out.append(f"{scene}: gt_01.png ({manifest['frames_used']} frames)")
                 except Exception as exc:  # noqa: BLE001
                     out.append(f"{scene}: FAILED — {exc}")

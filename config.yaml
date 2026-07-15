@@ -73,9 +73,13 @@ sensor:
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
 data:
-  temporal_frames: 256      # frames averaged to build the clean reference
+  temporal_frames: 100      # frames averaged to build the clean reference (~100-frame look)
 
 # ---- LEVEL 4/5 : Optimization & Quantization ---------------------------------
+# NOTE: For sharp, GT-matching denoise on real IMX662/IMX662H bursts, prefer the
+# dedicated RAW burst-fusion trainer (does not blur like RGB pair regression):
+#   python train_gt_match.py --bursts datasets/imx662_project/bursts --gt-frames 100
+# See SOLUTION_GT_MATCH.md.
 optimization:
   quantize: false           # Hailo/DeepX need INT8; Intel NPU runs FP16 OpenVINO natively
   qat: false                # QAT only needed for INT8 NPU targets

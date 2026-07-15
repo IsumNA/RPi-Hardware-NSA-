@@ -130,9 +130,11 @@ def ctt_capture_lux(lux: float | int | None, *, fallback: int = 1) -> int:
 # Temporal GT averaging: read noise in the average scales ~ gain/√N, so high gains
 # need more frames for the same residual.  Override cap with NSA_GT_BURST_MAX.
 GT_BURST_MAX_FRAMES = int(os.environ.get("NSA_GT_BURST_MAX", "128"))
-# When building pairs we only pull/decode this many DNGs per burst (first frame +
-# subsample for GT). Override with NSA_GT_PULL_MAX.
-GT_PULL_MAX_FRAMES = int(os.environ.get("NSA_GT_PULL_MAX", "64"))
+# When building pairs we pull/decode this many DNGs per burst (first frame +
+# subsample for GT). Default 100 so GT matches the ~100-frame target quality —
+# NOT a handful of frames (older GUI paths used burst/4 ≈ 12 and baked blur
+# into the target). Override with NSA_GT_PULL_MAX.
+GT_PULL_MAX_FRAMES = int(os.environ.get("NSA_GT_PULL_MAX", "100"))
 
 
 def burst_frames_for_gain(gain: int, base: int, *,
@@ -1408,7 +1410,13 @@ def derive_real_pair(burst_dir: Path | str, test_dir: Path | str, *,
 
 def derive_real_pair_paths(frame_paths: Sequence[Path | str], test_dir: Path | str, *,
                            min_frames: int = 8, max_side: int = 0) -> dict:
-    """Build noisy+gt PNGs from an explicit list of burst frame paths."""
+    """Build noisy+gt PNGs from an explicit list of burst frame paths.
+
+    ``min_frames`` is a *floor* (reject shorter bursts), not a cap. We average
+    **every** provided frame into GT — previously the GUI passed ``burst/4``
+    (~12) which silently produced soft, under-averaged targets that no denoiser
+    can look sharper than.
+    """
     from nsa.gt_capture import temporal_average_gt, write_gt_png
     from nsa.raw_io import _load_any
 
@@ -1420,15 +1428,24 @@ def derive_real_pair_paths(frame_paths: Sequence[Path | str], test_dir: Path | s
     test_dir.mkdir(parents=True, exist_ok=True)
     if not paths:
         raise ValueError("No burst frames to derive a pair from")
+    if len(paths) < max(2, int(min_frames)):
+        raise ValueError(
+            f"Need ≥{min_frames} burst frames for GT, got {len(paths)} in "
+            f"{test_dir}"
+        )
 
-    noisy_rgb = _load_any(paths[0])
+    # Hold the first frame out of the GT average when possible so noisy≠subset(GT).
+    noisy_path = paths[0]
+    gt_paths = paths[1:] if len(paths) > max(4, int(min_frames)) else paths
+    noisy_rgb = _load_any(noisy_path)
     write_gt_png(test_dir / "noisy.png", noisy_rgb)
 
     gt = temporal_average_gt(
-        paths, min_frames=min(max(2, min_frames), len(paths)), max_side=max_side)
+        gt_paths, min_frames=min(max(2, min_frames), len(gt_paths)),
+        max_side=max_side)
     write_gt_png(test_dir / "gt.png", gt)
     return {"scene_dir": str(test_dir), "noisy": "noisy.png", "gt": "gt.png",
-            "frames_used": len(paths)}
+            "frames_used": len(gt_paths), "noisy_frame": noisy_path.name}
 
 
 # --------------------------------------------------------------------------- #
@@ -1705,7 +1722,7 @@ def derive_recorded_pairs(
         names = filenames_for_derive(rec.ctt_filenames, pull_max=pull_max)
         paths = [mirror_map[f] for f in names if f in mirror_map]
         try:
-            if len(paths) < min(2, min_frames):
+            if len(paths) < max(2, int(min_frames)):
                 raise ValueError(f"only {len(paths)}/{len(names)} DNG(s) available")
             res = derive_real_pair_paths(
                 paths, pd, min_frames=min_frames)
