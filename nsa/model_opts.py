@@ -12,9 +12,9 @@ from .config import ModelConfig
 # eamamba/unifyformer/emvd/mstmn are inherently depthwise (selective scan /
 # multi-scale / depthwise-separable), so conv_type has no effect — pruned from
 # the sweep, shown as "fixed".
-NO_ACTIVATION = frozenset({"nafnet", "restormer"})
+NO_ACTIVATION = frozenset({"nafnet", "restormer", "raw_denoiser"})
 NO_CONV_TYPE = frozenset({"nafnet", "restormer", "eamamba", "unifyformer",
-                          "emvd", "mstmn"})
+                          "emvd", "mstmn", "raw_denoiser"})
 CONVT_FAMILIES = frozenset({"unet", "rednet", "drunet"})
 # Recurrent/multi-frame video denoisers: the exported graph is the per-frame
 # spatial core; the temporal recurrence runs in the streaming runtime
@@ -29,6 +29,7 @@ FIXED_NONLINEARITY = {
     "restormer": "GELU gated FFN (fixed)",
     "eamamba": "sigmoid selection gate + GELU FFN",
     "unifyformer": "multi-scale DW + GELU FFN",
+    "raw_denoiser": "SimpleGate (NAFNet blocks, 5→4 packed RAW)",
 }
 
 # block_depth is internally halved per stage for these U-Nets.
@@ -143,6 +144,9 @@ def instantiate_summary(cfg: ModelConfig) -> str:
         dec = cfg.nafnet_dec_blocks or cfg.nafnet_enc_blocks[::-1]
         return (f"multi-scale NAFNet ({c}ch, enc {cfg.nafnet_enc_blocks} · "
                 f"middle {cfg.nafnet_middle_blocks} · dec {dec})")
+    if fam == "RAW_DENOISER":
+        return (f"RawDenoiser ({c}ch × {cfg.block_depth} NAFBlocks, "
+                f"5→4 packed RAW + fusion confidence)")
     if fam == "NAFNET":
         return f"flat NAFNet ({c}ch × {cfg.block_depth} NAFBlocks, SimpleGate)"
     if fam == "RESTORMER":

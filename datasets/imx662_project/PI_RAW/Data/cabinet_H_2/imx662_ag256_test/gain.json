@@ -1,0 +1,8 @@
+{
+  "requested_gain": 256,
+  "actual_gain": 251.189,
+  "clamped": false,
+  "exposure_us": 998,
+  "capture_sensor": "imx662",
+  "hcg_enabled": false
+}

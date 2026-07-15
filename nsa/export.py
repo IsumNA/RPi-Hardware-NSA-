@@ -57,6 +57,65 @@ def export_onnx(model: nn.Module, patch: int, path: Path,
         return None
 
 
+def export_raw_onnx(model: nn.Module, patch: int, path: Path,
+                    *, in_ch: int = 5, out_ch: int = 4,
+                    dynamic: bool = True) -> Path | None:
+    """Export the 5-channel packed-RAW denoiser to ONNX (opset 18).
+
+  Input layout: ``(1, in_ch, H, W)`` with optional dynamic spatial axes.
+  Output layout: ``(1, out_ch, H, W)`` packed Bayer residual.
+
+  TODO(executorch): after ONNX validation, convert to ``.pte`` via the
+  ExecuTorch export path (``torch.export`` + edge compile). Full INT8 PTQ
+  on Pi likely needs the ExecuTorch SDK and a calibration burst on-device.
+    """
+    model.eval()
+    dummy = torch.randn(1, in_ch, patch, patch)
+    try:
+        kwargs = dict(
+            input_names=["packed_fusion"],
+            output_names=["packed_denoised"],
+            opset_version=18,
+        )
+        if dynamic:
+            kwargs["dynamic_axes"] = {
+                "packed_fusion": {2: "h", 3: "w"},
+                "packed_denoised": {2: "h", 3: "w"},
+            }
+        torch.onnx.export(model, dummy, str(path), **kwargs)
+        try:
+            import onnx
+            onnx.checker.check_model(str(path))
+        except Exception:
+            pass
+        return path
+    except Exception:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        return None
+
+
+def export_torchscript(model: nn.Module, patch: int, path: Path,
+                       *, in_ch: int = 5) -> Path | None:
+    """Optional TorchScript trace for the raw denoiser (Pi libtorch path)."""
+    model.eval()
+    dummy = torch.randn(1, in_ch, patch, patch)
+    try:
+        traced = torch.jit.trace(model, dummy)
+        traced.save(str(path))
+        return path
+    except Exception:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        return None
+
+
 def _pack_int8_weights(model: nn.Module) -> tuple[bytes, list[dict]]:
     """Serialise per-channel INT8 weights into a flat blob + manifest."""
     buf = io.BytesIO()

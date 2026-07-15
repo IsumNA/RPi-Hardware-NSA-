@@ -13,6 +13,7 @@ import copy
 import math
 import time
 import types
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -471,7 +472,11 @@ def _sample_batch(tensors, crop: int, batch: int,
 
 def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
            crop: int, batch: int, qat: bool, lr: float, loss_fn=None,
-           weights=None) -> nn.Module:
+           weights=None, device: torch.device | None = None,
+           panel_every: int = 0,
+           panel_ref: tuple[torch.Tensor, torch.Tensor] | None = None,
+           panel_dir: Path | None = None,
+           panel_meta: dict | None = None) -> nn.Module:
     """Shared training loop: configurable loss + 8× aug + warmup-cosine LR + grad clip.
 
     Gradient clipping and a short warmup keep even deep transpose-conv nets
@@ -479,9 +484,14 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
     minibatch of augmented crops gives stable, low-variance gradients. ``loss_fn``
     defaults to Charbonnier (see ``build_loss``). ``weights`` (one per frame)
     biases crop sampling towards the hard high-gain / low-light captures.
+
+    When ``panel_every > 0`` and ``panel_ref`` is set, saves a 3-panel validation
+    image every N steps under ``panel_dir`` (matplotlib Agg, no GUI).
     """
     if loss_fn is None:
         loss_fn = _charbonnier
+    dev = device or torch.device("cpu")
+    model = model.to(dev)
     wt = None
     if weights is not None and len(weights) == len(tensors):
         wt = torch.as_tensor(list(weights), dtype=torch.float32).clamp(min=1e-6)
@@ -502,8 +512,12 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
     if qat:
         enable_qat(model)
     model.train()
+    ref_x, ref_y = panel_ref if panel_ref else (None, None)
+    if panel_every > 0 and ref_x is not None and panel_dir is not None:
+        panel_dir.mkdir(parents=True, exist_ok=True)
     for i in range(steps):
         xb, yb = _sample_batch(tensors, crop, batch, g, weights=wt)
+        xb, yb = xb.to(dev), yb.to(dev)
         opt.zero_grad()
         loss = loss_fn(model(xb), yb)
         loss.backward()
@@ -512,10 +526,47 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
         sched.step()
         if progress is not None and (i % 4 == 0 or i == steps - 1):
             progress(i + 1, steps, float(loss.item()))
+        if (panel_every > 0 and ref_x is not None and panel_dir is not None
+                and panel_meta is not None
+                and ((i + 1) % panel_every == 0 or i == steps - 1)):
+            _save_train_panel(model, ref_x, ref_y, dev, panel_dir, i + 1,
+                              panel_meta, float(loss.item()))
     if qat:
         disable_qat(model)
     model.eval()
     return model
+
+
+def _save_train_panel(model, ref_x, ref_y, dev, panel_dir: Path, step: int,
+                      meta: dict, loss: float) -> None:
+    """Write a quick noisy/gt/denoised panel during training (headless)."""
+    from .visualize import render_panel
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        out = model(ref_x.to(dev))
+    noisy = to_image(ref_x)
+    clean = to_image(ref_y)
+    denoised = to_image(out.cpu())
+    pmeta = dict(meta)
+    pmeta["psnr_in"] = psnr(noisy, clean)
+    pmeta["psnr_out"] = psnr(denoised, clean)
+    pmeta["step"] = step
+    pmeta["loss"] = loss
+    path = panel_dir / f"step_{step:05d}.png"
+    render_panel(noisy, clean, denoised, pmeta, path, show=False)
+    # Symlink latest for easy polling
+    latest = panel_dir / "latest.png"
+    try:
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(path.name)
+    except OSError:
+        import shutil
+        shutil.copy2(path, panel_dir / "latest.png")
+    if was_training:
+        model.train()
 
 
 def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
@@ -530,7 +581,11 @@ def calibrate(model: nn.Module, noisy: np.ndarray, clean: np.ndarray,
 def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
                     progress=None, crop: int = 160, qat: bool = False,
                     batch: int = 4, lr: float = 3e-3, loss_fn=None,
-                    weights=None) -> nn.Module:
+                    weights=None, device: torch.device | None = None,
+                    panel_every: int = 0,
+                    panel_ref: tuple[np.ndarray, np.ndarray] | None = None,
+                    panel_dir: Path | None = None,
+                    panel_meta: dict | None = None) -> nn.Module:
     """Calibrate across a set of (noisy, clean) frames (batch / multi-image fit).
 
     Draws an augmented minibatch of crops across all frames each step — the
@@ -542,8 +597,13 @@ def calibrate_multi(model: nn.Module, pairs, steps: int, seed: int,
     if not pairs:
         raise ValueError("calibrate_multi needs at least one (noisy, clean) pair")
     tensors = [(to_tensor(n), to_tensor(c)) for n, c in pairs]
+    pref = None
+    if panel_ref is not None:
+        pref = (to_tensor(panel_ref[0]), to_tensor(panel_ref[1]))
     return _train(model, tensors, steps, seed, progress, crop, batch, qat, lr,
-                  loss_fn, weights=weights)
+                  loss_fn, weights=weights, device=device,
+                  panel_every=panel_every, panel_ref=pref,
+                  panel_dir=panel_dir, panel_meta=panel_meta)
 
 
 def temporal_denoise(model: nn.Module, burst, alpha: float = 0.6):

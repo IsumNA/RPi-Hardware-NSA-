@@ -850,6 +850,24 @@ class _PyrScaleDenoiser(nn.Module):
         return self.tail(self.body(self.head(x)))    # residual for this band
 
 
+class RawDenoiserDenoiser(nn.Module):
+    """Phase 2B — fused packed RAW denoiser (5 in: 4 Bayer + confidence, 4 out)."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        from .raw_domain import RawDenoiser
+
+        self.net = RawDenoiser(
+            base_channels=cfg.base_channels,
+            block_depth=cfg.block_depth,
+            in_ch=5,
+            out_ch=4,
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class MSTMNDenoiser(nn.Module):
     """MSTMN-style multi-scale spatio-temporal network: a Gaussian–Laplace pyramid
     splits each frame into a coarse low-frequency band and a fine detail band,
@@ -910,6 +928,7 @@ def build_model(cfg: ModelConfig) -> nn.Module:
         "remonet": ReMoNetDenoiser,
         "emvd": EMVDDenoiser,
         "mstmn": MSTMNDenoiser,
+        "raw_denoiser": RawDenoiserDenoiser,
     }
     return families[cfg.model_family](cfg)
 

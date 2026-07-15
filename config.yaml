@@ -17,7 +17,7 @@ hardware: rpi5_cpu
 
 # ---- LEVEL 3 : Model Architecture --------------------------------------------
 model:
-  model_family: nafnet      # cnn|dncnn|unet|rednet|ridnet|nafnet|ffdnet|drunet|restormer
+  model_family: nafnet      # cnn|dncnn|unet|rednet|ridnet|nafnet|ffdnet|drunet|restormer|raw_denoiser
   base_channels: 16         # 16 | 32 | 64
   block_depth: 4            # 2  | 4  | 8  (REDNet min 2; UNet/DRUNet halved per stage)
   conv_type: depthwise      # standard | depthwise  (ignored for nafnet / restormer)
@@ -73,7 +73,7 @@ sensor:
 
 # ---- LEVEL 2 : Ground-Truth / Data -------------------------------------------
 data:
-  temporal_frames: 256      # frames averaged to build the clean reference
+  temporal_frames: 512      # frames averaged to build the clean reference (high-gain)
 
 # ---- LEVEL 4/5 : Optimization & Quantization ---------------------------------
 optimization:

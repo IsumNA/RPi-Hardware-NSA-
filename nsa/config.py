@@ -24,7 +24,8 @@ HARDWARE = {
 MODEL_FAMILIES = ("cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet",
                   "ffdnet", "drunet", "restormer",
                   "attn_unet2", "eamamba", "unifyformer",
-                  "remonet", "emvd", "mstmn")
+                  "remonet", "emvd", "mstmn",
+                  "raw_denoiser")
 BASE_CHANNELS = (16, 32, 64)
 BLOCK_DEPTHS = (2, 4, 8)
 CONV_TYPES = ("standard", "depthwise")
