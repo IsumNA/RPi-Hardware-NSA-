@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""Genuinely solve IMX662 denoise: burst-merge (= GT) or detail-preserving single.
+"""Denoise for real use: motion means you cannot just average.
 
-This is the answer to "make it look like the 100-frame average without blur":
+Modes
+-----
+  --input PATH
+      Single-frame path (the common case under motion). Uses --ckpt if given
+      (sharp RAW net), else dual-domain preserve.
 
-  * If you have a burst → average it in linear RGB/RAW. That **is** the GT.
-  * If you have one frame → dual-domain preserve (not L1-NAFNet plastic blur).
+  --burst DIR --motion
+      Short burst with camera/subject motion: optical-flow warp + photometric
+      weights so moving pixels do not ghost (static bg still gets multi-frame SNR).
 
-Examples
---------
-  # Perfect: merge 100 frames from a real burst (equals your GT method)
-  python solve_denoise.py --burst datasets/imx662_project/bursts/cabinet_H_2/ag512 \\
-      --max-frames 100 --out outputs/solved.png
+  --burst DIR
+      Static / tripod only — plain average (lab GT method). Do NOT use on motion.
 
-  # Single frame fallback (keeps resolution bars)
-  python solve_denoise.py --input path/to/noisy.dng --out outputs/solved_single.png
-
-  # Proof on synthetic resolution chart (no camera needed)
-  python solve_denoise.py --proof --out-dir outputs/solve_proof
+  --proof-sharp
+      Train a tiny single-frame net on synthetic data; must beat blur baseline.
 """
 from __future__ import annotations
 
@@ -25,59 +24,77 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from nsa.solve import (  # noqa: E402
-    denoise_single_preserve, merge_burst, proof_synthetic, solve, _save_rgb,
+    _save_rgb, denoise_single_preserve, merge_burst, merge_burst_motion, proof_synthetic,
 )
+from nsa.raw_domain import packed_to_rgb  # noqa: E402
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--burst", help="folder of burst frames (DNG/PNG/…)")
-    p.add_argument("--input", help="single noisy frame")
-    p.add_argument("--max-frames", type=int, default=100,
-                   help="frames to average from --burst (default 100 = GT look)")
-    p.add_argument("--no-align", action="store_true")
+    p.add_argument("--burst")
+    p.add_argument("--input")
+    p.add_argument("--motion", action="store_true",
+                   help="flow-weighted merge (use with --burst when there is motion)")
+    p.add_argument("--max-frames", type=int, default=0,
+                   help="default: 8 with --motion, 100 for static merge")
+    p.add_argument("--ckpt", help="sharp_single.pt for --input")
     p.add_argument("--out", default="outputs/solved.png")
-    p.add_argument("--proof", action="store_true",
-                   help="run synthetic chirp proof (clean|noisy|blurry|preserve|merge)")
+    p.add_argument("--display-gain", type=float, default=1.0)
+    p.add_argument("--proof", action="store_true", help="static merge chirp proof")
+    p.add_argument("--proof-sharp", action="store_true",
+                   help="single-frame net vs blur proof")
     p.add_argument("--out-dir", default="outputs/solve_proof")
+    p.add_argument("--steps", type=int, default=400)
+    p.add_argument("--device", default="cpu")
     args = p.parse_args()
+
+    if args.proof_sharp:
+        from nsa.sharp_single import proof_sharp_synth
+        m = proof_sharp_synth(args.out_dir, steps=args.steps, device=args.device)
+        print(json.dumps(m, indent=2, default=str), flush=True)
+        return 0 if m.get("pred_beats_blur_psnr") else 1
 
     if args.proof:
         m = proof_synthetic(args.out_dir)
         print(json.dumps(m, indent=2), flush=True)
-        print(
-            f"\nChirp contrast recovery vs clean:\n"
-            f"  blurry (what L1 nets do):  {m['recovery_blurry']:.3f}\n"
-            f"  single preserve:           {m['recovery_preserve']:.3f}\n"
-            f"  100-frame merge (= GT):    {m['recovery_merge100']:.3f}\n"
-            f"panel -> {args.out_dir}/proof_panel.png",
-            flush=True,
-        )
-        if m["recovery_merge100"] < 0.9:
-            print("WARNING: merge recovery < 0.9 — unexpected", flush=True)
-            return 1
         return 0
 
-    if args.burst:
-        rgb = merge_burst(args.burst, max_frames=args.max_frames,
-                          align=not args.no_align)
-        mode = f"burst_merge×{args.max_frames}"
+    if args.burst and args.motion:
+        k = args.max_frames or 8
+        rgb = merge_burst_motion(args.burst, max_frames=k)
+        mode = f"motion_merge×{k}"
+    elif args.burst:
+        k = args.max_frames or 100
+        rgb = merge_burst(args.burst, max_frames=k)
+        mode = f"static_merge×{k}"
     elif args.input:
-        from nsa.raw_io import _load_any
-        noisy = _load_any(Path(args.input))
-        rgb = denoise_single_preserve(noisy)
-        mode = "single_preserve"
+        if args.ckpt:
+            import torch
+            from nsa.sharp_single import infer_sharp, load_sharp_model
+            device = args.device
+            if device == "cuda" and not torch.cuda.is_available():
+                device = "cpu"
+            model = load_sharp_model(args.ckpt, device=device)
+            packed = infer_sharp(model, args.input, device=device)
+            rgb = packed_to_rgb(packed, args.display_gain)
+            mode = "sharp_single_net"
+        else:
+            from nsa.raw_io import _load_any
+            rgb = denoise_single_preserve(_load_any(Path(args.input)))
+            mode = "single_preserve"
     else:
-        p.error("pass --burst, --input, or --proof")
+        p.error("pass --input, --burst, --proof, or --proof-sharp")
 
     out = Path(args.out)
-    _save_rgb(out, rgb)
-    print(f"wrote {out}  mode={mode}  shape={rgb.shape}", flush=True)
+    _save_rgb(out, np.clip(rgb, 0, 1))
+    print(f"wrote {out}  mode={mode}  shape={tuple(rgb.shape)}", flush=True)
     return 0
 
 

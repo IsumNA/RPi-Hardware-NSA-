@@ -178,20 +178,112 @@ def denoise_single_preserve(
     return out.astype(np.float32)
 
 
+def merge_burst_motion(
+    frames: list[np.ndarray] | list[Path] | Path,
+    *,
+    max_frames: int = 8,
+    ref_index: int = 0,
+    flow_scale: float = 0.5,
+    consistency: float = 0.02,
+) -> np.ndarray:
+    """Motion-aware robust merge — for short bursts with camera/subject motion.
+
+    Unlike a blind average (which ghosts under motion), this:
+      1. Picks a reference frame (the one you care about — sharp pose)
+      2. Optical-flow warps neighbours onto the reference
+      3. Photometric-consistency weights: misaligned / moving pixels get ~0 weight
+         so they do **not** smear into the result
+      4. Falls back to the reference where nothing agrees
+
+    Still not magic for large motion — those pixels stay single-frame. But static
+    background gets multi-frame SNR while moving subjects keep the ref's sharpness.
+    """
+    if isinstance(frames, (str, Path)):
+        paths = list_burst_files(frames)
+        if max_frames and len(paths) > max_frames:
+            # Prefer frames near the reference for small motion
+            mid = len(paths) // 2
+            lo = max(0, mid - max_frames // 2)
+            paths = paths[lo:lo + max_frames]
+        imgs = [_load_linear(p) for p in paths]
+    else:
+        imgs = [
+            _load_linear(Path(f)) if isinstance(f, (str, Path)) else np.asarray(f, np.float32)
+            for f in frames
+        ]
+        if max_frames:
+            imgs = imgs[:max_frames]
+
+    if len(imgs) == 1:
+        return imgs[0]
+    ref_index = int(np.clip(ref_index, 0, len(imgs) - 1))
+    ref = imgs[ref_index]
+    h, w = ref.shape[:2]
+    ref_g = _to_gray01(ref)
+    # Downscale for flow speed
+    small = (max(32, int(w * flow_scale)), max(32, int(h * flow_scale)))
+
+    acc = np.zeros_like(ref, dtype=np.float64)
+    wsum = np.zeros(ref.shape[:2], dtype=np.float64)[..., None]
+
+    for i, img in enumerate(imgs):
+        if img.shape[:2] != (h, w):
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+        if i == ref_index:
+            weight = np.ones((h, w, 1), dtype=np.float64)
+            warped = img
+        else:
+            g = _to_gray01(img)
+            r_s = cv2.resize(ref_g, small, interpolation=cv2.INTER_AREA)
+            g_s = cv2.resize(g, small, interpolation=cv2.INTER_AREA)
+            flow = cv2.calcOpticalFlowFarneback(
+                (r_s * 255).astype(np.uint8), (g_s * 255).astype(np.uint8),
+                None, 0.5, 3, 15, 3, 5, 1.2, 0,
+            )
+            # Upscale flow to full res
+            flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+            flow[..., 0] *= w / small[0]
+            flow[..., 1] *= h / small[1]
+            grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+            map_x = (grid_x + flow[..., 0]).astype(np.float32)
+            map_y = (grid_y + flow[..., 1]).astype(np.float32)
+            warped = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REFLECT)
+            # Photometric consistency vs reference
+            err = np.mean(np.abs(warped - ref), axis=-1, keepdims=True)
+            weight = np.exp(-err / max(consistency, 1e-6)).astype(np.float64)
+        acc += warped.astype(np.float64) * weight
+        wsum += weight
+
+    out = acc / np.maximum(wsum, 1e-6)
+    # Where almost no support, keep reference (moving subject)
+    weak = wsum[..., 0] < 0.35
+    out[weak] = ref[weak]
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
 def solve(
     source: Path | str,
     *,
     max_frames: int = 100,
     align: bool = True,
     single: str = "preserve",
+    motion: bool = False,
 ) -> dict:
-    """Auto denoise: burst folder → merge (GT); file → single-frame preserve.
+    """Auto denoise.
 
-    Returns dict with ``rgb`` (float [0,1]), ``mode``, ``frames_used``.
+    * burst + ``motion=False`` → static merge (lab / tripod only)
+    * burst + ``motion=True``  → flow-weighted robust merge (handles motion)
+    * file → single-frame preserve (or pass a sharp_single checkpoint separately)
     """
     source = Path(source).expanduser()
     if source.is_dir():
         files = list_burst_files(source)
+        if motion:
+            n = min(len(files), max_frames if max_frames else 8)
+            rgb = merge_burst_motion(source, max_frames=min(n, 8) if max_frames > 8 else n)
+            return {"rgb": rgb, "mode": "motion_merge", "frames_used": n,
+                    "path": str(source)}
         n = min(len(files), max_frames) if max_frames else len(files)
         rgb = merge_burst(source, max_frames=max_frames, align=align)
         return {"rgb": rgb, "mode": "burst_merge", "frames_used": n,
@@ -200,11 +292,9 @@ def solve(
         raise FileNotFoundError(source)
     noisy = _load_linear(source)
     if single == "none":
-        out = noisy
-        mode = "identity"
+        out, mode = noisy, "identity"
     else:
-        out = denoise_single_preserve(noisy)
-        mode = "single_preserve"
+        out, mode = denoise_single_preserve(noisy), "single_preserve"
     return {"rgb": out, "mode": mode, "frames_used": 1, "path": str(source)}
 
 
