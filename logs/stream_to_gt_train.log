@@ -1,0 +1,114 @@
+Device cuda  recipe: STREAM×4 → 512-frame GT
+Scenes ('cabinet_H_2', 'cabinet_H_10', 'cabinet_F11_25', 'cabinet_D50_100', 'cabinet_D_10', 'cabinet_F_5', 'colour_stripes', 'cabinet_H_2_hcg')  gains (128, 256, 512)
+  cabinet_H_2/ag128: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_H_2/ag256: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_H_2/ag512: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_H_10/ag128: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_H_10/ag256: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_H_10/ag512: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_F11_25/ag128: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_F11_25/ag256: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_F11_25/ag512: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_D50_100/ag128: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_D50_100/ag256: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_D50_100/ag512: 512 DNGs → 256 train (T=4), holdout [400, 437, 474]
+  cabinet_D_10/ag128: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_D_10/ag256: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_D_10/ag512: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_F_5/ag128: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_F_5/ag256: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_F_5/ag512: 128 DNGs → 64 train (T=4), holdout [127]
+  colour_stripes/ag128: 128 DNGs → 64 train (T=4), holdout [127]
+  colour_stripes/ag256: 128 DNGs → 64 train (T=4), holdout [127]
+  colour_stripes/ag512: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_H_2_hcg/ag128: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_H_2_hcg/ag256: 128 DNGs → 64 train (T=4), holdout [127]
+  cabinet_H_2_hcg/ag512: 128 DNGs → 64 train (T=4), holdout [127]
+Total train pairs: 3840  in_ch=16
+RawDenoiser 16→4  974,468 params  (128ch × 8, T=4)
+Loss: charbonnier+edge+swt
+  step 1/16000  loss=0.1283  lr=1.50e-06  0.38s/it
+  step 51/16000  loss=0.1092  lr=3.90e-05  0.21s/it
+  step 101/16000  loss=0.0708  lr=7.65e-05  0.20s/it
+  step 151/16000  loss=0.0638  lr=1.14e-04  0.20s/it
+  panel step 200: cabinet_H_2/ag256 frame 400  15.3→19.1 dB
+  probe mean PSNR (n=6): 17.70 dB
+  ★ best@200: panel=19.06 probe=17.70 score=18.38
+  step 201/16000  loss=0.0501  lr=1.51e-04  0.21s/it
+  step 251/16000  loss=0.0399  lr=1.89e-04  0.21s/it
+  step 301/16000  loss=0.0155  lr=2.26e-04  0.21s/it
+  step 351/16000  loss=0.0353  lr=2.64e-04  0.21s/it
+  panel step 400: cabinet_H_2/ag256 frame 400  15.3→24.5 dB
+  probe mean PSNR (n=6): 23.54 dB
+  ★ best@400: panel=24.46 probe=23.54 score=24.00
+  step 401/16000  loss=0.0180  lr=3.01e-04  0.21s/it
+  step 451/16000  loss=0.0376  lr=3.39e-04  0.21s/it
+  step 501/16000  loss=0.0299  lr=3.76e-04  0.21s/it
+  step 551/16000  loss=0.0282  lr=4.14e-04  0.21s/it
+  panel step 600: cabinet_H_2/ag256 frame 400  15.3→24.7 dB
+  probe mean PSNR (n=6): 23.49 dB
+  ★ best@600: panel=24.71 probe=23.49 score=24.10
+  step 601/16000  loss=0.0216  lr=4.51e-04  0.21s/it
+  step 651/16000  loss=0.0251  lr=4.89e-04  0.21s/it
+  step 701/16000  loss=0.0211  lr=5.26e-04  0.21s/it
+  step 751/16000  loss=0.0091  lr=5.64e-04  0.21s/it
+  panel step 800: cabinet_H_2/ag256 frame 400  15.3→26.4 dB
+  probe mean PSNR (n=6): 25.23 dB
+  ★ best@800: panel=26.38 probe=25.23 score=25.80
+  step 801/16000  loss=0.0283  lr=6.00e-04  0.21s/it
+  step 851/16000  loss=0.0132  lr=6.00e-04  0.21s/it
+  step 901/16000  loss=0.0090  lr=6.00e-04  0.21s/it
+  step 951/16000  loss=0.0276  lr=6.00e-04  0.21s/it
+  panel step 1000: cabinet_H_2/ag256 frame 400  15.3→27.3 dB
+  probe mean PSNR (n=6): 26.20 dB
+  ★ best@1000: panel=27.34 probe=26.20 score=26.77
+  step 1001/16000  loss=0.0196  lr=6.00e-04  0.21s/it
+  step 1051/16000  loss=0.0169  lr=6.00e-04  0.21s/it
+  step 1101/16000  loss=0.0286  lr=5.99e-04  0.21s/it
+  step 1151/16000  loss=0.0373  lr=5.99e-04  0.21s/it
+  panel step 1200: cabinet_H_2/ag256 frame 400  15.3→27.6 dB
+  probe mean PSNR (n=6): 26.67 dB
+  ★ best@1200: panel=27.57 probe=26.67 score=27.12
+  step 1201/16000  loss=0.0165  lr=5.99e-04  0.21s/it
+  step 1251/16000  loss=0.0100  lr=5.99e-04  0.21s/it
+  step 1301/16000  loss=0.0133  lr=5.98e-04  0.21s/it
+  step 1351/16000  loss=0.0175  lr=5.98e-04  0.21s/it
+  panel step 1400: cabinet_H_2/ag256 frame 400  15.3→28.0 dB
+  probe mean PSNR (n=6): 26.78 dB
+  ★ best@1400: panel=28.02 probe=26.78 score=27.40
+  step 1401/16000  loss=0.0182  lr=5.98e-04  0.21s/it
+  step 1451/16000  loss=0.0165  lr=5.97e-04  0.21s/it
+  step 1501/16000  loss=0.0156  lr=5.97e-04  0.21s/it
+  step 1551/16000  loss=0.0128  lr=5.97e-04  0.21s/it
+  panel step 1600: cabinet_H_2/ag256 frame 400  15.3→28.2 dB
+  probe mean PSNR (n=6): 27.06 dB
+  ★ best@1600: panel=28.22 probe=27.06 score=27.64
+  step 1601/16000  loss=0.0127  lr=5.96e-04  0.21s/it
+  step 1651/16000  loss=0.0235  lr=5.96e-04  0.21s/it
+  step 1701/16000  loss=0.0086  lr=5.95e-04  0.21s/it
+  step 1751/16000  loss=0.0171  lr=5.95e-04  0.21s/it
+  panel step 1800: cabinet_H_2/ag256 frame 400  15.3→28.5 dB
+  probe mean PSNR (n=6): 27.42 dB
+  ★ best@1800: panel=28.50 probe=27.42 score=27.96
+  step 1801/16000  loss=0.0220  lr=5.94e-04  0.21s/it
+  step 1851/16000  loss=0.0293  lr=5.93e-04  0.21s/it
+  step 1901/16000  loss=0.0216  lr=5.93e-04  0.21s/it
+  step 1951/16000  loss=0.0177  lr=5.92e-04  0.21s/it
+  panel step 2000: cabinet_H_2/ag256 frame 400  15.3→28.6 dB
+  probe mean PSNR (n=6): 27.62 dB
+  ★ best@2000: panel=28.64 probe=27.62 score=28.13
+  step 2001/16000  loss=0.0119  lr=5.91e-04  0.21s/it
+  step 2051/16000  loss=0.0196  lr=5.91e-04  0.21s/it
+  step 2101/16000  loss=0.0150  lr=5.90e-04  0.21s/it
+  step 2151/16000  loss=0.0150  lr=5.89e-04  0.21s/it
+  panel step 2200: cabinet_H_2/ag256 frame 400  15.3→28.7 dB
+  probe mean PSNR (n=6): 27.79 dB
+  ★ best@2200: panel=28.75 probe=27.79 score=28.27
+  step 2201/16000  loss=0.0088  lr=5.88e-04  0.21s/it
+  step 2251/16000  loss=0.0173  lr=5.87e-04  0.21s/it
+  step 2301/16000  loss=0.0102  lr=5.86e-04  0.21s/it
+  step 2351/16000  loss=0.0217  lr=5.85e-04  0.21s/it
+  panel step 2400: cabinet_H_2/ag256 frame 400  15.3→28.6 dB
+  probe mean PSNR (n=6): 27.89 dB
+  step 2401/16000  loss=0.0132  lr=5.85e-04  0.21s/it
+  step 2451/16000  loss=0.0147  lr=5.84e-04  0.21s/it

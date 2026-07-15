@@ -13,7 +13,9 @@ Pipeline (SID convention):
     tensor helpers are channel-agnostic).
   * packed_to_rgb / unpack: back to a viewable image.
 
-The denoiser (RawDenoiser) reuses NAFNet blocks with a 4->4 channel head/tail.
+The denoiser (RawDenoiser) reuses NAFNet blocks. Phase 2B feeds 5 channels
+(4 packed Bayer + normalised fusion confidence from ``temporal_fusion``) and
+predicts a 4-channel packed residual.
 """
 
 from __future__ import annotations
@@ -74,16 +76,68 @@ def burst_clean(paths, limit: int = 128) -> np.ndarray:
     return acc / max(n, 1)
 
 
+def fusion_confidence(
+    weight_map: np.ndarray,
+    *,
+    k_cap: float = 16.0,
+) -> np.ndarray:
+    """Normalise temporal-fusion sample count to [0, 1] confidence."""
+    w = np.asarray(weight_map, dtype=np.float32)
+    if w.ndim == 2:
+        w = w[..., np.newaxis]
+    return np.clip(w / max(float(k_cap), 1e-6), 0.0, 1.0).astype(np.float32)
+
+
+def stack_fusion_input(
+    fused: np.ndarray,
+    weight_map: np.ndarray,
+    *,
+    k_cap: float = 16.0,
+) -> np.ndarray:
+    """Build 5-channel input: 4 packed Bayer + fusion confidence (H/2, W/2, 5)."""
+    fused = np.asarray(fused, dtype=np.float32)[..., :4]
+    conf = fusion_confidence(weight_map, k_cap=k_cap)
+    return np.concatenate([fused, conf], axis=-1)
+
+
+def to_fusion_tensor(
+    fused: np.ndarray,
+    weight_map: np.ndarray,
+    *,
+    k_cap: float = 16.0,
+) -> torch.Tensor:
+    """NCHW float tensor for RawDenoiser 5-channel forward pass."""
+    x = stack_fusion_input(fused, weight_map, k_cap=k_cap)
+    return torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0)
+
+
 # --- model -----------------------------------------------------------------
 class RawDenoiser(nn.Module):
-    """NAFNet-blocks denoiser on 4-channel packed raw (residual)."""
+    """NAFNet-blocks denoiser on packed raw (residual).
 
-    def __init__(self, base_channels: int = 32, block_depth: int = 4, in_ch: int = 4):
+    Default 4->4 for single-frame packed raw. Phase 2B uses ``in_ch=5`` with
+  ``out_ch=4``: fused packed Bayer plus a confidence channel from
+    ``fuse_burst_packed``'s weight map (count / k_cap).
+    """
+
+    def __init__(
+        self,
+        base_channels: int = 32,
+        block_depth: int = 4,
+        in_ch: int = 4,
+        out_ch: int | None = None,
+    ):
         super().__init__()
+        if out_ch is None:
+            out_ch = 4 if in_ch == 5 else in_ch
+        self.in_ch = in_ch
+        self.out_ch = out_ch
         c = base_channels
         self.head = nn.Conv2d(in_ch, c, 3, padding=1)
         self.body = nn.Sequential(*[_NAFBlock(c) for _ in range(block_depth)])
-        self.tail = nn.Conv2d(c, in_ch, 3, padding=1)
+        self.tail = nn.Conv2d(c, out_ch, 3, padding=1)
 
     def forward(self, x):
-        return torch.clamp(x + self.tail(self.body(self.head(x))), 0.0, 1.0)
+        residual = self.tail(self.body(self.head(x)))
+        base = x[:, : self.out_ch]
+        return torch.clamp(base + residual, 0.0, 1.0)
