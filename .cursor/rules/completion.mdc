@@ -1,0 +1,6 @@
+---
+description: Enforce brief plain-English git summary for voice webhook injection
+globs: **/*
+alwaysApply: true
+---
+At the conclusion of every successful file modification, analyze your git diff and generate a strict 3-to-4 word plain-English summary of the visual or structural change (e.g., "Added blue buttons", "Updated navbar links", "Changed API routes"). Pass this exact text string back to the outbound webhook payload.
