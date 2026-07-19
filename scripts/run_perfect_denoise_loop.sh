@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Continuous laptop-CPU sharp-denoise search. Resumes across reboots.
-# Memory-safe: alpha-trim GT, few pairs, no LPIPS-in-loop, small crops.
+# v2: skip Stage B (makes soft mush); always warm-start from champion
+# (best PSNR+grad_ratio≈1 among non-stageb students); balanced HF↔grad.
 set -u
 cd "$(dirname "$0")/.."
-ROOT="$(pwd)"
 PY="${PY:-.venv/bin/python}"
 LOG=logs/perfect_denoise_loop.log
 STATE=outputs/perfect_run/loop_state.env
@@ -11,7 +11,6 @@ LOCK=/tmp/nsa_perfect_denoise.lock
 mkdir -p logs outputs/perfect_run outputs/perfect_panels
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
-# Single instance (survives systemd Restart=)
 exec 9>"$LOCK"
 if ! flock -n 9; then
   log "Another perfect-denoise loop holds $LOCK — exiting"
@@ -27,129 +26,83 @@ GAINS="128"
 DEFAULT_INIT="outputs/cfm_l1/cfm_student_best.pt"
 TEACHER="outputs/cfm_edm/cfm_teacher.pt"
 
-pick_init() {
-  local best=""
-  # Prefer newest restore-best student under perfect_run
-  best=$(ls -t outputs/perfect_run/*/cfm_student_best.pt 2>/dev/null | head -1 || true)
-  if [[ -z "$best" ]]; then
-    best=$(ls -t outputs/perfect_run/*/cfm_student.pt 2>/dev/null | head -1 || true)
-  fi
-  if [[ -n "$best" ]]; then
-    echo "$best"
-  else
-    echo "$DEFAULT_INIT"
-  fi
+# Champion = best non-stageb student by PSNR + |grad_ratio-1| penalty
+pick_champion() {
+  $PY - <<'PY'
+import json, glob
+from pathlib import Path
+rows = []
+for p in glob.glob("outputs/perfect_run/*/cfm_student_summary.json"):
+    d = Path(p).parent
+    if "stageb" in d.name:
+        continue
+    best = d / "cfm_student_best.pt"
+    last = d / "cfm_student.pt"
+    ckpt = best if best.is_file() else last
+    if not ckpt.is_file():
+        continue
+    j = json.loads(Path(p).read_text())
+    psnr = float(j.get("psnr_out", 0))
+    gr = float(j.get("grad_ratio", 1))
+    score = 0.45 * psnr + 0.55 * (20.0 * max(0.0, 1.0 - abs(gr - 1.0)))
+    rows.append((score, str(ckpt), psnr, gr, d.name))
+rows.sort(reverse=True)
+if not rows:
+    print("outputs/cfm_l1/cfm_student_best.pt")
+else:
+    s, ckpt, psnr, gr, name = rows[0]
+    print(ckpt)
+    import sys
+    print(f"champion {name} psnr={psnr:.2f} gr={gr:.3f} score={s:.2f}", file=sys.stderr)
+PY
 }
 
 next_round() {
   local max=0 r
-  for d in outputs/perfect_run/r*_cfm_hf outputs/perfect_run/r*_stageb outputs/perfect_run/r*_cfm_grad; do
+  for d in outputs/perfect_run/r*_cfm_bal outputs/perfect_run/r*_cfm_hf outputs/perfect_run/r*_cfm_grad; do
     [[ -e "$d" ]] || continue
     r=$(basename "$d" | sed -n 's/^r\([0-9]*\)_.*/\1/p')
     [[ -n "$r" ]] || continue
     if (( r > max )); then max=$r; fi
   done
-  # If current max round's stage C finished, start max+1; else resume max
-  if [[ -f "outputs/perfect_run/r${max}_cfm_grad/cfm_student.pt" ]] \
-     || [[ -f "outputs/perfect_run/r${max}_cfm_grad/cfm_student_best.pt" ]]; then
+  # Prefer new balanced rounds starting at 100+
+  if [[ -f "outputs/perfect_run/r${max}_cfm_bal/cfm_student_summary.json" ]]; then
     echo $((max + 1))
-  elif (( max == 0 )); then
-    echo 1
-  else
+  elif (( max >= 100 )); then
     echo "$max"
+  else
+    echo 100
   fi
 }
 
 phase_done() {
-  # $1 = out dir — only skip if the *final* artifacts exist (not mid-run best)
   local out="$1"
-  [[ -f "$out/cfm_student_summary.json" || -f "$out/cfm_stage_b_summary.json" ]]
+  [[ -f "$out/cfm_student_summary.json" ]]
 }
 
-INIT="$(pick_init)"
+INIT="$(pick_champion 2> >(tee -a "$LOG" >&2))"
 ROUND="$(next_round)"
-log "Boot/resume: INIT=$INIT  next_round=$ROUND  host=$(hostname) pid=$$"
+log "Boot/resume v2: INIT=$INIT  next_round=$ROUND  host=$(hostname) pid=$$"
 echo "INIT=$INIT" > "$STATE"
 echo "ROUND=$ROUND" >> "$STATE"
 echo "UPDATED=$(date -Iseconds)" >> "$STATE"
-
-# optional synth (non-fatal)
-if [[ ! -f datasets/synth/bursts/cabinet_H_2__ag128.npy ]]; then
-  log "Building synth clean frames from local bursts..."
-  $PY -u build_synth_dataset.py --skip-srgb >> logs/build_synth.log 2>&1 || \
-    log "WARN: synth build failed (continuing)"
-fi
+echo "RECIPE=v2_balanced_no_stageb" >> "$STATE"
 
 while true; do
-  log "======== ROUND $ROUND ========"
+  INIT="$(pick_champion 2> >(tee -a "$LOG" >&2))"
+  log "======== ROUND $ROUND (balanced, no Stage B) INIT=$INIT ========"
   echo "INIT=$INIT" > "$STATE"
   echo "ROUND=$ROUND" >> "$STATE"
   echo "UPDATED=$(date -Iseconds)" >> "$STATE"
 
-  # A) Lean CFM distill — structure match (HF)
-  OUT="outputs/perfect_run/r${ROUND}_cfm_hf"
-  PAN="outputs/perfect_panels/r${ROUND}_cfm_hf"
+  # Balanced distill: HF structure + mild grad match, short steps, restore-best
+  OUT="outputs/perfect_run/r${ROUND}_cfm_bal"
+  PAN="outputs/perfect_panels/r${ROUND}_cfm_bal"
   mkdir -p "$OUT" "$PAN"
   if phase_done "$OUT"; then
-    log "A) skip (already have checkpoint in $OUT)"
+    log "skip $OUT (already complete)"
   else
-    log "A) CFM distill l1_hf → $OUT (init=$INIT)"
-    $PY -u train_cfm_distill.py \
-      --teacher "$TEACHER" \
-      --method consistency \
-      --sample-loss l1_hf \
-      --init-student "$INIT" \
-      --gt-mode alpha_trim --gt-frames 16 \
-      --scenes "$SCENES" --gains "$GAINS" \
-      --stride 4 \
-      --gt-weight 0 --gt-hf-weight 0.45 \
-      --gt-grad-energy-weight 0 --gt-grad-weight 0 \
-      --cd-weight 0 --restore-best --no-heun \
-      --steps 800 --channels 64 --depth 6 \
-      --temporal 4 --batch 1 --crop 128 \
-      --lr 1.5e-4 \
-      --integrate-steps 2 --teacher-steps 2 \
-      --panel-every 100 --panel-dir "$PAN" --out "$OUT" \
-      --no-onnx \
-      >> "logs/perfect_r${ROUND}_cfm_hf.log" 2>&1 \
-      && log "A done" \
-      || log "A FAILED (see logs/perfect_r${ROUND}_cfm_hf.log)"
-  fi
-  if [[ -f "$OUT/cfm_student_best.pt" ]]; then INIT="$OUT/cfm_student_best.pt"
-  elif [[ -f "$OUT/cfm_student.pt" ]]; then INIT="$OUT/cfm_student.pt"
-  fi
-
-  # B) Stronger Stage B
-  OUTB="outputs/perfect_run/r${ROUND}_stageb"
-  PANB="outputs/perfect_panels/r${ROUND}_stageb"
-  mkdir -p "$OUTB" "$PANB"
-  if phase_done "$OUTB"; then
-    log "B) skip (already have checkpoint in $OUTB)"
-  else
-    log "B) Stage B residual=0.35 → $OUTB (stage-a=$INIT)"
-    $PY -u train_cfm_stage_b.py \
-      --stage-a "$INIT" \
-      --scenes "$SCENES" --gains "$GAINS" \
-      --gt-frames 16 --stride 4 \
-      --steps 2000 --crop 160 --batch 1 --lr 2.5e-4 \
-      --detail-channels 48 --detail-depth 4 \
-      --residual-scale 0.35 \
-      --loss charbonnier+perceptual+ffl \
-      --panel-every 200 --panel-dir "$PANB" --out "$OUTB" \
-      --no-onnx \
-      >> "logs/perfect_r${ROUND}_stageb.log" 2>&1 \
-      && log "B done" \
-      || log "B FAILED (see logs/perfect_r${ROUND}_stageb.log)"
-  fi
-
-  # C) Alternate distill: l1_grad
-  OUTC="outputs/perfect_run/r${ROUND}_cfm_grad"
-  PANC="outputs/perfect_panels/r${ROUND}_cfm_grad"
-  mkdir -p "$OUTC" "$PANC"
-  if phase_done "$OUTC"; then
-    log "C) skip (already have checkpoint in $OUTC)"
-  else
-    log "C) CFM distill l1_grad → $OUTC (init=$INIT)"
+    log "micro-finetune l1_grad (tiny lr) → $OUT"
     $PY -u train_cfm_distill.py \
       --teacher "$TEACHER" \
       --method consistency \
@@ -158,29 +111,57 @@ while true; do
       --gt-mode alpha_trim --gt-frames 16 \
       --scenes "$SCENES" --gains "$GAINS" \
       --stride 4 \
-      --gt-weight 0 --gt-hf-weight 0.25 \
+      --gt-weight 0 --gt-hf-weight 0.1 \
       --gt-grad-energy-weight 0 --gt-grad-weight 0 \
       --cd-weight 0 --restore-best --no-heun \
-      --steps 600 --channels 64 --depth 6 \
-      --temporal 4 --batch 1 --crop 128 \
-      --lr 1.0e-4 \
-      --integrate-steps 2 --teacher-steps 2 \
-      --panel-every 100 --panel-dir "$PANC" --out "$OUTC" \
+      --steps 300 --channels 64 --depth 6 \
+      --temporal 4 --batch 1 --crop 160 \
+      --lr 2e-5 \
+      --integrate-steps 3 --teacher-steps 3 \
+      --panel-every 50 --panel-dir "$PAN" --out "$OUT" \
       --no-onnx \
-      >> "logs/perfect_r${ROUND}_cfm_grad.log" 2>&1 \
-      && log "C done" \
-      || log "C FAILED (see logs/perfect_r${ROUND}_cfm_grad.log)"
-  fi
-  if [[ -f "$OUTC/cfm_student_best.pt" ]]; then INIT="$OUTC/cfm_student_best.pt"
-  elif [[ -f "$OUTC/cfm_student.pt" ]]; then INIT="$OUTC/cfm_student.pt"
+      >> "logs/perfect_r${ROUND}_cfm_bal.log" 2>&1 \
+      && log "micro-finetune done" \
+      || log "micro-finetune FAILED (see logs/perfect_r${ROUND}_cfm_bal.log)"
+    # Reject if worse than champion (don't chain soft models)
+    if [[ -f "$OUT/cfm_student_summary.json" && -f outputs/perfect_run/champion/cfm_student_summary.json ]]; then
+      if ! OUT="$OUT" $PY - <<'PY'
+import json, os
+from pathlib import Path
+out = Path(os.environ["OUT"])
+def score(p):
+    j = json.loads(Path(p).read_text())
+    psnr, gr = float(j["psnr_out"]), float(j["grad_ratio"])
+    return 0.45 * psnr + 0.55 * (20.0 * max(0.0, 1.0 - abs(gr - 1.0)))
+s_new = score(out / "cfm_student_summary.json")
+s_ch = score("outputs/perfect_run/champion/cfm_student_summary.json")
+print(f"score new={s_new:.2f} champ={s_ch:.2f}")
+raise SystemExit(0 if s_new >= s_ch - 0.05 else 1)
+PY
+      then
+        log "REJECT $OUT (worse than champion) — keeping champion as INIT"
+        rm -f "$OUT/cfm_student_summary.json"
+      fi
+    fi
   fi
 
-  LATEST=$(ls -t outputs/perfect_panels/r${ROUND}_*/*.png 2>/dev/null | head -1 || true)
+  LATEST=$(ls -t "$PAN"/*.png 2>/dev/null | head -1 || true)
   if [[ -n "${LATEST:-}" ]]; then
     cp -f "$LATEST" outputs/perfect_panels/latest.png
-    log "latest panel → outputs/perfect_panels/latest.png ($LATEST)"
+    log "latest panel → outputs/perfect_panels/latest.png"
   fi
 
-  log "Round $ROUND complete. INIT=$INIT — continuing..."
+  # Copy champion to a stable path for cloud/export
+  CHAMP="$(pick_champion 2>/dev/null)"
+  if [[ -f "$CHAMP" ]]; then
+    mkdir -p outputs/perfect_run/champion
+    cp -f "$CHAMP" outputs/perfect_run/champion/cfm_student_best.pt
+    # copy matching summary if any
+    SUM="$(dirname "$CHAMP")/cfm_student_summary.json"
+    [[ -f "$SUM" ]] && cp -f "$SUM" outputs/perfect_run/champion/cfm_student_summary.json
+    log "champion checkpoint → outputs/perfect_run/champion/ ($(basename "$(dirname "$CHAMP")"))"
+  fi
+
+  log "Round $ROUND complete — continuing..."
   ROUND=$((ROUND + 1))
 done

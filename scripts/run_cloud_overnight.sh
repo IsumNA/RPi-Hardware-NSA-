@@ -10,7 +10,9 @@ mkdir -p outputs/cloud_sharp outputs/cloud_panels logs
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 TEACHER="${TEACHER:-cloud_pack/checkpoints/cfm_edm_teacher.pt}"
-INIT="${INIT:-cloud_pack/checkpoints/perfect_r1_student_best.pt}"
+INIT="${INIT:-cloud_pack/checkpoints/champion_r2_cfm_grad.pt}"
+# fallback if champion name missing
+[[ -f "$INIT" ]] || INIT="cloud_pack/checkpoints/perfect_r1_student_best.pt"
 PACK="${PACK:-cloud_pack/data}"
 STEPS="${STEPS:-4000}"
 BATCH="${BATCH:-4}"
@@ -22,9 +24,9 @@ $PY -u train_cfm_distill.py \
   --init-student "$INIT" \
   --pack-dir "$PACK" \
   --method consistency \
-  --sample-loss l1_hf \
+  --sample-loss l1_grad \
   --gt-weight 0 \
-  --gt-hf-weight 0.45 \
+  --gt-hf-weight 0.15 \
   --gt-grad-energy-weight 0 \
   --gt-grad-weight 0 \
   --cd-weight 0 \
@@ -33,7 +35,7 @@ $PY -u train_cfm_distill.py \
   --steps "$STEPS" \
   --channels 64 --depth 6 \
   --temporal 4 --batch "$BATCH" --crop "$CROP" \
-  --lr 2e-4 \
+  --lr 8e-5 \
   --integrate-steps 4 --teacher-steps 4 \
   --panel-every 200 \
   --panel-dir outputs/cloud_panels \

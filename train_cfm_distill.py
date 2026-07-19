@@ -367,8 +367,9 @@ def _train_regression_from_dumps(
             probe, probe_gr = _quick_probe(student, evals[:6], device)
             print(f"  probe mean PSNR={probe:.2f} dB  grad_ratio={probe_gr:.3f}",
                   flush=True)
-            score = (0.4 * pout + 0.3 * probe
-                     + 0.3 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
+            # Prefer sharpness (grad_ratio≈1) over PSNR — PSNR alone picks mush
+            score = (0.25 * pout + 0.25 * probe
+                     + 0.5 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
             if score > best_score:
                 best_score = score
                 best_state = {k: v.detach().cpu().clone()
@@ -542,8 +543,9 @@ def _train_consistency(
             print(f"  probe mean PSNR={probe:.2f} dB  grad_ratio={probe_gr:.3f}",
                   flush=True)
             # grad_ratio → 1.0 scores 20; blur or residual noise both penalised
-            score = (0.4 * pout + 0.3 * probe
-                     + 0.3 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
+            # Prefer sharpness (grad_ratio≈1) over PSNR — PSNR alone picks mush
+            score = (0.25 * pout + 0.25 * probe
+                     + 0.5 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
             if score > best_score:
                 best_score = score
                 best_state = {k: v.detach().cpu().clone()
@@ -664,8 +666,9 @@ def _train_regression_match(
             print(f"  probe mean PSNR={probe:.2f} dB  grad_ratio={probe_gr:.3f}",
                   flush=True)
             # grad_ratio → 1.0 scores 20; blur or residual noise both penalised
-            score = (0.4 * pout + 0.3 * probe
-                     + 0.3 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
+            # Prefer sharpness (grad_ratio≈1) over PSNR — PSNR alone picks mush
+            score = (0.25 * pout + 0.25 * probe
+                     + 0.5 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
             if score > best_score:
                 best_score = score
                 best_state = {k: v.detach().cpu().clone()
