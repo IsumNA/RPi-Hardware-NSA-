@@ -29,7 +29,12 @@ from .config import DEFAULT_LOSS_WEIGHTS, LOSS_TERMS, parse_loss_terms
 # ~80-150 ms on the Pi 5 CPU - and they scale with model complexity so the
 # Pareto trade-off between accuracy and speed is visible across configs.
 LATENCY_MODEL = {
-    "hailo8": (4.0, 6.5),
+    # Hailo-10H is ~1.5x the raw INT8 throughput of Hailo-8 (40 vs 26 TOPS),
+    # with LPDDR-backed weight/activation spill: expect a lower per-GFLOP slope
+    # than the older Hailo-8 profile once the compiler places on the LPDDR
+    # path. These constants remain conservative; the export step overwrites
+    # them with measured numbers when the DFC-compiled HEF is benchmarked.
+    "hailo10h": (3.5, 4.5),
     "deepx": (4.5, 7.0),
     "rpi5_cpu": (14.0, 62.0),
     "intel_npu": (2.0, 2.5),   # OpenVINO on Intel AI Boost (estimate; measured at export)
@@ -244,6 +249,44 @@ def _ssim_loss(pred: torch.Tensor, target: torch.Tensor,
     return 1.0 - _ssim_index(pred, target, window)
 
 
+def _ffl_bandpass(x: torch.Tensor, sigma_lo: float = 0.8,
+                  sigma_hi: float = 3.0) -> torch.Tensor:
+    """Mid-frequency band via difference of Gaussians (differentiable)."""
+    lo_cut = _gaussian_blur_ffl(x, sigma_hi)
+    hi_cut = _gaussian_blur_ffl(x, sigma_lo)
+    return hi_cut - lo_cut
+
+
+def _gaussian_blur_ffl(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    if sigma <= 1e-6:
+        return x
+    radius = max(1, int(round(3.0 * float(sigma))))
+    k = 2 * radius + 1
+    coords = torch.arange(k, device=x.device, dtype=x.dtype) - radius
+    g1 = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    g1 = g1 / g1.sum()
+    c = x.shape[1]
+    kh = g1.view(1, 1, 1, k).expand(c, 1, 1, k)
+    kv = g1.view(1, 1, k, 1).expand(c, 1, k, 1)
+    x = F.conv2d(x, kh, padding=(0, radius), groups=c)
+    x = F.conv2d(x, kv, padding=(radius, 0), groups=c)
+    return x
+
+
+def _ffl_loss(pred: torch.Tensor, target: torch.Tensor,
+              sigma_lo: float = 0.8, sigma_hi: float = 3.0,
+              eps: float = 1e-3) -> torch.Tensor:
+    """Band-passed Frequency Fidelity Loss — mid-band texture match.
+
+    Compares pred vs target in a fixed mid-frequency band (DoG). Penalises
+    over-smoothed denoising without pushing DC colour or ultra-fine sensor grain.
+    """
+    bp_p = _ffl_bandpass(pred, sigma_lo, sigma_hi)
+    bp_t = _ffl_bandpass(target, sigma_lo, sigma_hi)
+    diff = bp_p - bp_t
+    return torch.sqrt(diff * diff + eps * eps).mean()
+
+
 def _edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """L1 loss on horizontal/vertical image gradients (finite differences).
 
@@ -340,6 +383,21 @@ def _swt_rel_loss(pred: torch.Tensor, target: torch.Tensor, levels: int = 3,
     return loss / (max(1, levels) * 3)
 
 
+def _to_lpips_rgb(t: torch.Tensor) -> torch.Tensor:
+    """Map model tensors (1/3/4 ch packed) to 3ch RGB for LPIPS."""
+    if t.shape[1] == 3:
+        return t
+    if t.shape[1] == 1:
+        return t.repeat(1, 3, 1, 1)
+    if t.shape[1] >= 4:
+        pk = t[:, :4]
+        r = pk[:, 0:1]
+        g = 0.5 * (pk[:, 1:2] + pk[:, 2:3])
+        b = pk[:, 3:4]
+        return torch.clamp(torch.cat([r, g, b], dim=1), 0.0, 1.0)
+    raise ValueError(f"LPIPS expects 1/3/4 channels, got {t.shape[1]}")
+
+
 def _perceptual_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Differentiable LPIPS (AlexNet) perceptual loss.
 
@@ -349,10 +407,7 @@ def _perceptual_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     that L1 alone tolerates.
     """
     net = _get_lpips_net().to(device=pred.device, dtype=pred.dtype)
-    p, t = pred, target
-    if p.shape[1] == 1:                        # LPIPS expects 3 channels
-        p = p.repeat(1, 3, 1, 1)
-        t = t.repeat(1, 3, 1, 1)
+    p, t = _to_lpips_rgb(pred), _to_lpips_rgb(target)
     p, t = p * 2.0 - 1.0, t * 2.0 - 1.0        # LPIPS wants [-1, 1]
     return net(p, t).mean()
 
@@ -378,6 +433,8 @@ def _term_loss(term: str, *, charbonnier_eps: float, huber_delta: float,
         return _swt_loss
     if term == "swtrel":
         return _swt_rel_loss
+    if term == "ffl":
+        return _ffl_loss
     raise KeyError(term)
 
 
@@ -757,6 +814,6 @@ def estimate_device_latency_ms(model: nn.Module, patch: int, hardware: str,
     base, slope = LATENCY_MODEL[hardware]
     latency = base + slope * gflops
     # FP path on an INT8 accelerator (quantization disabled) runs ~1.7x slower.
-    if hardware in ("hailo8", "deepx") and not quantized:
+    if hardware in ("hailo10h", "deepx") and not quantized:
         latency *= 1.7
     return latency

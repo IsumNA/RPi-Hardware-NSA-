@@ -11,6 +11,10 @@ venv/
 # Demo outputs (regenerated on every run)
 outputs/
 
+# Compact cloud kit is committed (checkpoints + npz pairs; no DNGs)
+!cloud_pack/
+!cloud_pack/**
+
 # Real-capture datasets — large DNG trees stay local; sample PNGs may be committed
 datasets/**/*.dng
 datasets/**/*.raw

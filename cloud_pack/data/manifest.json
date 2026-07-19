@@ -1,0 +1,133 @@
+{
+  "temporal": 4,
+  "gt_mode": "alpha_trim",
+  "gt_frames": 16,
+  "pairs": [
+    {
+      "file": "pair_0000.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0001.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0002.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0003.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0004.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0005.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0006.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    },
+    {
+      "file": "pair_0007.npz",
+      "gain": 128,
+      "shape_noisy": [
+        548,
+        968,
+        16
+      ],
+      "shape_clean": [
+        548,
+        968,
+        4
+      ]
+    }
+  ],
+  "evals": [
+    {
+      "file": "eval_0000.npz",
+      "scene": "cabinet_H_2",
+      "gain": 128,
+      "frame": 400
+    },
+    {
+      "file": "eval_0001.npz",
+      "scene": "cabinet_D50_100",
+      "gain": 128,
+      "frame": 400
+    }
+  ]
+}

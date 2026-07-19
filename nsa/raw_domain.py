@@ -16,17 +16,28 @@ Pipeline (SID convention):
 The denoiser (RawDenoiser) reuses NAFNet blocks. Phase 2B feeds 5 channels
 (4 packed Bayer + normalised fusion confidence from ``temporal_fusion``) and
 predicts a 4-channel packed residual.
+
+Packing helpers (``pack_raw``, ``packed_to_rgb``, …) stay torch-free so the Pi
+ONNX live path can import them without installing PyTorch.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import json
 import numpy as np
-import torch
-import torch.nn as nn
 
-from .models import _NAFBlock
+try:
+    import torch
+    import torch.nn as nn
+    from .models import _NAFBlock
+    _HAS_TORCH = True
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    _NAFBlock = None  # type: ignore
+    _HAS_TORCH = False
 
 
 # --- raw I/O ---------------------------------------------------------------
@@ -76,6 +87,70 @@ def burst_clean(paths, limit: int = 128) -> np.ndarray:
     return acc / max(n, 1)
 
 
+def burst_clean_alpha_trim(
+    paths,
+    limit: int = 16,
+    trim: float = 0.25,
+    *,
+    packed_stack: np.ndarray | None = None,
+) -> np.ndarray:
+    """Alpha-trimmed temporal GT: per-pixel sort along time, drop tails, mean.
+
+    With ``limit=16`` and ``trim=0.25``, the bottom and top 4 frames are dropped
+    and the middle 8 are averaged — less ghosting than a plain mean.
+    """
+    if packed_stack is not None:
+        stack = np.asarray(packed_stack, dtype=np.float32)[:limit]
+    else:
+        use = list(paths)[:limit]
+        if not use:
+            raise ValueError("burst_clean_alpha_trim: no paths")
+        stack = np.stack([load_packed(p) for p in use], axis=0)
+    t = int(stack.shape[0])
+    if t <= 1:
+        return stack[0].astype(np.float32) if t == 1 else stack.mean(0).astype(np.float32)
+    lo = int(np.floor(float(trim) * t))
+    hi = int(np.ceil((1.0 - float(trim)) * t))
+    hi = max(lo + 1, min(hi, t))
+    sorted_t = np.sort(stack, axis=0)
+    return sorted_t[lo:hi].mean(axis=0).astype(np.float32)
+
+
+def gt_alpha_cache_path(cache_root: Path, scene: str, gain: int) -> Path:
+    """``datasets/.../gt_alpha16/{scene}/ag{gain}/gt_packed.npy``."""
+    return Path(cache_root) / scene / f"ag{gain}" / "gt_packed.npy"
+
+
+def load_or_build_alpha_gt(
+    bursts_root: Path,
+    cache_root: Path,
+    scene: str,
+    gain: int,
+    *,
+    limit: int = 16,
+    trim: float = 0.25,
+    rebuild: bool = False,
+) -> np.ndarray:
+    """Load cached alpha-trim GT or build from DNGs and write cache."""
+    cache_root = Path(cache_root)
+    out = gt_alpha_cache_path(cache_root, scene, gain)
+    if out.is_file() and not rebuild:
+        return np.load(out).astype(np.float32)
+    bdir = Path(bursts_root) / scene / f"ag{gain}"
+    files = sorted(bdir.glob("*.dng"))
+    if len(files) < 2:
+        raise FileNotFoundError(f"Need burst DNGs under {bdir}")
+    gt = burst_clean_alpha_trim(files, limit=min(limit, len(files)), trim=trim)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out, gt)
+    meta = out.parent / "meta.json"
+    meta.write_text(json.dumps({
+        "scene": scene, "gain": gain, "limit": limit, "trim": trim,
+        "n_dng": len(files), "shape": list(gt.shape),
+    }, indent=2))
+    return gt
+
+
 def fusion_confidence(
     weight_map: np.ndarray,
     *,
@@ -105,39 +180,46 @@ def to_fusion_tensor(
     weight_map: np.ndarray,
     *,
     k_cap: float = 16.0,
-) -> torch.Tensor:
+):
     """NCHW float tensor for RawDenoiser 5-channel forward pass."""
+    if not _HAS_TORCH:
+        raise ImportError("to_fusion_tensor requires PyTorch")
     x = stack_fusion_input(fused, weight_map, k_cap=k_cap)
     return torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0)
 
 
 # --- model -----------------------------------------------------------------
-class RawDenoiser(nn.Module):
-    """NAFNet-blocks denoiser on packed raw (residual).
+if _HAS_TORCH:
+    class RawDenoiser(nn.Module):
+        """NAFNet-blocks denoiser on packed raw (residual).
 
-    Default 4->4 for single-frame packed raw. Phase 2B uses ``in_ch=5`` with
-  ``out_ch=4``: fused packed Bayer plus a confidence channel from
-    ``fuse_burst_packed``'s weight map (count / k_cap).
-    """
+        Default 4->4 for single-frame packed raw. Phase 2B uses ``in_ch=5`` with
+        ``out_ch=4``: fused packed Bayer plus a confidence channel from
+        ``fuse_burst_packed``'s weight map (count / k_cap).
+        """
 
-    def __init__(
-        self,
-        base_channels: int = 32,
-        block_depth: int = 4,
-        in_ch: int = 4,
-        out_ch: int | None = None,
-    ):
-        super().__init__()
-        if out_ch is None:
-            out_ch = 4 if in_ch == 5 else in_ch
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-        c = base_channels
-        self.head = nn.Conv2d(in_ch, c, 3, padding=1)
-        self.body = nn.Sequential(*[_NAFBlock(c) for _ in range(block_depth)])
-        self.tail = nn.Conv2d(c, out_ch, 3, padding=1)
+        def __init__(
+            self,
+            base_channels: int = 32,
+            block_depth: int = 4,
+            in_ch: int = 4,
+            out_ch: int | None = None,
+        ):
+            super().__init__()
+            if out_ch is None:
+                out_ch = 4 if in_ch == 5 else in_ch
+            self.in_ch = in_ch
+            self.out_ch = out_ch
+            c = base_channels
+            self.head = nn.Conv2d(in_ch, c, 3, padding=1)
+            self.body = nn.Sequential(*[_NAFBlock(c) for _ in range(block_depth)])
+            self.tail = nn.Conv2d(c, out_ch, 3, padding=1)
 
-    def forward(self, x):
-        residual = self.tail(self.body(self.head(x)))
-        base = x[:, : self.out_ch]
-        return torch.clamp(base + residual, 0.0, 1.0)
+        def forward(self, x):
+            residual = self.tail(self.body(self.head(x)))
+            base = x[:, : self.out_ch]
+            return torch.clamp(base + residual, 0.0, 1.0)
+else:  # pragma: no cover
+    class RawDenoiser:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            raise ImportError("RawDenoiser requires PyTorch")

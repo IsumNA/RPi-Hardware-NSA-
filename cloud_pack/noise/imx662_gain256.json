@@ -1,0 +1,31 @@
+{
+  "sensor": "imx662",
+  "gain": 256,
+  "temperature_c": null,
+  "adc_bits": 12,
+  "shot_a": 0.024020755436780086,
+  "read_dist": {
+    "kind": "gaussian",
+    "mu": -8.416005392586356e-11,
+    "sigma": 0.0480523556470871,
+    "shape": 0.0,
+    "scale": 0.0,
+    "ks_stat": 0.03867188635992258
+  },
+  "row_dist": {
+    "kind": "gaussian",
+    "mu": 1.8057121770054252e-11,
+    "sigma": 0.00327094248495996,
+    "shape": 0.0,
+    "scale": 0.0,
+    "ks_stat": 0.011834211478960854
+  },
+  "row_strength": 0.0812358860898742,
+  "quant_scale": 0.0001221001221001221,
+  "n_bias": 8,
+  "n_dark": 5,
+  "n_flat_levels": 12,
+  "notes": [
+    "Row noise detected (strength 0.081)"
+  ]
+}
