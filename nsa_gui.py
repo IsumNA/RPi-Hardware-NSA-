@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from shlex import quote as shlex_quote
 from typing import Callable
 
 import tkinter as tk
@@ -4249,6 +4250,8 @@ class App(tk.Tk):
         self.extended_steps_var = tk.StringVar(value="1500")
         self.eval_var = tk.StringVar(value="single")     # single | sweep
         self.all_sensors_var = tk.BooleanVar(value=False)
+        # Stream→GT Pi recipe: regression L1 vs generative CFM (Teacher→Student).
+        self.stream_recipe_var = tk.StringVar(value="flow")  # regression | flow
         self._nafnet_topo = {"enc": "", "mid": "", "dec": ""}
 
         # Wizard chrome: a header (step indicator) + a content area + nav footer.
@@ -4295,6 +4298,7 @@ class App(tk.Tk):
 
         self._build_goal_card(home_body)
         self._build_noise_dataset_card(home_body)
+        self._build_stream_denoise_card(home_body)
 
         tk.Label(home_body, text="Compile with your current settings",
                  bg=WHITE, fg=INK, font=font(15, "bold")).pack(anchor="w",
@@ -4328,6 +4332,7 @@ class App(tk.Tk):
         self._on_mode_change()
         self._on_source_change()
         self._on_eval_change()
+        self._on_stream_recipe_change()
         self._show_home()
         try:
             self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -4657,6 +4662,222 @@ class App(tk.Tk):
                     kind="secondary", width=170, height=40).pack(side="left", padx=(S(8), 0))
         RoundButton(btn_row, "NOISE DATASET WIZARD", self._open_noise_wizard,
                     kind="secondary", width=220, height=40).pack(side="left", padx=(S(8), 0))
+
+    def _build_stream_denoise_card(self, parent):
+        """Home card: Regression vs Flow Matching for Pi stream→GT training."""
+        card = tk.Frame(parent, bg=FIELD, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=LINE)
+        card.pack(fill="x", pady=(S(4), S(16)))
+        inner = tk.Frame(card, bg=FIELD)
+        inner.pack(fill="x", padx=S(16), pady=S(14))
+
+        head = tk.Frame(inner, bg=FIELD)
+        head.pack(fill="x")
+        tk.Label(head, text="STREAM", bg=RASPBERRY, fg=WHITE,
+                 font=font(8, "bold"), padx=S(6), pady=S(1)).pack(side="left")
+        tk.Label(head, text="  Pi stream denoise — pick a training recipe",
+                 bg=FIELD, fg=INK, font=font(14, "bold")).pack(side="left")
+        tk.Label(
+            inner,
+            text=("Train a 1-step RawDenoiser for live Pi inference "
+                  "(pi_stream_denoise.py). Flow Matching = generative CFM Teacher "
+                  "→ distilled Student (cfm_student.onnx). Regression = L1 to "
+                  "burst GT (stream_to_gt.onnx)."),
+            bg=FIELD, fg=SUBTLE, font=font(9), wraplength=S(600),
+            justify="left").pack(anchor="w", pady=(S(4), S(8)))
+
+        tk.Label(inner, text="TRAINING RECIPE", bg=FIELD, fg=RASPBERRY,
+                 font=font(9, "bold")).pack(anchor="w", pady=(S(2), S(2)))
+        tk.Frame(inner, bg=LINE, height=1).pack(fill="x", pady=(0, S(6)))
+        recipe_fr = tk.Frame(inner, bg=FIELD)
+        recipe_fr.pack(fill="x", pady=(0, S(4)))
+        for text, value, badge, desc in (
+            ("Flow Matching (Teacher → Distill Student)", "flow", "CFM",
+             "Generative velocity field, then 1-step student for the Pi."),
+            ("Regression (L1 to burst GT)", "regression", "OLD WAY",
+             "Direct pixel regression — faster to train, often blurrier."),
+        ):
+            fr = tk.Frame(recipe_fr, bg=FIELD)
+            fr.pack(fill="x", pady=S(3))
+            top = tk.Frame(fr, bg=FIELD); top.pack(fill="x")
+            tk.Radiobutton(
+                top, text="  " + text, variable=self.stream_recipe_var,
+                value=value, bg=FIELD, fg=INK, selectcolor=FIELD,
+                activebackground=FIELD, activeforeground=INK,
+                font=font(11, "bold"), anchor="w", highlightthickness=0, bd=0,
+                command=self._on_stream_recipe_change,
+            ).pack(side="left")
+            self._badge(top, badge,
+                        bg=RASPBERRY if value == "flow" else LINE,
+                        fg=WHITE if value == "flow" else SUBTLE)
+            tk.Label(fr, text="     " + desc, bg=FIELD, fg=SUBTLE,
+                     font=font(9), wraplength=S(560),
+                     justify="left").pack(anchor="w")
+
+        self._stream_status = tk.Label(
+            inner, text="", bg=FIELD, fg=SUBTLE, font=font(9),
+            wraplength=S(600), justify="left")
+        self._stream_status.pack(anchor="w", pady=(S(6), S(8)))
+
+        btn_row = tk.Frame(inner, bg=FIELD)
+        btn_row.pack(fill="x")
+        RoundButton(btn_row, "START TRAINING", self._run_stream_train,
+                    kind="primary", width=180, height=40).pack(side="left")
+        RoundButton(btn_row, "TEST STREAM", self._test_stream_model,
+                    kind="secondary", width=150, height=40).pack(
+                        side="left", padx=(S(8), 0))
+        RoundButton(btn_row, "VIEW AI LOG", self._view_stream_ai_log,
+                    kind="secondary", width=140, height=40).pack(
+                        side="left", padx=(S(8), 0))
+        self._on_stream_recipe_change()
+
+    def _on_stream_recipe_change(self):
+        """Update checkpoint status when the stream recipe radio changes."""
+        if not hasattr(self, "_stream_status"):
+            return
+        ckpt, onnx = self._stream_artifact_paths()
+        recipe = self.stream_recipe_var.get()
+        name = ("Flow Matching student" if recipe == "flow"
+                else "Regression stream→GT")
+        bits = []
+        if ckpt.is_file():
+            bits.append(f"ckpt ✓ {ckpt.name}")
+        else:
+            bits.append(f"ckpt — missing {ckpt.name}")
+        if onnx.is_file():
+            bits.append(f"onnx ✓ {onnx.name}")
+        else:
+            bits.append(f"onnx — missing {onnx.name}")
+        colour = GREEN if ckpt.is_file() or onnx.is_file() else SUBTLE
+        self._stream_status.config(
+            text=f"{name}:  " + "  ·  ".join(bits), fg=colour)
+
+    def _stream_artifact_paths(self) -> tuple[Path, Path]:
+        """Checkpoint + ONNX paths for the selected stream recipe."""
+        out = ROOT / "outputs"
+        if self.stream_recipe_var.get() == "flow":
+            ckpt = out / "cfm_student.pt"
+            if not ckpt.is_file():
+                alt = out / "stream_to_gt_cfm.pt"
+                if alt.is_file():
+                    ckpt = alt
+            onnx = out / "cfm_student.onnx"
+            if not onnx.is_file():
+                alt = out / "stream_to_gt_cfm.onnx"
+                if alt.is_file():
+                    onnx = alt
+            return ckpt, onnx
+        return out / "stream_to_gt.pt", out / "stream_to_gt.onnx"
+
+    def _stream_python(self) -> str:
+        venv = ROOT / ".venv" / "bin" / "python"
+        return str(venv) if venv.is_file() else sys.executable
+
+    def _maybe_remote_ai_train_cmd(self, shell_cmd: str) -> list[str]:
+        """Run *shell_cmd* locally on the AI box, or via ``ssh ai`` from a laptop."""
+        try:
+            from nsa.denoise_hw_data import DEFAULT_AI_HOST, running_on_ai_server
+            on_ai = running_on_ai_server()
+            host = DEFAULT_AI_HOST
+        except Exception:
+            on_ai = False
+            host = os.environ.get("NSA_AI_HOST", "ai")
+        if on_ai:
+            return ["bash", "-lc", f"cd {shlex_quote(str(ROOT))} && {shell_cmd}"]
+        return [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+            f"cd ~/RPi-Hardware-NSA- && {shell_cmd}",
+        ]
+
+    def _build_stream_train_shell(self) -> str:
+        """Shell body for stream→GT training (regression or full CFM pipeline)."""
+        py = ".venv/bin/python"
+        if self.stream_recipe_var.get() == "flow":
+            teacher = (
+                f"{py} -u train_cfm_teacher.py "
+                "--gains 128,256,512 --steps 12000 --channels 128 --depth 8 "
+                "--stride 2 --temporal 4 --batch 2 --crop 256 --lr 6e-4 "
+                "--sample-steps 16 --panel-every 400"
+            )
+            distill = (
+                f"{py} -u train_cfm_distill.py "
+                "--teacher outputs/cfm_teacher.pt "
+                "--gains 128,256,512 --steps 8000 --channels 64 --depth 6 "
+                "--stride 2 --temporal 4 --batch 2 --crop 256 --lr 6e-4 "
+                "--teacher-steps 16 --gt-weight 0.15 --panel-every 400"
+            )
+            # No wait-for-regression — GUI kicks CFM off immediately.
+            return f"{teacher} && {distill}"
+        return (
+            f"{py} -u train_stream_to_gt.py "
+            "--gains 128,256,512 --steps 16000 --channels 128 --depth 8 "
+            "--stride 2 --temporal 4 --batch 2 --crop 256 --lr 6e-4 "
+            "--panel-every 200"
+        )
+
+    def _run_stream_train(self):
+        """Launch Regression or Flow Matching training (local AI or ssh ai)."""
+        recipe = self.stream_recipe_var.get()
+        title = ("Flow Matching training…" if recipe == "flow"
+                 else "Regression stream→GT training…")
+        subtitle = (
+            "CFM Teacher → 1-step Student → ONNX (Pi deploy: cfm_student.onnx)"
+            if recipe == "flow" else
+            "L1 RawDenoiser → stream_to_gt.onnx")
+        shell = self._build_stream_train_shell()
+        cmd = self._maybe_remote_ai_train_cmd(shell)
+        self._save_gui_state()
+        self._run_command(cmd, title, subtitle)
+
+    def _test_stream_model(self):
+        """Run pi_stream_denoise.py with the recipe's checkpoint / ONNX."""
+        ckpt, onnx = self._stream_artifact_paths()
+        if not ckpt.is_file() and not onnx.is_file():
+            messagebox.showinfo(
+                "Test stream model",
+                f"No artifacts for this recipe yet.\n\n"
+                f"Expected:\n  {ckpt.name}\n  {onnx.name}\n\n"
+                "Start training first (START TRAINING), or sync outputs/ "
+                "from the AI server.")
+            return
+        folder = filedialog.askdirectory(
+            title="Folder of stream .dng frames (or cancel)",
+            initialdir=str(ROOT / "datasets"))
+        if not folder:
+            return
+        cmd = [self._stream_python(), str(ROOT / "pi_stream_denoise.py"),
+               "--input", folder, "--out", str(ROOT / "outputs" / "stream_out")]
+        if onnx.is_file():
+            cmd += ["--onnx", str(onnx)]
+        else:
+            cmd += ["--checkpoint", str(ckpt)]
+        recipe = "Flow Matching" if self.stream_recipe_var.get() == "flow" else "Regression"
+        self._run_command(cmd, f"Stream denoise ({recipe})…",
+                          f"Using {onnx.name if onnx.is_file() else ckpt.name}")
+
+    def _view_stream_ai_log(self):
+        """Tail the CFM / regression train log on the AI host (or locally)."""
+        recipe = self.stream_recipe_var.get()
+        if recipe == "flow":
+            log = "logs/cfm_teacher_train.log"
+            # Fall back to pipeline / distill if teacher log is empty.
+            shell = (
+                "f=logs/cfm_teacher_train.log; "
+                "[ -s \"$f\" ] || f=logs/cfm_pipeline.log; "
+                "[ -s \"$f\" ] || f=logs/cfm_distill_train.log; "
+                "echo \"=== $f ===\"; tail -n 80 \"$f\" 2>/dev/null || "
+                "echo '(no CFM log yet)'"
+            )
+            title = "CFM train log (AI)…"
+        else:
+            shell = (
+                "echo '=== logs/stream_to_gt_train.log ==='; "
+                "tail -n 80 logs/stream_to_gt_train.log 2>/dev/null || "
+                "echo '(no regression log yet)'"
+            )
+            title = "Regression train log (AI)…"
+        cmd = self._maybe_remote_ai_train_cmd(shell)
+        self._run_command(cmd, title, "Last 80 lines from the training host")
 
     def _pick_capture_sensor(self) -> str | None:
         dlg = tk.Toplevel(self)
@@ -5192,7 +5413,8 @@ class App(tk.Tk):
                             "naf_enc", "naf_mid", "naf_dec")
     _STATE_BOOL_VARS = ("sim_noise_var", "quantize_var", "qat_var", "all_sensors_var",
                         "extended_train_var")
-    _STATE_STR_VARS = ("mode_var", "source_var", "eval_var", "extended_steps_var")
+    _STATE_STR_VARS = ("mode_var", "source_var", "eval_var", "extended_steps_var",
+                        "stream_recipe_var")
 
     def _gui_state(self) -> dict:
         """Snapshot every user-facing wizard choice into a JSON-safe dict."""
@@ -5237,7 +5459,7 @@ class App(tk.Tk):
             # compilation-profile fields; fresh defaults come from the yaml next.
             state = {
                 "vars": {k: v for k, v in (state.get("vars") or {}).items()
-                         if k in ("eval_var",)},
+                         if k in ("eval_var", "stream_recipe_var")},
             }
         try:
             rows = state.get("rows", {})
@@ -6475,6 +6697,23 @@ class App(tk.Tk):
         cmd = getattr(self, "_run_cmd", []) or []
         is_compile = any("run_demo.py" in str(c) for c in cmd)
         is_sweep = any("search.py" in str(c) for c in cmd)
+        is_stream = any(
+            x in " ".join(str(c) for c in cmd)
+            for x in ("train_cfm_", "train_stream_to_gt", "pi_stream_denoise",
+                      "cfm_teacher_train", "stream_to_gt_train"))
+        if is_stream:
+            self.status.config(
+                text="Stream job finished — check outputs/ "
+                     "(cfm_student.onnx or stream_to_gt.onnx) and the log above")
+            try:
+                self.open_btn.set_enabled(True)
+            except Exception:
+                pass
+            try:
+                self._on_stream_recipe_change()
+            except Exception:
+                pass
+            return
         self.status.config(
             text="Compilation complete — artifacts written to outputs/" if is_compile
             else ("Sweep complete — ranked leaderboard below" if is_sweep

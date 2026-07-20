@@ -163,7 +163,7 @@ pi_live:
   # Fallback SSH target. When you connect in the camera-capture wizard, LIVE TEST
   # reuses THAT same Pi SSH target automatically; this is only used if you never
   # opened capture this session (no shared target yet).
-  ssh_host: pi@10.3.31.153  # lab Pi (or YOUR_USER@10.x.x.x)
+  ssh_host: pi@10.3.195.212  # lab Pi (was 10.3.31.153; update if IP changes)
   repo: ~/RPi-Hardware-NSA- # path to this repo ON THE PI
   source: picamera          # picamera | rpicam | opencv | auto
   display: auto             # auto-detect Pi desktop (X11/Wayland). "" = headless PNG.

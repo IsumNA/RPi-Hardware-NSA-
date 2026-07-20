@@ -59,15 +59,71 @@ def pack_raw(bayer: np.ndarray) -> np.ndarray:
                      b[1::2, 0::2], b[1::2, 1::2]], axis=-1).astype(np.float32)
 
 
+def unpack_raw(packed: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`pack_raw`: ``(H, W, 4)`` → Bayer ``(2H, 2W)``."""
+    h, w = packed.shape[:2]
+    bayer = np.empty((h * 2, w * 2), dtype=np.float32)
+    bayer[0::2, 0::2] = packed[..., 0]
+    bayer[0::2, 1::2] = packed[..., 1]
+    bayer[1::2, 0::2] = packed[..., 2]
+    bayer[1::2, 1::2] = packed[..., 3]
+    return bayer
+
+
 def packed_to_rgb(packed: np.ndarray, gain: float = 1.0) -> np.ndarray:
     """Half-res linear RGB for viewing/metrics: R, avg(G1,G2), B (RGGB order).
 
     ``gain`` brightens the dark linear signal for display only.
+    Fast preview helper — not the training demosaic for RGB U-NAFNet.
     """
     r = packed[..., 0]
     g = 0.5 * (packed[..., 1] + packed[..., 2])
     b = packed[..., 3]
     rgb = np.stack([r, g, b], axis=-1) * gain
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _bayer_cv_code(raw_format: str | None = None) -> int:
+    """Map a libcamera/FourCC Bayer name to ``cv2.COLOR_BAYER_*2RGB``."""
+    import cv2
+
+    fmt = (raw_format or "SRGGB").upper()
+    # Strip bit-depth suffixes: SRGGB16 / SBGGR12_CSI2P → SRGGB / SBGGR
+    for suf in ("_CSI2P", "_PISP", "16", "14", "12", "10", "8"):
+        if fmt.endswith(suf):
+            fmt = fmt[: -len(suf)]
+    return {
+        "SRGGB": cv2.COLOR_BAYER_RG2RGB,
+        "RGGB": cv2.COLOR_BAYER_RG2RGB,
+        "SBGGR": cv2.COLOR_BAYER_BG2RGB,
+        "BGGR": cv2.COLOR_BAYER_BG2RGB,
+        "SGRBG": cv2.COLOR_BAYER_GR2RGB,
+        "GRBG": cv2.COLOR_BAYER_GR2RGB,
+        "SGBRG": cv2.COLOR_BAYER_GB2RGB,
+        "GBRG": cv2.COLOR_BAYER_GB2RGB,
+    }.get(fmt, cv2.COLOR_BAYER_RG2RGB)
+
+
+def packed_to_rgb_demosaic(
+    packed: np.ndarray,
+    gain: float = 1.0,
+    *,
+    raw_format: str | None = None,
+) -> np.ndarray:
+    """Full-res linear RGB via OpenCV Bayer demosaic.
+
+    Matches the NAFNet / U-NAFNet RGB training path (``nsa.raw_io`` DNG loader).
+    Use this for RGB-domain live inference — not :func:`packed_to_rgb`.
+    ``raw_format`` should be the camera CFA string (e.g. ``SRGGB16``).
+    """
+    import cv2
+
+    bayer = unpack_raw(np.asarray(packed, dtype=np.float32))
+    b16 = (np.clip(bayer, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+    code = _bayer_cv_code(raw_format)
+    rgb = cv2.cvtColor(b16, code).astype(np.float32) / 65535.0
+    if gain != 1.0:
+        rgb = rgb * float(gain)
     return np.clip(rgb, 0.0, 1.0)
 
 

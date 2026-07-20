@@ -36,10 +36,12 @@ GAINS = (256, 512)
 # joining them with '+', e.g. "l1+perceptual+edge". Each term's default weight
 # is what it contributes when several are summed (a lone term is used unscaled).
 LOSS_TERMS = ("l1", "l2", "charbonnier", "huber", "ssim", "perceptual", "edge",
-              "swt", "swtrel")
+              "swt", "swtrel", "ffl")
 DEFAULT_LOSS_WEIGHTS = {
     "l1": 1.0, "l2": 1.0, "charbonnier": 1.0, "huber": 1.0,
     "ssim": 0.2, "perceptual": 0.1, "edge": 0.05,
+    # Band-passed frequency fidelity (mid-band texture); see _ffl_loss.
+    "ffl": 0.15,
     # Stationary-wavelet loss: multi-scale subband matching, the anti-blur
     # upgrade over the single-band 'edge' term.
     "swt": 0.1,
