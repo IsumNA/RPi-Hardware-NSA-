@@ -547,6 +547,8 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
     steps = max(1, steps)
     warmup = max(1, steps // 10)
 
+    _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(_dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     def lr_at(i: int) -> float:
@@ -561,6 +563,7 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
     model.train()
     for i in range(steps):
         xb, yb = _sample_batch(tensors, crop, batch, g, weights=wt)
+        xb, yb = xb.to(_dev), yb.to(_dev)
         opt.zero_grad()
         loss = loss_fn(model(xb), yb)
         loss.backward()
@@ -571,6 +574,7 @@ def _train(model: nn.Module, tensors, steps: int, seed: int, progress,
             progress(i + 1, steps, float(loss.item()))
     if qat:
         disable_qat(model)
+    model = model.to("cpu")
     model.eval()
     return model
 
