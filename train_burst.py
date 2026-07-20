@@ -121,7 +121,7 @@ def main():
 
     last = [0.0]
     def prog(i, total, loss):
-        if i % 200 == 0 or i == total:
+        if i % 500 < 4 or i >= total - 1:
             print(f"  step {i}/{total}  loss={loss:.4f}", flush=True)
         last[0] = loss
     calibrate_multi(model, pairs, args.steps, args.seed, prog,
