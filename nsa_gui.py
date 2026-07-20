@@ -7326,6 +7326,20 @@ class App(tk.Tk):
         fam = r.get("family")
         if fam and "model_family" in self.rows:
             self.rows["model_family"].set(fam)
+        # Apply the recorded NAFNet topology. Sweep models are FLAT (no custom
+        # topology); without this the form keeps config.yaml's custom topology
+        # from _build_form and silently runs a DIFFERENT architecture than the
+        # one that was swept. History rows carry their real topology.
+        if fam == "nafnet" and any(k in r for k in
+                                   ("nafnet_enc", "nafnet_middle", "nafnet_dec")):
+            enc = r.get("nafnet_enc") or []
+            dec = r.get("nafnet_dec") or []
+            mid = r.get("nafnet_middle")
+            self._write_nafnet_topo(
+                " ".join(str(x) for x in enc),
+                str(mid) if (enc and mid) else "",
+                " ".join(str(x) for x in dec),
+            )
         # .set() doesn't fire the combobox callback, so rebuild the detail rows
         # for this family before applying its specific parameters.
         self._render_model_options()
