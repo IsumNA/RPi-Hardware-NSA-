@@ -9,7 +9,10 @@ venv/
 .npu_driver/
 
 # Demo outputs (regenerated on every run)
-outputs/
+outputs/*
+# Keep the results portfolio deck on main
+!outputs/portfolio/
+!outputs/portfolio/**
 
 # Compact cloud kit is committed (checkpoints + npz pairs; no DNGs)
 !cloud_pack/
