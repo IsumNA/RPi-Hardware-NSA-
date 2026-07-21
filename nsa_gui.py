@@ -321,6 +321,119 @@ def _round_points(x1, y1, x2, y2, r):
     ]
 
 
+class ToolTip:
+    """Lightweight hover tooltip: a small dark popup with wrapped text.
+
+    Attach with ``ToolTip.attach(widget, "plain-language help")``. It appears
+    after a short delay when the pointer enters the widget (or any child) and
+    hides on leave / click / destroy. Used to make every option explain itself
+    on hover so the tool is usable by non-experts, not just ML engineers.
+    """
+
+    _DELAY_MS = 300
+    _WRAP = 280  # logical px
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self._tip = None
+        self._after = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Button-1>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    @classmethod
+    def attach(cls, widget, text, children=True):
+        tip = cls(widget, text)
+        if children:
+            for ch in widget.winfo_children():
+                ch.bind("<Enter>", tip._schedule, add="+")
+                ch.bind("<Leave>", tip._hide, add="+")
+        return tip
+
+    def set_text(self, text):
+        self.text = text
+
+    def _schedule(self, _e=None):
+        if not self.text:
+            return
+        self._cancel()
+        try:
+            self._after = self.widget.after(self._DELAY_MS, self._show)
+        except tk.TclError:
+            self._after = None
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + S(18)
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + S(6)
+        except Exception:
+            return
+        try:
+            self._tip = tw = tk.Toplevel(self.widget)
+        except tk.TclError:
+            self._tip = None
+            return
+        tw.wm_overrideredirect(True)
+        try:
+            tw.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        frame = tk.Frame(tw, bg=INK, bd=0, highlightthickness=1,
+                         highlightbackground=RASPBERRY)
+        frame.pack()
+        tk.Label(frame, text=self.text, bg=INK, fg=WHITE, font=font(9),
+                 justify="left", wraplength=S(self._WRAP),
+                 padx=S(11), pady=S(8)).pack()
+        tw.update_idletasks()
+        try:
+            sw = tw.winfo_screenwidth()
+            sh = tw.winfo_screenheight()
+            if x + tw.winfo_width() > sw - S(8):
+                x = max(S(8), sw - tw.winfo_width() - S(8))
+            if y + tw.winfo_height() > sh - S(8):
+                y = max(S(8), self.widget.winfo_rooty() - tw.winfo_height() - S(6))
+        except Exception:
+            pass
+        tw.wm_geometry(f"+{int(x)}+{int(y)}")
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+class InfoDot(tk.Label):
+    """A small 'ⓘ' badge that reveals a plain-language tooltip on hover."""
+
+    def __init__(self, parent, text, bg=None):
+        bg = bg if bg is not None else parent["bg"]
+        super().__init__(parent, text="\u24d8", bg=bg, fg=SUBTLE,
+                         font=font(10, "bold"), cursor="question_arrow")
+        self._bg = bg
+        self.tip = ToolTip(self, text)
+        self.bind("<Enter>", lambda _e: self.config(fg=RASPBERRY), add="+")
+        self.bind("<Leave>", lambda _e: self.config(fg=SUBTLE), add="+")
+
+    def set_text(self, text):
+        self.tip.set_text(text)
+
+
 class RoundButton(tk.Canvas):
     """Flat rounded button matching the Imager's primary/secondary styles."""
 
@@ -479,14 +592,18 @@ class Sidebar(tk.Canvas):
 class ConfigRow(tk.Frame):
     """One Imager-style list row: bold title + grey description + a control."""
 
-    def __init__(self, parent, title, desc, values, default, command=None):
+    def __init__(self, parent, title, desc, values, default, command=None, help=None):
         super().__init__(parent, bg=WHITE)
         self.columnconfigure(0, weight=1)
         left = tk.Frame(self, bg=WHITE)
         left.grid(row=0, column=0, sticky="w")
-        self._title_lbl = tk.Label(left, text=title, bg=WHITE, fg=INK,
+        title_row = tk.Frame(left, bg=WHITE)
+        title_row.pack(anchor="w", fill="x")
+        self._title_lbl = tk.Label(title_row, text=title, bg=WHITE, fg=INK,
                                    font=font(11, "bold"))
-        self._title_lbl.pack(anchor="w")
+        self._title_lbl.pack(side="left")
+        if help:
+            InfoDot(title_row, help).pack(side="left", padx=(S(6), 0))
         tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
 
         self.var = tk.StringVar(value=str(default))
@@ -528,15 +645,19 @@ class LossSelector(tk.Frame):
     _ALIASES = {"mse": "l2", "l1_perceptual_edge": "l1+perceptual+edge",
                 "charbonnier_ssim": "charbonnier+ssim"}
 
-    def __init__(self, parent, title, desc, default, command=None):
+    def __init__(self, parent, title, desc, default, command=None, help=None):
         super().__init__(parent, bg=WHITE)
         self.columnconfigure(0, weight=1)
         self.command = command
         left = tk.Frame(self, bg=WHITE)
         left.grid(row=0, column=0, sticky="w")
-        self._title_lbl = tk.Label(left, text=title, bg=WHITE, fg=INK,
+        title_row = tk.Frame(left, bg=WHITE)
+        title_row.pack(anchor="w", fill="x")
+        self._title_lbl = tk.Label(title_row, text=title, bg=WHITE, fg=INK,
                                    font=font(11, "bold"))
-        self._title_lbl.pack(anchor="w")
+        self._title_lbl.pack(side="left")
+        if help:
+            InfoDot(title_row, help).pack(side="left", padx=(S(6), 0))
         tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
 
         self.vars = {t: tk.BooleanVar(value=False) for t in self.TERMS}
@@ -698,6 +819,500 @@ class SensorSelector(tk.Frame):
         if value in self._frames:
             self.var.set(value)
             self._refresh()
+
+
+# ---------------------------------------------------------------------------
+# Model-family catalogue: plain-language, non-expert-friendly descriptions plus
+# a schematic architecture diagram, so choosing a network doesn't require an ML
+# background. `shape` selects which diagram is drawn; speed/quality/size are 1–5.
+# ---------------------------------------------------------------------------
+CATEGORY_COLOR = {
+    "Compact CNN": "#3F9142",
+    "Encoder–Decoder": RASPBERRY,
+    "Transformer / State-space": "#7A5AF8",
+    "Video (multi-frame)": AMBER,
+}
+
+FAMILY_GROUPS = [
+    ("Compact CNN", ["cnn", "dncnn", "ffdnet"]),
+    ("Encoder–Decoder", ["nafnet", "unet", "drunet", "rednet", "ridnet", "attn_unet2"]),
+    ("Transformer / State-space", ["restormer", "eamamba", "unifyformer"]),
+    ("Video (multi-frame)", ["remonet", "emvd", "mstmn"]),
+]
+
+FAMILY_INFO = {
+    "cnn": {
+        "label": "Plain CNN", "group": "Compact CNN", "shape": "stack",
+        "tagline": "A simple stack of convolutions — the fastest baseline.",
+        "how": "Slides small filters over the image a few times to smooth out "
+               "noise. No fancy tricks, so it stays tiny and quick but leaves the "
+               "most detail on the table.",
+        "best_for": "Ultra-low-power baselines",
+        "speed": 5, "quality": 2, "size": 1,
+        "hw": "Runs anywhere — bare Pi CPU and every NPU.",
+    },
+    "dncnn": {
+        "label": "DnCNN", "group": "Compact CNN", "shape": "stack-residual",
+        "tagline": "Learns the noise itself, then subtracts it.",
+        "how": "Rather than redraw the clean image, it predicts just the noise and "
+               "removes it. This residual trick trains fast and clearly beats a "
+               "plain CNN at a similar size.",
+        "best_for": "Fast, reliable general denoising",
+        "speed": 4, "quality": 3, "size": 2,
+        "hw": "INT8-friendly; great on Hailo-8 / DeepX.",
+    },
+    "ffdnet": {
+        "label": "FFDNet", "group": "Compact CNN", "shape": "stack-residual",
+        "tagline": "Noise-level-aware CNN on a downsampled image.",
+        "how": "Works on a shrunk copy of the frame plus a noise-level map, so one "
+               "network handles many noise strengths quickly. Very fast; extreme "
+               "noise can look a touch soft.",
+        "best_for": "Variable noise / changing gain",
+        "speed": 4, "quality": 3, "size": 2,
+        "hw": "Lightweight; fine on NPUs and CPU.",
+    },
+    "nafnet": {
+        "label": "NAFNet", "group": "Encoder–Decoder", "shape": "unet-gate",
+        "tagline": "Activation-free efficient U-Net — the recommended default.",
+        "how": "A U-Net that swaps heavy activations for a lightweight 'SimpleGate', "
+               "getting top quality for the compute. Small, hardware-friendly graph "
+               "with excellent results.",
+        "best_for": "Best quality-per-watt (recommended)",
+        "speed": 4, "quality": 5, "size": 3,
+        "hw": "Excellent on Hailo-8 / DeepX and Pi 5 CPU.",
+    },
+    "unet": {
+        "label": "U-Net", "group": "Encoder–Decoder", "shape": "unet",
+        "tagline": "Encoder–decoder with skip connections — the workhorse.",
+        "how": "Shrinks the image to 'understand' the scene, then rebuilds it clean, "
+               "copying fine detail across skip connections so edges stay sharp. A "
+               "dependable all-rounder.",
+        "best_for": "Balanced quality and speed",
+        "speed": 3, "quality": 4, "size": 3,
+        "hw": "Maps well to most accelerators.",
+    },
+    "drunet": {
+        "label": "DRUNet", "group": "Encoder–Decoder", "shape": "unet",
+        "tagline": "A deeper, bias-free U-Net for tougher noise.",
+        "how": "A larger U-Net with more capacity per stage — cleaner results on "
+               "heavy low-light noise, at the cost of more compute and memory.",
+        "best_for": "Heavy noise, quality first",
+        "speed": 2, "quality": 5, "size": 4,
+        "hw": "Prefers a real NPU or the Pi 5 CPU.",
+    },
+    "rednet": {
+        "label": "RED-Net", "group": "Encoder–Decoder", "shape": "unet",
+        "tagline": "Residual encoder–decoder with symmetric skips.",
+        "how": "Encoder and decoder linked by residual skips that pass detail "
+               "straight to the output, which helps preserve texture. Uses at least "
+               "two stages.",
+        "best_for": "Detail preservation",
+        "speed": 3, "quality": 4, "size": 3,
+        "hw": "Standard convs — broad accelerator support.",
+    },
+    "ridnet": {
+        "label": "RIDNet", "group": "Encoder–Decoder", "shape": "unet-attn",
+        "tagline": "Residual-in-residual with feature attention.",
+        "how": "Stacks residual groups and lets the network re-weight its own "
+               "features (attention) to focus on what matters. Strong quality, a "
+               "little heavier to run.",
+        "best_for": "Quality on real photographic noise",
+        "speed": 2, "quality": 4, "size": 3,
+        "hw": "Feature re-weighting stays INT8-friendly.",
+    },
+    "attn_unet2": {
+        "label": "Attention U-Net²", "group": "Encoder–Decoder", "shape": "unet-attn",
+        "tagline": "Two-stage U-Net with attention gates.",
+        "how": "A U-Net with attention gates on its skips, plus a second corrector "
+               "pass that cleans up what the first missed. Higher quality, more "
+               "compute.",
+        "best_for": "Two-pass refinement",
+        "speed": 2, "quality": 4, "size": 4,
+        "hw": "Best on NPUs with headroom or the Pi 5 CPU.",
+    },
+    "restormer": {
+        "label": "Restormer", "group": "Transformer / State-space", "shape": "transformer",
+        "tagline": "Transformer that attends across channels — top quality.",
+        "how": "Uses self-attention (across feature channels, so it stays efficient) "
+               "to see the whole image at once. Best-in-class detail, but the "
+               "attention graph is heavy and prefers a CPU over INT8 NPUs.",
+        "best_for": "Maximum quality on Pi 5 CPU",
+        "speed": 1, "quality": 5, "size": 5,
+        "hw": "Great on Pi 5 CPU; caveats on INT8 NPUs.",
+    },
+    "eamamba": {
+        "label": "EAMamba", "group": "Transformer / State-space", "shape": "transformer",
+        "tagline": "State-space model — a global view at linear cost.",
+        "how": "A 'selective scan' sweeps the whole image once (cost grows linearly, "
+               "not quadratically like attention), so it gets big-picture context "
+               "without transformer-sized bills.",
+        "best_for": "Global context, efficiently",
+        "speed": 3, "quality": 4, "size": 3,
+        "hw": "Scan ops fall back to FP on INT8 NPUs.",
+    },
+    "unifyformer": {
+        "label": "UnifyFormer", "group": "Transformer / State-space", "shape": "transformer",
+        "tagline": "Multi-scale local aggregation (kernels 3 / 5 / 7).",
+        "how": "Blends features gathered at several neighbourhood sizes at once, "
+               "capturing both fine and coarse structure. A modern, efficient "
+               "hybrid.",
+        "best_for": "Mixed fine + coarse detail",
+        "speed": 3, "quality": 4, "size": 3,
+        "hw": "Depthwise-based; NPU-friendly.",
+    },
+    "remonet": {
+        "label": "ReMoNet", "group": "Video (multi-frame)", "shape": "video",
+        "tagline": "Video denoiser with recurrent memory.",
+        "how": "Remembers previous frames and reuses them, so a moving scene gets "
+               "cleaner and more stable over time. For video streams, not single "
+               "shots.",
+        "best_for": "Live video / bursts",
+        "speed": 3, "quality": 4, "size": 3,
+        "hw": "Per-frame core exports; memory runs in the runtime.",
+    },
+    "emvd": {
+        "label": "EMVD", "group": "Video (multi-frame)", "shape": "video",
+        "tagline": "Efficient multi-frame video denoiser (<500K params).",
+        "how": "A tiny video network that splits work into 'align' and 'refine' "
+               "steps, built to run in real time on modest hardware.",
+        "best_for": "Real-time video on small chips",
+        "speed": 5, "quality": 3, "size": 1,
+        "hw": "Very light — ideal for NPUs / Pi.",
+    },
+    "mstmn": {
+        "label": "MSTMN", "group": "Video (multi-frame)", "shape": "video",
+        "tagline": "Multi-scale temporal video (coarse + fine bands).",
+        "how": "Processes each frame at several scales and fuses them across time, "
+               "handling both large motion and fine texture. A heavier video option.",
+        "best_for": "Higher-quality video",
+        "speed": 2, "quality": 4, "size": 4,
+        "hw": "Best on an NPU with headroom.",
+    },
+}
+
+
+def draw_arch_diagram(canvas, family, W, H):
+    """Draw a clean schematic of a model family on ``canvas`` (W×H px).
+
+    Guarded so a drawing hiccup can never take down the wizard.
+    """
+    try:
+        canvas.delete("all")
+        info = FAMILY_INFO.get(family, {})
+        shape = info.get("shape", "stack")
+        BLK, IO, ATT = RASPBERRY, FIELD, "#7A5AF8"
+
+        def box(x1, y1, x2, y2, text="", fill=BLK, fg="white", fsz=8):
+            canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=fill)
+            if text:
+                canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=text,
+                                   fill=fg, font=font(fsz, "bold"))
+
+        def arrow(x1, y1, x2, y2, color=SUBTLE, dash=None, width=2):
+            canvas.create_line(x1, y1, x2, y2, fill=color, width=width,
+                               arrow="last", dash=dash)
+
+        def cap(text, color=SUBTLE):
+            canvas.create_text(W / 2, H - S(9), text=text, fill=color,
+                               font=font(8, "bold"))
+
+        my = (H - S(14)) / 2
+
+        if shape in ("stack", "stack-residual", "transformer"):
+            n = 3
+            iow, bw, gap = S(30), S(52), S(18)
+            block_txt = {"stack": "conv", "stack-residual": "conv",
+                         "transformer": {"restormer": "attn", "eamamba": "scan",
+                                         "unifyformer": "multi"}.get(family, "block")}[shape]
+            blk_fill = ATT if shape == "transformer" else BLK
+            box(S(8), my - S(20), S(8) + iow, my + S(20), "IN", IO, INK)
+            x = S(8) + iow + gap
+            for _i in range(n):
+                arrow(x - gap, my, x, my)
+                box(x, my - S(17), x + bw, my + S(17), block_txt, blk_fill, "white")
+                x += bw + gap
+            arrow(x - gap, my, x, my)
+            box(x, my - S(20), x + iow, my + S(20), "OUT", IO, INK)
+            if shape == "stack-residual":
+                ytop = my - S(34)
+                canvas.create_line(S(8) + iow / 2, my - S(20), S(8) + iow / 2, ytop,
+                                   S(8) + iow / 2 + (x - (S(8) + iow / 2)), ytop,
+                                   x + iow / 2, my - S(20), fill=GREEN, width=2,
+                                   dash=(4, 3), arrow="last")
+                canvas.create_text(W / 2, ytop - S(7), text="+ residual (learns noise)",
+                                   fill=GREEN, font=font(8, "bold"))
+                cap("convolution stack")
+            elif shape == "transformer":
+                mech = {"restormer": "channel self-attention",
+                        "eamamba": "linear selective scan",
+                        "unifyformer": "multi-scale aggregation"}.get(family, "attention")
+                cap(mech)
+            else:
+                cap("convolution stack")
+
+        elif shape in ("unet", "unet-gate", "unet-attn"):
+            levels = 3
+            bw, bh = S(42), S(18)
+            xL, sx, sy, y0 = S(34), S(30), S(26), S(12)
+            xR = W - S(34) - bw
+            enc, dec = [], []
+            for i in range(levels):
+                enc.append((xL + i * sx, y0 + i * sy))
+                dec.append((xR - i * sx, y0 + i * sy))
+            by = y0 + levels * sy
+            bx = (enc[-1][0] + dec[-1][0]) / 2
+            # skips
+            for i in range(levels):
+                ex, ey = enc[i]
+                dx, dy = dec[i]
+                canvas.create_line(ex + bw, ey + bh / 2, dx, dy + bh / 2,
+                                   fill=LINE, width=2, dash=(4, 3))
+            # encoder
+            arrow(S(6), enc[0][1] + bh / 2, enc[0][0], enc[0][1] + bh / 2)
+            for i, (ex, ey) in enumerate(enc):
+                box(ex, ey, ex + bw, ey + bh, "enc", BLK, "white")
+                if i + 1 < levels:
+                    arrow(ex + bw / 2, ey + bh, enc[i + 1][0] + bw / 2, enc[i + 1][1])
+                else:
+                    arrow(ex + bw / 2, ey + bh, bx, by)
+            # bottleneck
+            box(bx - bw / 2, by, bx + bw / 2, by + bh, "core", INK, "white")
+            # decoder (bottom→top)
+            arrow(bx, by + bh, dec[-1][0] + bw / 2, dec[-1][1] + bh)
+            for i in range(levels - 1, -1, -1):
+                dx, dy = dec[i]
+                box(dx, dy, dx + bw, dy + bh, "dec", BLK, "white")
+                if i > 0:
+                    arrow(dx + bw / 2, dy, dec[i - 1][0] + bw / 2, dec[i - 1][1] + bh)
+            arrow(dec[0][0] + bw, dec[0][1] + bh / 2, W - S(6), dec[0][1] + bh / 2)
+            canvas.create_text(enc[0][0] - S(6), enc[0][1] - S(8), text="IN",
+                               fill=INK, font=font(7, "bold"), anchor="e")
+            canvas.create_text(dec[0][0] + bw + S(6), dec[0][1] - S(8), text="OUT",
+                               fill=INK, font=font(7, "bold"), anchor="w")
+            if shape == "unet-gate":
+                cap("U-Net · SimpleGate blocks · skip connections")
+            elif shape == "unet-attn":
+                cap("U-Net · attention on skips")
+            else:
+                cap("encoder – decoder · skip connections")
+
+        elif shape == "video":
+            fw, fh = S(30), S(20)
+            fx = S(10)
+            labels = ["t-2", "t-1", "t"]
+            ys = [my - S(30), my, my + S(30)]
+            for lab, y in zip(labels, ys):
+                box(fx, y - fh / 2, fx + fw, y + fh / 2, lab, IO, INK, fsz=7)
+                arrow(fx + fw, y, fx + fw + S(16), my)
+            ax = fx + fw + S(16)
+            box(ax, my - S(18), ax + S(52), my + S(18), "align+fuse", ATT, "white", fsz=7)
+            dx = ax + S(52) + S(16)
+            arrow(ax + S(52), my, dx, my)
+            box(dx, my - S(18), dx + S(52), my + S(18), "denoise", BLK, "white")
+            # memory loop
+            canvas.create_line(dx + S(26), my - S(18), dx + S(26), my - S(30),
+                               dx - S(6), my - S(30), dx - S(6), my,
+                               fill=GREEN, width=2, dash=(4, 3), arrow="last")
+            canvas.create_text(dx + S(10), my - S(37), text="memory",
+                               fill=GREEN, font=font(7, "bold"))
+            ox = dx + S(52) + S(16)
+            arrow(dx + S(52), my, ox, my)
+            box(ox, my - S(20), ox + S(30), my + S(20), "OUT", IO, INK)
+            cap("multi-frame · temporal memory")
+    except Exception:
+        pass
+
+
+class RatingBar(tk.Frame):
+    """A labelled 1–5 pip meter (Speed / Quality / Footprint) with hover help."""
+
+    def __init__(self, parent, label, value, color, help=None, bg=WHITE):
+        super().__init__(parent, bg=bg)
+        self.color = color
+        tk.Label(self, text=label, bg=bg, fg=SUBTLE, font=font(9),
+                 width=8, anchor="w").pack(side="left")
+        self.canvas = tk.Canvas(self, width=S(84), height=S(14), bg=bg,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack(side="left")
+        self.set(value)
+        if help:
+            InfoDot(self, help, bg=bg).pack(side="left", padx=(S(6), 0))
+
+    def set(self, value):
+        self.canvas.delete("all")
+        pw, gap = S(12), S(4)
+        for i in range(5):
+            x = i * (pw + gap) + S(2)
+            fill = self.color if i < value else LINE
+            self.canvas.create_rectangle(x, S(3), x + pw, S(11), fill=fill,
+                                         outline=fill)
+
+
+class ModelFamilySelector(tk.Frame):
+    """Visual model-family picker: grouped clickable chips + a detail panel with
+    a schematic architecture diagram, plain-language explanation, "best for",
+    and Speed / Quality / Footprint meters.
+
+    Exposes ``.get()`` / ``.set()`` / ``.set_enabled()`` like ``ConfigRow`` so the
+    rest of the form treats it as ``self.rows['model_family']``.
+    """
+
+    def __init__(self, parent, default="nafnet", command=None):
+        super().__init__(parent, bg=WHITE)
+        self.var = tk.StringVar(value=default)
+        self.command = command
+        self._chips = {}
+        self._enabled = True
+
+        # Grouped chip grid.
+        grid = tk.Frame(self, bg=WHITE)
+        grid.pack(fill="x")
+        for gname, keys in FAMILY_GROUPS:
+            hdr = tk.Frame(grid, bg=WHITE)
+            hdr.pack(fill="x", pady=(S(8), S(2)))
+            tk.Frame(hdr, bg=CATEGORY_COLOR[gname], width=S(10),
+                     height=S(10)).pack(side="left", padx=(S(2), S(6)))
+            tk.Label(hdr, text=gname.upper(), bg=WHITE, fg=SUBTLE,
+                     font=font(8, "bold")).pack(side="left")
+            row = tk.Frame(grid, bg=WHITE)
+            row.pack(fill="x")
+            cols = 3
+            for i in range(cols):
+                row.columnconfigure(i, weight=1, uniform="fam")
+            for i, key in enumerate(keys):
+                self._build_chip(row, key, i // cols, i % cols)
+
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x", pady=(S(12), 0))
+
+        # Detail panel.
+        detail = tk.Frame(self, bg=WHITE)
+        detail.pack(fill="x", pady=(S(10), 0))
+        head = tk.Frame(detail, bg=WHITE)
+        head.pack(fill="x")
+        self._name_lbl = tk.Label(head, text="", bg=WHITE, fg=INK,
+                                  font=font(15, "bold"))
+        self._name_lbl.pack(side="left")
+        self._badge_lbl = tk.Label(head, text="", bg=FIELD, fg=SUBTLE,
+                                   font=font(8, "bold"))
+        self._badge_lbl.pack(side="left", padx=(S(8), 0))
+        self._tag_lbl = tk.Label(detail, text="", bg=WHITE, fg=RASPBERRY,
+                                 font=font(10, "bold"), justify="left", anchor="w")
+        self._tag_lbl.pack(anchor="w", pady=(S(2), S(6)))
+
+        cols = tk.Frame(detail, bg=WHITE)
+        cols.pack(fill="x")
+        cols.columnconfigure(0, weight=0)
+        cols.columnconfigure(1, weight=1)
+        self.diagram = tk.Canvas(cols, width=S(300), height=S(150), bg=WHITE,
+                                 highlightthickness=1, highlightbackground=LINE)
+        self.diagram.grid(row=0, column=0, sticky="nw")
+        right = tk.Frame(cols, bg=WHITE)
+        right.grid(row=0, column=1, sticky="new", padx=(S(14), 0))
+        self._how_lbl = tk.Label(right, text="", bg=WHITE, fg=INK, font=font(9),
+                                 wraplength=S(280), justify="left", anchor="w")
+        self._how_lbl.pack(anchor="w")
+        self._speed = RatingBar(right, "Speed", 3, GREEN,
+                                "How fast it runs on-device. More bars = faster / "
+                                "lower latency.")
+        self._speed.pack(anchor="w", pady=(S(8), 0))
+        self._quality = RatingBar(right, "Quality", 3, RASPBERRY,
+                                  "Expected denoising quality (detail kept, noise "
+                                  "removed). More bars = cleaner output.")
+        self._quality.pack(anchor="w", pady=(S(3), 0))
+        self._size = RatingBar(right, "Footprint", 3, AMBER,
+                               "Model size + compute / memory cost. More bars = "
+                               "heavier (needs more capable hardware).")
+        self._size.pack(anchor="w", pady=(S(3), 0))
+
+        foot = tk.Frame(detail, bg=WHITE)
+        foot.pack(fill="x", pady=(S(8), 0))
+        self._bestfor = tk.Label(foot, text="", bg="#FCEEF2", fg=RASPBERRY_DK,
+                                 font=font(9, "bold"))
+        self._bestfor.pack(anchor="w")
+        self._hw_lbl = tk.Label(detail, text="", bg=WHITE, fg=SUBTLE, font=font(9),
+                                wraplength=S(560), justify="left", anchor="w")
+        self._hw_lbl.pack(anchor="w", pady=(S(4), 0))
+
+        self._refresh_chips()
+        self._refresh_detail()
+
+    def _build_chip(self, parent, key, r, c):
+        info = FAMILY_INFO[key]
+        color = CATEGORY_COLOR[info["group"]]
+        chip = tk.Frame(parent, bg=WHITE, highlightthickness=2,
+                        highlightbackground=LINE, highlightcolor=LINE,
+                        cursor="hand2")
+        chip.grid(row=r, column=c, sticky="nsew", padx=S(4), pady=S(4))
+        pad = tk.Frame(chip, bg=WHITE)
+        pad.pack(fill="both", expand=True, padx=S(9), pady=S(7))
+        top = tk.Frame(pad, bg=WHITE)
+        top.pack(fill="x")
+        tk.Frame(top, bg=color, width=S(8), height=S(8)).pack(side="left",
+                                                              padx=(0, S(5)))
+        name = tk.Label(top, text=info["label"], bg=WHITE, fg=INK,
+                        font=font(10, "bold"))
+        name.pack(side="left")
+        tag = tk.Label(pad, text=info["tagline"], bg=WHITE, fg=SUBTLE,
+                       font=font(8), wraplength=S(150), justify="left", anchor="w")
+        tag.pack(anchor="w", pady=(S(3), 0))
+        self._chips[key] = {"chip": chip, "pad": pad, "top": top, "name": name,
+                            "tag": tag}
+        ToolTip.attach(chip, f"{info['label']} — {info['tagline']}")
+        for w in (chip, pad, top, name, tag):
+            w.bind("<Button-1>", lambda _e, k=key: self._select(k))
+
+    def _select(self, key):
+        if not self._enabled or self.var.get() == key:
+            return
+        self.var.set(key)
+        self._refresh_chips()
+        self._refresh_detail()
+        if self.command:
+            self.command()
+
+    def _refresh_chips(self):
+        sel = self.var.get()
+        for key, parts in self._chips.items():
+            on = key == sel
+            bg = "#FCEEF2" if on else WHITE
+            border = CATEGORY_COLOR[FAMILY_INFO[key]["group"]] if on else LINE
+            parts["chip"].configure(highlightbackground=border, highlightcolor=border,
+                                    bg=bg)
+            for nm in ("pad", "top", "name", "tag"):
+                try:
+                    parts[nm].configure(bg=bg)
+                except Exception:
+                    pass
+
+    def _refresh_detail(self):
+        key = self.var.get()
+        info = FAMILY_INFO.get(key, {})
+        self._name_lbl.config(text=info.get("label", key))
+        self._badge_lbl.config(text=f" {info.get('group', '').upper()} ")
+        self._tag_lbl.config(text=info.get("tagline", ""))
+        self._how_lbl.config(text=info.get("how", ""))
+        self._speed.set(info.get("speed", 3))
+        self._quality.set(info.get("quality", 3))
+        self._size.set(info.get("size", 3))
+        self._bestfor.config(text=f"  Best for: {info.get('best_for', '')}  ")
+        self._hw_lbl.config(text="Hardware: " + info.get("hw", ""))
+        self.diagram.delete("all")
+        self.diagram.update_idletasks()
+        w = self.diagram.winfo_width() or S(300)
+        h = self.diagram.winfo_height() or S(150)
+        draw_arch_diagram(self.diagram, key, w, h)
+
+    def get(self):
+        return self.var.get()
+
+    def set(self, value):
+        if value in self._chips:
+            self.var.set(value)
+            self._refresh_chips()
+            self._refresh_detail()
+
+    def set_enabled(self, on: bool):
+        self._enabled = on
 
 
 class LiveView(tk.Toplevel):
@@ -4157,7 +4772,7 @@ class App(tk.Tk):
                  font=font(8, "bold")).pack(side="left", padx=(S(10), 0))
 
     def _radio(self, parent, text, value, enabled, badge=None,
-               variable=None, desc=None, command=None):
+               variable=None, desc=None, command=None, help=None):
         variable = variable if variable is not None else self.mode_var
         fr = tk.Frame(parent, bg=WHITE)
         fr.pack(fill="x", pady=S(4))
@@ -4173,34 +4788,42 @@ class App(tk.Tk):
         rb.pack(side="left")
         if badge:
             self._badge(top, badge)
+        if help:
+            InfoDot(top, help).pack(side="left", padx=(S(6), 0))
         if desc:
             tk.Label(fr, text="     " + desc, bg=WHITE,
                      fg=(SUBTLE if enabled else "#C4C4C4"),
                      font=font(9), wraplength=S(560),
                      justify="left").pack(anchor="w")
 
-    def _check(self, parent, text, desc, variable, command=None):
+    def _check(self, parent, text, desc, variable, command=None, help=None):
         fr = tk.Frame(parent, bg=WHITE)
         fr.pack(fill="x", pady=S(6))
+        top = tk.Frame(fr, bg=WHITE); top.pack(fill="x")
         cb = tk.Checkbutton(
-            fr, text="  " + text, variable=variable, onvalue=True, offvalue=False,
+            top, text="  " + text, variable=variable, onvalue=True, offvalue=False,
             bg=WHITE, fg=INK, selectcolor=WHITE, activebackground=WHITE,
             activeforeground=INK, font=font(11, "bold"), anchor="w",
             highlightthickness=0, bd=0, command=command)
-        cb.pack(anchor="w")
+        cb.pack(side="left")
+        if help:
+            InfoDot(top, help).pack(side="left", padx=(S(6), 0))
         if desc:
             tk.Label(fr, text="     " + desc, bg=WHITE, fg=SUBTLE,
                      font=font(9), wraplength=S(560),
                      justify="left").pack(anchor="w")
         return cb
 
-    def _entry_row(self, parent, key, title, desc, default=""):
+    def _entry_row(self, parent, key, title, desc, default="", help=None):
         row = tk.Frame(parent, bg=WHITE)
         row.pack(fill="x", pady=S(6))
         row.columnconfigure(0, weight=1)
         left = tk.Frame(row, bg=WHITE); left.grid(row=0, column=0, sticky="w")
-        title_lbl = tk.Label(left, text=title, bg=WHITE, fg=INK, font=font(11, "bold"))
-        title_lbl.pack(anchor="w")
+        title_row = tk.Frame(left, bg=WHITE); title_row.pack(anchor="w", fill="x")
+        title_lbl = tk.Label(title_row, text=title, bg=WHITE, fg=INK, font=font(11, "bold"))
+        title_lbl.pack(side="left")
+        if help:
+            InfoDot(title_row, help).pack(side="left", padx=(S(6), 0))
         tk.Label(left, text=desc, bg=WHITE, fg=SUBTLE, font=font(9)).pack(anchor="w")
         var = tk.StringVar(value=str(default))
         ent = ttk.Entry(row, textvariable=var, width=18, font=font(10))
@@ -4223,8 +4846,10 @@ class App(tk.Tk):
 
     # -- Form view (step-by-step wizard) -------------------------------------
     def _add_rows(self, parent, specs):
-        for key, title, desc, values, default in specs:
-            row = ConfigRow(parent, title, desc, values, default)
+        for spec in specs:
+            key, title, desc, values, default = spec[:5]
+            help_txt = spec[5] if len(spec) > 5 else None
+            row = ConfigRow(parent, title, desc, values, default, help=help_txt)
             row.pack(fill="x", pady=S(6))
             self.rows[key] = row
 
@@ -4355,18 +4980,27 @@ class App(tk.Tk):
             body, "Test ALL sensor profiles (sweep only)",
             "Sweep mode: also vary the sensor so the leaderboard shows which model "
             "suits which camera (3× the runs).",
-            self.all_sensors_var, command=self._on_eval_change)
+            self.all_sensors_var, command=self._on_eval_change,
+            help="Only in Sweep mode. Runs every model against all three sensors so "
+                 "the leaderboard tells you which network suits which camera. Takes "
+                 "about 3× as long.")
 
     def _step_data(self, body):
         self._section(body, "LEVEL 1 · CAPTURE SOURCE")
         self._radio(body, "Simulated capture", "sim", enabled=True,
                     variable=self.source_var,
                     desc="Synthesise a noisy frame from the sensor's noise physics.",
-                    command=self._on_source_change)
+                    command=self._on_source_change,
+                    help="No camera needed. The tool fakes a realistic noisy frame "
+                         "from the chosen sensor's physics — great for a quick trial "
+                         "before you have real captures.")
         self._radio(body, "Real captures", "real", enabled=True,
                     variable=self.source_var, badge="REAL DATA",
                     desc="Load real frames; paired noisy/gt folders are auto-detected.",
-                    command=self._on_source_change)
+                    command=self._on_source_change,
+                    help="Use your own captured frames. Point at a folder of "
+                         "noisy/clean (gt) pairs and the tool finds them "
+                         "automatically. Best accuracy for your real hardware.")
 
         ds_row = tk.Frame(body, bg=WHITE)
         ds_row.pack(fill="x", pady=(S(8), S(2)))
@@ -4393,12 +5027,18 @@ class App(tk.Tk):
 
         self.filter_var = self._entry_row(
             body, "filter", "Dataset Filter",
-            "Keyword filter for folders (e.g. imx662 or imx219 ag12)", "imx662")
+            "Keyword filter for folders (e.g. imx662 or imx219 ag12)", "imx662",
+            help="Only load capture folders whose name contains these words. "
+                 "Handy when one dataset holds several sensors or gain levels — "
+                 "e.g. 'imx219 ag12' picks just those.")
         vg = ConfigRow(
             body, "Validation Gain",
             "Which capture the validation matrix tests on across an analog-gain "
             "sweep: high = noisiest (default), low = cleanest, or a gain (e.g. 512)",
-            ["high", "512", "256", "low", "first"], "high")
+            ["high", "512", "256", "low", "first"], "high",
+            help="Which capture the before/after result is scored on. 'high' uses "
+                 "the noisiest (hardest) frame — a good worst-case check; 'low' uses "
+                 "the cleanest; or pick a specific analog gain.")
         vg.pack(fill="x", pady=S(6))
         self.rows["validate_gain"] = vg
         self.sim_noise_cb = self._check(
@@ -4413,9 +5053,15 @@ class App(tk.Tk):
         self._section(body, "LEVEL 2 · GROUND TRUTH / DATA")
         self._add_rows(body, [
             ("frames", "Temporal Frames",
-             "Synthetic GT only — averaged reads for simulated capture", [64, 128, 256], 256),
+             "Synthetic GT only — averaged reads for simulated capture", [64, 128, 256], 256,
+             "The clean 'answer' image is made by averaging this many simulated "
+             "reads. More frames = a cleaner target to learn from, but slower "
+             "setup. Only used for simulated capture."),
             ("gain", "Sensor Gain",
-             "Synthetic/sim only — analog gain of the injected noise", [256, 512], 256),
+             "Synthetic/sim only — analog gain of the injected noise", [256, 512], 256,
+             "How much the simulated sensor amplifies the signal in the dark. "
+             "Higher gain = brighter but much noisier — a harder, more realistic "
+             "low-light test."),
         ])
         tk.Label(body, text="     Real paired folders take ground truth from disk; "
                  "temporal frames and gain apply only to synthetic capture (or when "
@@ -4426,15 +5072,23 @@ class App(tk.Tk):
         self._section(body, "RUN MODE")
         self._radio(body, "Single Frame Calibration", "single", enabled=True,
                     desc="Calibrate + evaluate on one frame.",
-                    command=self._on_mode_change)
+                    command=self._on_mode_change,
+                    help="Fastest option: tune and score the model on one image. "
+                         "Ideal for a quick look at how a model performs.")
         self._radio(body, "Batch Folder Calibration", "batch", enabled=True,
                     badge="MULTI-IMAGE",
                     desc="Train across many frames in a folder; metrics are averaged.",
-                    command=self._on_mode_change)
+                    command=self._on_mode_change,
+                    help="Trains across many frames in a folder and averages the "
+                         "scores — a more reliable measure of real-world quality. "
+                         "Slower than single-frame.")
         self._radio(body, "Temporal Video Denoise", "temporal", enabled=True,
                     badge="VIDEO",
                     desc="Recursive burst denoising of a frame sequence (IIR blend).",
-                    command=self._on_mode_change)
+                    command=self._on_mode_change,
+                    help="For video / bursts: cleans a sequence of frames using the "
+                         "previous frames' results, so motion stays smooth. Use with "
+                         "the video model families.")
         self.batch_var = self._entry_row(
             body, "batch", "Batch Size", "Frames to load in batch mode", "6")
         self.burst_var = self._entry_row(
@@ -4453,31 +5107,31 @@ class App(tk.Tk):
                     width=160, height=36).grid(row=0, column=1, sticky="e")
 
     def _step_model(self, body):
-        self._section(body, "LEVEL 3 · MODEL ARCHITECTURE")
+        self._section(body, "STEP 3 · CHOOSE A MODEL")
         self.model_intro = tk.Label(
             body, text="", bg=WHITE, fg=RASPBERRY, font=font(9, "bold"),
             wraplength=S(560), justify="left")
-        self.model_intro.pack(anchor="w", pady=(0, S(4)))
-        fam_row = ConfigRow(body, "Model Family",
-                            "CNN · DnCNN · U-Net · RED-Net · RIDNet · NAFNet · "
-                            "FFDNet · DRUNet · Restormer · Attn-U-Net² · EAMamba · "
-                            "UnifyFormer · ReMoNet · EMVD · MSTMN (video)",
-                            ["cnn", "dncnn", "unet", "rednet", "ridnet", "nafnet",
-                             "ffdnet", "drunet", "restormer",
-                             "attn_unet2", "eamamba", "unifyformer",
-                             "remonet", "emvd", "mstmn"],
-                            "nafnet", command=self._on_family_change)
-        fam_row.pack(fill="x", pady=S(6))
+        self.model_intro.pack(anchor="w", pady=(0, S(2)))
+        tk.Label(body, text="Click a family to see how it works. Hover any "
+                 "\u24d8 for a plain-language explanation.",
+                 bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
+                 justify="left").pack(anchor="w", pady=(0, S(6)))
+        fam_row = ModelFamilySelector(body, default="nafnet",
+                                      command=self._on_family_change)
+        fam_row.pack(fill="x", pady=S(2))
         self.rows["model_family"] = fam_row
+
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(12), 0))
+        self._section(body, "FINE-TUNE THE ARCHITECTURE")
         self.model_box = tk.Frame(body, bg=WHITE)
         self.model_box.pack(fill="x")
         self._render_model_options()
 
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(14), 0))
-        self._section(body, "EXTERNAL MODELS · HUGGING FACE HUB")
-        tk.Label(body, text="     Pretrained denoisers from the Hub (Apache-2.0 / MIT). "
-                 "Freeze a commit, then DOWNLOAD & USE — the next compile loads those "
-                 "weights instead of training.",
+        self._section(body, "OR START FROM A PRETRAINED MODEL · HUGGING FACE")
+        tk.Label(body, text="     Load a ready-made denoiser from the Hub "
+                 "(Apache-2.0 / MIT only) instead of training from scratch. Freeze a "
+                 "version, then DOWNLOAD & USE.",
                  bg=WHITE, fg=SUBTLE, font=font(9), wraplength=S(560),
                  justify="left").pack(anchor="w", pady=(0, S(6)))
         hf_row = tk.Frame(body, bg=WHITE); hf_row.pack(fill="x", pady=S(4))
@@ -4489,10 +5143,14 @@ class App(tk.Tk):
         self._refresh_hf_active_label()
 
     def _step_hw(self, body):
-        self._section(body, "LEVELS 4 & 6 · HARDWARE COMPILER TARGET")
+        self._section(body, "LEVELS 4 & 6 · TARGET HARDWARE")
         self._add_rows(body, [
-            ("hardware", "Target Hardware", "Pi 5 CPU · Hailo-8 · DeepX · Intel NPU",
-             ["rpi5_cpu", "hailo8", "deepx", "intel_npu"], "intel_npu"),
+            ("hardware", "Target Hardware", "The chip you'll deploy the model on",
+             ["rpi5_cpu", "hailo8", "deepx", "intel_npu"], "intel_npu",
+             "The chip you'll run the model on. The compiler tailors and scores the "
+             "model for it: Pi 5 CPU = no accelerator (most flexible, slowest); "
+             "Hailo-8 / DeepX = INT8 AI accelerators (fast, low-power); Intel NPU = "
+             "the accelerator in Intel Core Ultra."),
         ])
         self.hw_note = tk.Label(body, text="", bg=WHITE, fg=SUBTLE, font=font(9),
                                 wraplength=S(560), justify="left")
@@ -4514,13 +5172,19 @@ class App(tk.Tk):
         self._section(body, "LEVEL 5 · CALIBRATION & QUANTIZATION")
         self._add_rows(body, [
             ("steps", "Calibration", "Live fit iterations (lower = faster)",
-             [150, 300, 500, 800], 300),
+             [150, 300, 500, 800], 300,
+             "How many training steps the model gets on your frame(s). More steps = "
+             "better quality but a longer wait. 300 is a good balance for a demo."),
         ])
 
         loss_row = LossSelector(
             body, "Loss Function",
             "Tick one or more terms — several are summed (Loss = Σ weight·term)",
-            "l1_perceptual_edge", command=self._on_loss_change)
+            "l1_perceptual_edge", command=self._on_loss_change,
+            help="What the model is told to optimise for. Each term rewards a "
+                 "different quality: l1/l2 = overall accuracy, ssim = structure, "
+                 "perceptual = looks natural, edge/swt = keep sharp detail. Tick "
+                 "several and they're combined. Defaults are sensible.")
         loss_row.pack(fill="x", pady=S(6))
         self.rows["loss"] = loss_row
         self.loss_box = tk.Frame(body, bg=WHITE)
@@ -4529,7 +5193,11 @@ class App(tk.Tk):
 
         self._check(body, "INT8 quantization (PTQ)",
                     "Quantize weights + activations for the accelerator target.",
-                    self.quantize_var)
+                    self.quantize_var,
+                    help="Shrinks the model to 8-bit integers so AI accelerators "
+                         "(Hailo-8 / DeepX / NPU) can run it fast and power-"
+                         "efficiently. A tiny quality trade-off. Required for those "
+                         "chips; optional on the Pi CPU.")
         raw_row = tk.Frame(body, bg=WHITE)
         raw_row.pack(fill="x", pady=S(6))
         raw_row.columnconfigure(0, weight=1)
@@ -4544,14 +5212,21 @@ class App(tk.Tk):
         self._check(body, "Quantization-Aware Training (QAT)",
                     "Train with INT8 fake-quant in the loop (STE) to recover "
                     "quantization loss. Auto-on for gelu→DeepX / non-native acts.",
-                    self.qat_var)
+                    self.qat_var,
+                    help="Lets the model practise with 8-bit rounding during "
+                         "training so it recovers the small quality lost to INT8. "
+                         "Slower to train, but the best accuracy on accelerators. "
+                         "Turns on automatically when a chip needs it.")
 
         tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(S(8), 0))
         self._check(body, "Extended training on the full dataset",
                     "After the quick calibration, keep training on EVERY paired "
                     "image in the dataset (all of PI_RAW). Much stronger denoising, "
                     "but slower. Recommended when you have real captures.",
-                    self.extended_train_var, command=self._on_extended_toggle)
+                    self.extended_train_var, command=self._on_extended_toggle,
+                    help="After the quick fit, keep training across every image in "
+                         "your dataset for a much stronger denoiser. Slower, but "
+                         "recommended once you have real captures to learn from.")
         ext_row = tk.Frame(body, bg=WHITE)
         ext_row.pack(fill="x", pady=(0, S(4)))
         ext_row.columnconfigure(0, weight=1)
@@ -5754,13 +6429,16 @@ class App(tk.Tk):
         fam = self.rows["model_family"].get()
         topo = getattr(self, "_nafnet_topo", {"enc": "", "mid": "", "dec": ""})
 
-        def cfgrow(key, title, desc, values, default):
-            r = ConfigRow(self.model_box, title, desc, values, default)
+        def cfgrow(key, title, desc, values, default, help=None):
+            r = ConfigRow(self.model_box, title, desc, values, default, help=help)
             r.pack(fill="x", pady=S(6))
             self.rows[key] = r
 
         cfgrow("base_channels", "Base Channels", "Network width",
-               [16, 32, 64], _choice_int(prev.get("base_channels"), 32))
+               [16, 32, 64], _choice_int(prev.get("base_channels"), 32),
+               help="How 'wide' the network is (feature channels). More = higher "
+                    "quality but bigger and slower. 32 is a solid balance; 16 for "
+                    "tiny/fast, 64 for maximum quality.")
         depth_vals = [2, 4, 8]
         if fam == "rednet":
             depth_desc = "RED blocks per encoder stage (minimum 2)"
@@ -5791,7 +6469,10 @@ class App(tk.Tk):
         cfgrow("block_depth", "Block Depth", depth_desc,
                depth_vals,
                max(_choice_int(prev.get("block_depth"), 4),
-                   2 if fam == "rednet" else 0))
+                   2 if fam == "rednet" else 0),
+               help="How 'deep' the network is (number of processing blocks). "
+                    "Deeper = more capacity for tough noise, but slower and larger. "
+                    "4 is a good default.")
 
         if fam == "nafnet":
             tk.Label(self.model_box,
@@ -5820,25 +6501,30 @@ class App(tk.Tk):
                      justify="left").pack(anchor="w", pady=(S(2), 0))
         else:
             cfgrow("conv_type", "Convolution", "Standard or depthwise-separable",
-                   ["standard", "depthwise"], prev.get("conv_type", "depthwise"))
+                   ["standard", "depthwise"], prev.get("conv_type", "depthwise"),
+                   help="'depthwise' is a lighter, faster convolution that most "
+                        "NPUs love — usually the best default. 'standard' is a bit "
+                        "heavier but can squeeze out slightly more quality.")
             cfgrow("activation", "Activation",
                    "gelu on DeepX forces QAT injection",
-                   ["relu", "gelu", "silu"], prev.get("activation", "relu"))
+                   ["relu", "gelu", "silu"], prev.get("activation", "relu"),
+                   help="The non-linear function between layers. 'relu' is the "
+                        "safest and most hardware-portable. 'gelu'/'silu' can lift "
+                        "quality but may not run natively on every NPU (gelu on "
+                        "DeepX triggers quantization-aware training).")
 
     def _on_eval_change(self):
         sweep = self.eval_var.get() == "sweep"
         if hasattr(self, "model_intro"):
             if sweep:
                 self.model_intro.config(
-                    text="     Sweep mode: all 9 families are trained & ranked. The "
-                         "settings below pin the width / conv / activation used for "
-                         "every family (depth is swept); the family choice itself is "
-                         "ignored.")
+                    text="Sweep mode: every family is trained and ranked for you, so "
+                         "the pick below is just a preview — the fine-tune settings "
+                         "still set the width / conv / activation swept.")
             else:
                 self.model_intro.config(
-                    text="     Pick a family first — the options adapt to it (e.g. "
-                         "NAFNet / Restormer have no separate activation). These are "
-                         "the exact parameters that get compiled.")
+                    text="Compile mode: the family you pick is the one that gets "
+                         "built. Options below adapt to it.")
         if hasattr(self, "all_sensors_cb"):
             try:
                 self.all_sensors_cb.config(state="normal" if sweep else "disabled")
