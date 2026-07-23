@@ -54,7 +54,8 @@ def burst_to_clean_packed(
     files = sorted(Path(burst_dir).glob("*.dng"))
     if not files:
         raise FileNotFoundError(f"No .dng under {burst_dir}")
-    use = files[:limit]
+    # limit <= 0 → use every available frame (max averaging).
+    use = files if int(limit) <= 0 else files[: int(limit)]
     if mode == "mean":
         return burst_clean(use, limit=len(use))
     if mode == "alpha_trim":
@@ -174,12 +175,16 @@ def build_burst_clean_cache(
     tags: Iterable[str] = ("ag1",),
     half: bool = True,
     log: bool = True,
+    force_rebuild: bool = False,
 ) -> list[dict]:
     """Cache one packed-clean ``.npy`` per burst under ``cache_root/``.
 
     Uses ``ag1`` (lowest-noise) sub-bursts by default because those are what
     average down to the cleanest frames.  Higher-gain bursts *can* be used
     but they contribute more residual noise at every intensity.
+
+    Set ``force_rebuild=True`` to ignore existing ``.npy`` caches (needed when
+    raising ``limit`` / tightening ``alpha_trim`` for cleaner GT).
     """
     bursts_root = Path(bursts_root)
     cache_root = Path(cache_root)
@@ -191,28 +196,33 @@ def build_burst_clean_cache(
         for tag in sorted(scene_dir.iterdir()):
             if not tag.is_dir() or tag.name not in tag_set:
                 continue
-            if not any(tag.glob("*.dng")):
+            n_dng = len(list(tag.glob("*.dng")))
+            if n_dng < 1:
                 continue
             out = cache_root / f"{scene_dir.name}__{tag.name}.npy"
-            if out.exists():
+            n_use = n_dng if int(limit) <= 0 else min(int(limit), n_dng)
+            if out.exists() and not force_rebuild:
                 if log:
                     print(f"  keep  {out.relative_to(cache_root)}", flush=True)
                 arr_shape = np.load(out, mmap_mode="r").shape
                 manifest.append({"path": str(out), "shape": list(arr_shape),
                                  "source": "burst", "scene": scene_dir.name,
-                                 "burst_tag": tag.name})
+                                 "burst_tag": tag.name,
+                                 "n_frames_used": n_use, "mode": mode})
                 continue
             if log:
                 print(f"  build {out.relative_to(cache_root)}  "
-                      f"(mode={mode}, N≤{limit})", flush=True)
-            gt = burst_to_clean_packed(tag, limit=limit, mode=mode,
+                      f"(mode={mode}, N={n_use}/{n_dng}, trim={alpha_trim})",
+                      flush=True)
+            gt = burst_to_clean_packed(tag, limit=n_use, mode=mode,
                                        alpha_trim=alpha_trim)
             _write_npy(gt, out, half=half)
             manifest.append({"path": str(out), "shape": list(gt.shape),
                              "source": "burst", "scene": scene_dir.name,
                              "burst_tag": tag.name,
-                             "n_frames_used": min(limit, len(list(tag.glob('*.dng')))),
-                             "mode": mode})
+                             "n_frames_used": n_use,
+                             "mode": mode,
+                             "alpha_trim": float(alpha_trim)})
     return manifest
 
 

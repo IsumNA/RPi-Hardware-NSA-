@@ -50,6 +50,7 @@ from nsa.flow_matching import (
     update_ema,
 )
 from nsa.inference import psnr, ssim, to_image, to_tensor
+from nsa.lite_cfm_student import LiteCfmStudent, build_cfm_student, wrap_deploy
 from nsa.raw_domain import RawDenoiser
 from train_stream_to_gt import (
     DEFAULT_GAINS,
@@ -57,7 +58,13 @@ from train_stream_to_gt import (
     _export_onnx,
     build_pairs,
 )
-from train_cfm_teacher import DISPLAY_GAIN, _rgb, _rgb_t, _sample_cond_clean
+from train_cfm_teacher import (
+    DISPLAY_GAIN,
+    _rgb,
+    _rgb_t,
+    _sample_cond_clean,
+    _load_dump_pairs,
+)
 
 
 def _device() -> torch.device:
@@ -165,6 +172,28 @@ def _grad_energy_match(
     return ((gp / gt) - 1.0).abs()
 
 
+def _lowfreq_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    kernels: tuple[int, ...] = (16, 32),
+) -> torch.Tensor:
+    """Penalise low-frequency deviation from GT — the flat-region 'blotch' /
+    slow colour drift the eye integrates but plain L1 ignores (measured
+    amplitude ≈0.003–0.009, invisible to per-pixel L1). Compares non-overlapping
+    block means at several large scales. Because it's a difference vs the
+    target, legitimate low-freq shading/vignetting present in GT is preserved —
+    only blotches GT lacks are punished."""
+    total = pred.new_zeros(())
+    n = 0
+    for k in kernels:
+        ks = int(min(k, pred.shape[-1], pred.shape[-2]))
+        if ks < 2:
+            continue
+        total = total + F.l1_loss(F.avg_pool2d(pred, ks), F.avg_pool2d(target, ks))
+        n += 1
+    return total / max(n, 1)
+
+
 def _l1_grad(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -187,12 +216,15 @@ def _packed_rgb_t(pk: torch.Tensor) -> torch.Tensor:
     return torch.clamp(torch.cat([r, g, b], dim=1) * DISPLAY_GAIN, 0.0, 1.0)
 
 
-def _l1_lpips(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _l1_lpips(
+    pred: torch.Tensor, target: torch.Tensor, *, lpips_w: float = 0.1,
+) -> torch.Tensor:
     """L1 on packed 4ch + LPIPS on display-gain RGB."""
     from nsa.inference import _perceptual_loss
     return (
         F.l1_loss(pred, target)
-        + 0.1 * _perceptual_loss(_packed_rgb_t(pred), _packed_rgb_t(target))
+        + float(lpips_w) * _perceptual_loss(
+            _packed_rgb_t(pred), _packed_rgb_t(target))
     )
 
 
@@ -205,6 +237,7 @@ def _make_sample_loss(*, name: str = "l1") -> tuple:
     ``l1_hf`` adds a high-frequency L1 term (detail matching) to push texture
     without the over-smooth of swtrel.
     ``l1_grad`` adds explicit ∇ match (best for targeting grad_ratio≈1).
+    ``l1_lpips05`` softens LPIPS (less fake painted texture) vs ``l1_lpips``.
     """
     key = (name or "l1").strip().lower()
     if key in ("inv_luma", "inv_luma_l1", "inv-luma"):
@@ -216,9 +249,12 @@ def _make_sample_loss(*, name: str = "l1") -> tuple:
     if key in ("l1_hf", "l1+hf", "l1hf"):
         print("Sample-match loss: l1_hf (L1 + high-freq L1×0.35)", flush=True)
         return _l1_hf, "l1_hf"
+    if key in ("l1_lpips05", "l1_lpips_soft", "l1lpips05"):
+        print("Sample-match loss: l1_lpips05 (L1 + LPIPS×0.05 on RGB)", flush=True)
+        return (lambda a, b: _l1_lpips(a, b, lpips_w=0.05)), "l1_lpips05"
     if key in ("l1_lpips", "l1+lpips", "l1lpips"):
         print("Sample-match loss: l1_lpips (L1 + LPIPS×0.1 on RGB)", flush=True)
-        return _l1_lpips, "l1_lpips"
+        return (lambda a, b: _l1_lpips(a, b, lpips_w=0.1)), "l1_lpips"
     if key in ("l2", "mse"):
         print("Sample-match loss: l2 (mse)", flush=True)
         return (lambda a, b: F.mse_loss(a, b)), "l2"
@@ -270,33 +306,92 @@ def load_cloud_pack(pack_data: Path) -> tuple[
     return pairs, evals, meta
 
 
-def _load_dump_tensors(dump_root: Path) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Load offline (cond, teacher_clean) pairs from ``dump_cfm_teacher_samples``."""
+def _load_dump_tensors(
+    dump_root: Path,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[int]]:
+    """Load (cond, target) pairs + parallel gains from dump/synth shards.
+
+    Accepts either dump keys ``cond``/``teacher`` or synth keys ``noisy``/``gt``.
+    Gain comes from the npz ``gain`` field or the index record (default 128).
+    """
     idx_path = dump_root / "index.json"
     if not idx_path.is_file():
         raise FileNotFoundError(f"Missing dump index: {idx_path}")
     index = json.loads(idx_path.read_text())
     tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
+    pair_gains: list[int] = []
+    n_dump = n_synth = 0
     for rec in index.get("samples", []):
         rel = rec.get("file") or rec.get("path")
         if not rel:
             continue
         path = dump_root / rel
-        if path.suffix == ".npz":
-            blob = np.load(path)
+        if path.suffix != ".npz":
+            raise ValueError(f"Unsupported dump file: {path}")
+        blob = np.load(path)
+        keys = set(blob.files)
+        if "cond" in keys and "teacher" in keys:
             cond = np.asarray(blob["cond"], dtype=np.float32)
             teacher = np.asarray(blob["teacher"], dtype=np.float32)
-            if cond.ndim == 4:
-                cond = cond.squeeze(0).transpose(1, 2, 0)
-            if teacher.ndim == 4:
-                teacher = teacher.squeeze(0).transpose(1, 2, 0)
+            n_dump += 1
+        elif "noisy" in keys and "gt" in keys:
+            cond = np.asarray(blob["noisy"], dtype=np.float32)
+            teacher = np.asarray(blob["gt"], dtype=np.float32)
+            n_synth += 1
         else:
-            raise ValueError(f"Unsupported dump file: {path}")
+            raise ValueError(
+                f"Unsupported npz keys in {path}: {sorted(keys)} "
+                f"(need cond/teacher or noisy/gt)")
+        if cond.ndim == 4:
+            cond = cond.squeeze(0).transpose(1, 2, 0)
+        if teacher.ndim == 4:
+            teacher = teacher.squeeze(0).transpose(1, 2, 0)
+        if "gain" in keys:
+            gain = int(np.asarray(blob["gain"]).reshape(-1)[0])
+        else:
+            gain = int(rec.get("gain", 128))
         tensors.append((to_tensor(cond), to_tensor(teacher)))
+        pair_gains.append(gain)
     if not tensors:
         raise RuntimeError(f"No samples in {idx_path}")
-    print(f"Loaded {len(tensors)} dump pairs from {dump_root}", flush=True)
-    return tensors
+    print(
+        f"Loaded {len(tensors)} pairs from {dump_root} "
+        f"(teacher_dumps={n_dump}, synth={n_synth})",
+        flush=True,
+    )
+    return tensors, pair_gains
+
+
+def _warm_start_expand_head(
+    student: nn.Module,
+    istate: dict,
+) -> dict:
+    """Copy checkpoint weights; expand head when adding a gain channel."""
+    sw = student.state_dict()
+    out = {k: v for k, v in istate.items() if k in sw}
+    if "head.weight" not in out or "head.weight" not in sw:
+        return out
+    ow = out["head.weight"]
+    nw = sw["head.weight"]
+    if ow.shape == nw.shape:
+        return out
+    if (
+        ow.ndim == 4 and nw.ndim == 4
+        and ow.shape[0] == nw.shape[0]
+        and ow.shape[2:] == nw.shape[2:]
+        and nw.shape[1] == ow.shape[1] + 1
+    ):
+        expanded = nw.clone()
+        expanded[:, : ow.shape[1]] = ow
+        # New gain channel starts at 0 so warm-start matches no-gain behavior.
+        expanded[:, ow.shape[1] :] = 0
+        out["head.weight"] = expanded
+        print(
+            f"Warm-start: expanded head {tuple(ow.shape)} → {tuple(nw.shape)} "
+            "(gain ch zeros)",
+            flush=True,
+        )
+    return out
 
 
 def _train_regression_from_dumps(
@@ -314,16 +409,37 @@ def _train_regression_from_dumps(
     sample_loss=None,
     sample_loss_name: str = "l1",
     best_path: Path | None = None,
+    early_abort_soft: bool = False,
+    early_abort_after: int = 200,
+    pair_gains: list[int] | None = None,
+    gain_channel: bool = False,
+    gt_hf_weight: float = 0.0,
+    gt_grad_energy_weight: float = 0.0,
+    gt_lowfreq_weight: float = 0.0,
 ) -> RawDenoiser:
     """Stage A: match fixed offline teacher ODE outputs (no live teacher forward)."""
     wts = torch.tensor(
         [1.0 / max(float(n[..., :4].mean()), 1e-3) for n, _ in tensors],
         dtype=torch.float32)
     wts = (wts / wts.mean()).clamp(0.25, 8.0)
+    use_gain = bool(gain_channel) and pair_gains is not None
+    gt_hf_weight = float(gt_hf_weight)
+    gt_grad_energy_weight = float(gt_grad_energy_weight)
+    gt_lowfreq_weight = float(gt_lowfreq_weight)
 
     if sample_loss is None:
         sample_loss, sample_loss_name = _make_sample_loss()
-    print(f"Distill loss: {sample_loss_name} vs offline teacher dumps", flush=True)
+    print(
+        f"Distill loss: {sample_loss_name} vs offline teacher dumps"
+        + (f" + GT-HF×{gt_hf_weight}" if gt_hf_weight > 0 else "")
+        + (f" + GT-|∇|×{gt_grad_energy_weight}" if gt_grad_energy_weight > 0 else "")
+        + (f" + GT-LF×{gt_lowfreq_weight}" if gt_lowfreq_weight > 0 else "")
+        + ("  [gain channel]" if use_gain else ""),
+        flush=True,
+    )
+    if early_abort_soft:
+        print(f"Early-abort soft: after step {early_abort_after} if best≤100 "
+              f"and probe_gr softens below 0.97", flush=True)
 
     opt = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-4)
     warmup = max(1, steps // 20)
@@ -342,14 +458,31 @@ def _train_regression_from_dumps(
     t0 = time.time()
     best_score = -1.0
     best_state = None
+    best_step = 0
     skipped = 0
+    soft_streak = 0
 
     for i in range(steps):
-        cond, target = _sample_cond_clean(tensors, crop, batch, g, wts)
-        cond, target = cond.to(device), target.to(device)
+        if use_gain:
+            cond, target, gain = _sample_cond_clean(
+                tensors, crop, batch, g, wts, pair_gains)
+            cond, gain = _prep_student_cond(cond, gain, gain_channel=True)
+            cond = cond.to(device)
+            target = target.to(device)
+        else:
+            cond, target = _sample_cond_clean(tensors, crop, batch, g, wts)
+            cond, target = cond.to(device), target.to(device)
         opt.zero_grad(set_to_none=True)
         pred = student(cond)
         loss = sample_loss(pred, target)
+        # Synth/dump targets are clean GT — HF / |∇| push sharpness (grad≈1).
+        if gt_hf_weight > 0:
+            loss = loss + gt_hf_weight * _highfreq_l1(pred, target)
+        if gt_grad_energy_weight > 0:
+            loss = loss + gt_grad_energy_weight * _grad_energy_match(pred, target)
+        # Flat-region blotch / colour-drift suppression (see _lowfreq_l1).
+        if gt_lowfreq_weight > 0:
+            loss = loss + gt_lowfreq_weight * _lowfreq_l1(pred, target)
         if not torch.isfinite(loss):
             skipped += 1
             continue
@@ -363,8 +496,11 @@ def _train_regression_from_dumps(
                   f"{(time.time()-t0)/max(i,1):.2f}s/it", flush=True)
         if panel_every > 0 and ((i + 1) % panel_every == 0 or i == steps - 1):
             panel_ev = next((e for e in evals if e.get("gain", 0) >= 256), evals[0])
-            pout, gr = _save_eval_panel(student, panel_ev, device, panel_dir, i + 1)
-            probe, probe_gr = _quick_probe(student, evals[:6], device)
+            pout, gr = _save_eval_panel(
+                student, panel_ev, device, panel_dir, i + 1,
+                gain_channel=gain_channel)
+            probe, probe_gr = _quick_probe(
+                student, evals[:6], device, gain_channel=gain_channel)
             print(f"  probe mean PSNR={probe:.2f} dB  grad_ratio={probe_gr:.3f}",
                   flush=True)
             # Prefer sharpness (grad_ratio≈1) over PSNR — PSNR alone picks mush
@@ -372,6 +508,8 @@ def _train_regression_from_dumps(
                      + 0.5 * (20.0 * max(0.0, 1.0 - abs(probe_gr - 1.0))))
             if score > best_score:
                 best_score = score
+                best_step = i + 1
+                soft_streak = 0
                 best_state = {k: v.detach().cpu().clone()
                               for k, v in student.state_dict().items()}
                 if best_path is not None:
@@ -382,9 +520,21 @@ def _train_regression_from_dumps(
                         "panel_psnr": pout,
                         "probe_psnr": probe,
                         "probe_grad_ratio": probe_gr,
+                        "gain_channel": bool(gain_channel),
                     }, best_path)
                 print(f"  ★ best@{i+1}: panel={pout:.2f} probe={probe:.2f} "
                       f"grad_r={probe_gr:.3f} score={best_score:.2f}", flush=True)
+            elif probe_gr < 0.97:
+                soft_streak += 1
+            # Skip the rest when early peak already happened and we're mushing.
+            if (early_abort_soft
+                    and (i + 1) >= int(early_abort_after)
+                    and best_step > 0 and best_step <= 100
+                    and soft_streak >= 2):
+                print(f"  early-abort soft @step {i+1}: best@{best_step} "
+                      f"probe_gr={probe_gr:.3f} soft_streak={soft_streak} "
+                      f"— skipping likely reject", flush=True)
+                break
     if best_state is not None:
         student.load_state_dict(best_state)
         print(f"Restored best student (score={best_score:.2f})", flush=True)
@@ -409,7 +559,7 @@ def _deploy_model(student: nn.Module, method: str) -> nn.Module:
 
 
 def _train_consistency(
-    student: ConsistencyStudent,
+    student: nn.Module,
     teacher: FlowVelocityNet,
     pairs,
     steps: int,
@@ -435,7 +585,7 @@ def _train_consistency(
     gt_grad_weight: float = 0.0,
     gt_grad_energy_weight: float = 0.0,
     gt_hf_weight: float = 0.0,
-) -> ConsistencyStudent:
+) -> nn.Module:
     tensors = [(to_tensor(n), to_tensor(c[..., :4] if c.shape[-1] > 4 else c))
                for n, c in pairs]
     wts = torch.tensor(
@@ -605,6 +755,8 @@ def _train_regression_match(
     sample_loss=None,
     sample_loss_name: str = "l1",
     best_path: Path | None = None,
+    pair_gains: list[int] | None = None,
+    gain_channel: bool = False,
 ) -> RawDenoiser:
     """Ablation: match teacher Euler samples with a composite loss (old recipe)."""
     tensors = [(to_tensor(n), to_tensor(c[..., :4] if c.shape[-1] > 4 else c))
@@ -613,11 +765,16 @@ def _train_regression_match(
         [1.0 / max(float(n[..., :4].mean()), 1e-3) for n, _ in pairs],
         dtype=torch.float32)
     wts = (wts / wts.mean()).clamp(0.25, 8.0)
+    use_gain = bool(gain_channel) and pair_gains is not None
 
     if sample_loss is None:
         sample_loss, sample_loss_name = _make_sample_loss()
-    print(f"Distill loss: {sample_loss_name} vs teacher samples "
-          "(regression_match ablation)", flush=True)
+    print(
+        f"Distill loss: {sample_loss_name} vs teacher samples "
+        "(regression_match ablation)"
+        + ("  [gain channel]" if use_gain else ""),
+        flush=True,
+    )
 
     opt = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-4)
     warmup = max(1, steps // 20)
@@ -639,10 +796,19 @@ def _train_regression_match(
     skipped = 0
 
     for i in range(steps):
-        cond, clean = _sample_cond_clean(tensors, crop, batch, g, wts)
-        cond, clean = cond.to(device), clean.to(device)
+        if use_gain:
+            cond, clean, gain = _sample_cond_clean(
+                tensors, crop, batch, g, wts, pair_gains)
+            # Teacher sees stream-only cond; student gets gain channel appended.
+            stream = cond.to(device)
+            clean = clean.to(device)
+            cond, _ = _prep_student_cond(stream, gain.to(device), gain_channel=True)
+        else:
+            cond, clean = _sample_cond_clean(tensors, crop, batch, g, wts)
+            cond, clean = cond.to(device), clean.to(device)
+            stream = cond
         with torch.no_grad():
-            target = euler_sample(teacher, cond, steps=teacher_steps)
+            target = euler_sample(teacher, stream, steps=teacher_steps)
         opt.zero_grad(set_to_none=True)
         pred = student(cond)
         loss = sample_loss(pred, target)
@@ -661,8 +827,11 @@ def _train_regression_match(
                   f"{(time.time()-t0)/max(i,1):.2f}s/it", flush=True)
         if panel_every > 0 and ((i + 1) % panel_every == 0 or i == steps - 1):
             panel_ev = next((e for e in evals if e.get("gain", 0) >= 256), evals[0])
-            pout, gr = _save_eval_panel(student, panel_ev, device, panel_dir, i + 1)
-            probe, probe_gr = _quick_probe(student, evals[:6], device)
+            pout, gr = _save_eval_panel(
+                student, panel_ev, device, panel_dir, i + 1,
+                gain_channel=gain_channel)
+            probe, probe_gr = _quick_probe(
+                student, evals[:6], device, gain_channel=gain_channel)
             print(f"  probe mean PSNR={probe:.2f} dB  grad_ratio={probe_gr:.3f}",
                   flush=True)
             # grad_ratio → 1.0 scores 20; blur or residual noise both penalised
@@ -681,6 +850,7 @@ def _train_regression_match(
                         "panel_psnr": pout,
                         "probe_psnr": probe,
                         "probe_grad_ratio": probe_gr,
+                        "gain_channel": bool(gain_channel),
                     }, best_path)
                 print(f"  ★ best@{i+1}: panel={pout:.2f} probe={probe:.2f} "
                       f"grad_r={probe_gr:.3f} score={best_score:.2f}", flush=True)
@@ -739,6 +909,35 @@ def _save_eval_panel(
         latest.symlink_to(path.name)
     except OSError:
         shutil.copy2(path, latest)
+    # Pred|GT zoom crops for visual sharpness checks (not score-only).
+    try:
+        crop_dir = panel_dir / "crops"
+        crop_dir.mkdir(parents=True, exist_ok=True)
+        h, w = or_.shape[:2]
+        rois = {
+            "siemens": (int(h * 0.28), int(w * 0.18), int(h * 0.22), int(w * 0.22)),
+            "paper": (int(h * 0.72), int(w * 0.35), int(h * 0.18), int(w * 0.28)),
+            "yarn": (int(h * 0.42), int(w * 0.48), int(h * 0.18), int(w * 0.18)),
+        }
+        for name, (y0, x0, ch, cw) in rois.items():
+            y0 = max(0, min(y0, h - ch))
+            x0 = max(0, min(x0, w - cw))
+            pair = np.concatenate(
+                [or_[y0:y0 + ch, x0:x0 + cw], gr[y0:y0 + ch, x0:x0 + cw]],
+                axis=1,
+            )
+            pair_u8 = (np.clip(pair, 0, 1) * 255 + 0.5).astype(np.uint8)
+            cpath = crop_dir / f"step_{step:05d}_{name}_pred_gt.png"
+            Image.fromarray(pair_u8).save(cpath)
+            latest_c = crop_dir / f"latest_{name}_pred_gt.png"
+            try:
+                if latest_c.exists() or latest_c.is_symlink():
+                    latest_c.unlink()
+                latest_c.symlink_to(cpath.name)
+            except OSError:
+                shutil.copy2(cpath, latest_c)
+    except Exception as exc:  # noqa: BLE001 — crops are best-effort
+        print(f"  WARN: visual crops failed ({exc})", flush=True)
     print(f"  panel step {step}: {ev['scene']}/ag{ev['gain']} "
           f"frame {idx}  {pin:.1f}→{pout:.1f} dB  grad_r={g_ratio:.3f}  "
           f"(1-step student)", flush=True)
@@ -805,6 +1004,12 @@ def main() -> int:
         help="consistency = CFM-CD 1-step (default); "
              "regression_match = old L1-to-teacher-samples ablation",
     )
+    ap.add_argument(
+        "--student-arch", choices=("naf", "lite"), default="naf",
+        help="naf = ConsistencyStudent/_NAFBlock (default, SCA+GAP); "
+             "lite = LiteDenoiseNet-style 3x3/ReLU/stride/nearest "
+             "(Hailo-friendly; see docs/hailo_student_op_checklist.md)",
+    )
     ap.add_argument("--teacher-steps", type=int, default=16,
                     help="Euler steps for regression_match targets / "
                          "consistency integrate budget")
@@ -834,11 +1039,19 @@ def main() -> int:
         help="high-pass L1 of deploy boundary vs GT (structure/texture, not grain)",
     )
     ap.add_argument(
+        "--gt-lowfreq-weight", type=float, default=0.0,
+        help="multi-scale low-freq L1 vs GT — kills flat-region blotch / colour "
+             "drift the eye sees but L1 misses (try 0.5–2.0; regression path)",
+    )
+    ap.add_argument(
         "--sample-loss",
-        choices=("l1", "l2", "mse", "inv_luma", "l1_hf", "l1_grad", "l1_lpips"),
+        choices=(
+            "l1", "l2", "mse", "inv_luma", "l1_hf", "l1_grad",
+            "l1_lpips", "l1_lpips05",
+        ),
         default="l1",
-        help="teacher-endpoint match: l1 (default), l1_lpips, l1_hf, "
-             "l1_grad, l2/mse, or inv_luma",
+        help="teacher-endpoint match: l1 (default), l1_lpips, l1_lpips05 "
+             "(softer LPIPS), l1_hf, l1_grad, l2/mse, or inv_luma",
     )
     ap.add_argument(
         "--dump-dir", type=Path, default=None,
@@ -850,6 +1063,15 @@ def main() -> int:
         "--restore-best", action="store_true",
         help="Ship the mid-train best (PSNR+grad_ratio≈1 score) instead of "
              "final weights — use with l1_grad / texture runs",
+    )
+    ap.add_argument(
+        "--early-abort-soft", action="store_true",
+        help="Dump distill: stop early if best peaks by step 100 and probe "
+             "grad_ratio softens (<0.97) for 2 panels — skip likely rejects",
+    )
+    ap.add_argument(
+        "--early-abort-after", type=int, default=200,
+        help="Min steps before --early-abort-soft can fire (default 200)",
     )
     ap.add_argument(
         "--init-student", type=Path, default=None,
@@ -873,13 +1095,28 @@ def main() -> int:
     if args.dump_dir is not None and not args.dump_dir.is_dir():
         print(f"Dump directory missing: {args.dump_dir}", file=sys.stderr)
         return 1
-    if args.dump_dir is not None and args.method != "regression_match":
-        print("WARN: --dump-dir requires regression_match; switching method",
+    # dump-dir + consistency is OK when a live teacher is present (synth_pairs
+    # become (noisy, gt) crops; teacher still runs the ODE for CFM-CD).
+    # dump-only / no teacher still forces regression_match (offline targets).
+    if (
+        args.dump_dir is not None
+        and args.method != "regression_match"
+        and not args.teacher.is_file()
+    ):
+        print("WARN: --dump-dir without --teacher forces regression_match",
               flush=True)
         args.method = "regression_match"
 
     if args.dump_dir is None and not args.teacher.is_file():
         print(f"Teacher checkpoint missing: {args.teacher}", file=sys.stderr)
+        return 1
+    if (
+        args.method == "consistency"
+        and args.dump_dir is not None
+        and not args.teacher.is_file()
+    ):
+        print("consistency + --dump-dir requires a live --teacher",
+              file=sys.stderr)
         return 1
 
     scenes = tuple(s.strip() for s in args.scenes.split(",") if s.strip())
@@ -906,7 +1143,13 @@ def main() -> int:
     teacher = None
     tblob: dict = {}
     teacher_gain = False
-    if args.dump_dir is None:
+    tmeta: dict = {}
+    # Load live teacher for consistency (and for regression_match when no dumps).
+    need_teacher = (
+        args.method == "consistency"
+        or (args.dump_dir is None and args.method == "regression_match")
+    )
+    if need_teacher and args.teacher.is_file():
         teacher, tblob = _load_teacher(args.teacher, dev)
         tmeta = tblob.get("model", {})
         teacher_gain = bool(tmeta.get("gain_film", tblob.get("gain_film", False)))
@@ -916,28 +1159,76 @@ def main() -> int:
         print(f"Teacher: {args.teacher}  "
               f"({tmeta.get('base_channels')}ch×{tmeta.get('block_depth')})"
               + ("  [gain FiLM]" if teacher_gain else ""), flush=True)
-    else:
-        tmeta = {}
-        print(f"Stage A: offline dumps at {args.dump_dir}", flush=True)
+    if args.dump_dir is not None:
+        print(f"Stage A: offline dumps at {args.dump_dir}"
+              + ("  (+ live teacher CFM-CD)" if teacher is not None else ""),
+              flush=True)
 
-    gain_channel = (
-        False if args.no_gain_channel
-        else (args.gain_channel or teacher_gain)
-    )
+    # Prefer explicit flags; else match --init-student I/O; else teacher FiLM.
+    gain_channel = False if args.no_gain_channel else bool(args.gain_channel)
+    if not args.no_gain_channel and not args.gain_channel and args.init_student is not None:
+        try:
+            iblob = torch.load(args.init_student, map_location="cpu",
+                               weights_only=False)
+            istate = iblob.get("state_dict", iblob)
+            if any(k.startswith("student.") for k in istate):
+                istate = {k[len("student."):]: v for k, v in istate.items()
+                          if k.startswith("student.")}
+            hw = istate.get("head.weight")
+            if hw is not None and getattr(hw, "ndim", 0) == 4:
+                init_in = int(hw.shape[1])
+                if init_in == stream_ch + 1:
+                    gain_channel = True
+                elif init_in == stream_ch:
+                    gain_channel = False
+                else:
+                    print(f"WARN: init head in_ch={init_in} vs stream_ch={stream_ch}; "
+                          f"falling back to teacher gain_film={teacher_gain}",
+                          flush=True)
+                    gain_channel = bool(teacher_gain)
+            elif "gain_channel" in iblob:
+                gain_channel = bool(iblob["gain_channel"])
+            else:
+                gain_channel = bool(teacher_gain)
+        except Exception as exc:  # noqa: BLE001 — warm-start is best-effort
+            print(f"WARN: could not probe --init-student for gain_channel ({exc}); "
+                  f"using teacher gain_film={teacher_gain}", flush=True)
+            gain_channel = bool(teacher_gain)
+    elif not args.no_gain_channel and not args.gain_channel:
+        gain_channel = bool(teacher_gain)
     in_ch = stream_ch + (1 if gain_channel else 0)
 
+    dump_pair_gains: list[int] | None = None
     if args.pack_dir is not None:
         pairs, evals, meta = load_cloud_pack(args.pack_dir)
+        pair_gains = meta.get("pair_gains")
+    elif args.dump_dir is not None and args.method == "consistency":
+        # Live CFM-CD on synth_pairs / dump shards (same loader as teacher).
+        pairs, evals, pair_gains, meta = _load_dump_pairs(args.dump_dir)
+        meta = {**meta, "pair_gains": pair_gains}
+    elif args.dump_dir is not None and args.method == "regression_match":
+        # Train on dump/synth shards; build real-burst holdouts for panels/eval.
+        pairs, evals, meta = build_pairs(
+            args.bursts, scenes, gains,
+            gt_frames=gt_frames, stride=args.stride,
+            holdout_start=args.holdout_start, temporal=temporal,
+            gt_mode=args.gt_mode, gt_cache_root=args.gt_cache)
+        pair_gains = meta.get("pair_gains")
+        # Placeholder count — real dump size printed when tensors load.
+        if not pairs and not evals:
+            print("No eval pairs from bursts — panels will be limited",
+                  flush=True)
     else:
         pairs, evals, meta = build_pairs(
             args.bursts, scenes, gains,
             gt_frames=gt_frames, stride=args.stride,
             holdout_start=args.holdout_start, temporal=temporal,
             gt_mode=args.gt_mode, gt_cache_root=args.gt_cache)
-    if not pairs:
-        print("No training pairs — check bursts/ or --pack-dir", file=sys.stderr)
+        pair_gains = meta.get("pair_gains")
+    if not pairs and args.dump_dir is None:
+        print("No training pairs — check bursts/, --pack-dir, or --dump-dir",
+              file=sys.stderr)
         return 1
-    pair_gains = meta.get("pair_gains")
     print(f"Total train pairs: {len(pairs)}  in_ch={in_ch}"
           + (" (4T+gain)" if gain_channel else ""), flush=True)
 
@@ -950,10 +1241,11 @@ def main() -> int:
             print("consistency method requires --teacher (not dump-only)",
                   file=sys.stderr)
             return 1
-        student = ConsistencyStudent(
+        student = build_cfm_student(
+            args.student_arch,
             cond_ch=in_ch, out_ch=out_ch,
             base_channels=args.channels, block_depth=args.depth,
-            gain_channel=gain_channel)
+            gain_channel=gain_channel, consistency=True)
         if args.init_student is not None:
             if not args.init_student.is_file():
                 print(f"Missing --init-student {args.init_student}",
@@ -970,8 +1262,10 @@ def main() -> int:
                   f"(missing={len(missing)} unexpected={len(unexpected)})",
                   flush=True)
         n_params = sum(p.numel() for p in student.parameters())
-        print(f"Student ConsistencyStudent {in_ch}→{out_ch}  {n_params:,} params  "
-              f"({args.channels}ch × {args.depth})  boundary x0=noisy,t=0"
+        arch_name = type(student).__name__
+        print(f"Student {arch_name} [{args.student_arch}] {in_ch}→{out_ch}  "
+              f"{n_params:,} params  ({args.channels}ch × {args.depth})  "
+              f"boundary x0=noisy,t=0"
               + ("  [gain channel FiLM]" if gain_channel else ""),
               flush=True)
         student = _train_consistency(
@@ -988,30 +1282,67 @@ def main() -> int:
             gt_grad_weight=float(args.gt_grad_weight),
             gt_grad_energy_weight=float(args.gt_grad_energy_weight),
             gt_hf_weight=float(args.gt_hf_weight))
-        deploy = BoundaryConsistencyWrapper(student).to(dev).eval()
-        family = "cfm_consistency_1step"
+        deploy = wrap_deploy(student).to(dev).eval()
+        family = (
+            "cfm_lite_consistency_1step" if args.student_arch == "lite"
+            else "cfm_consistency_1step"
+        )
     else:
-        if gain_channel:
-            print("WARN: --gain-channel ignored for regression_match "
-                  "(RawDenoiser); use consistency method", flush=True)
-            gain_channel = False
-            in_ch = stream_ch
-        student = RawDenoiser(
-            base_channels=args.channels, block_depth=args.depth,
-            in_ch=in_ch, out_ch=out_ch)
+        if args.student_arch == "lite":
+            student = LiteCfmStudent(
+                cond_ch=in_ch, out_ch=out_ch,
+                base_channels=args.channels,
+                gain_channel=gain_channel)
+        else:
+            student = RawDenoiser(
+                base_channels=args.channels, block_depth=args.depth,
+                in_ch=in_ch, out_ch=out_ch)
+            # Deploy / eval helpers look for this flag (RawDenoiser has no FiLM).
+            student.gain_channel = bool(gain_channel)  # type: ignore[attr-defined]
+            student.stream_ch = stream_ch  # type: ignore[attr-defined]
+        if args.init_student is not None:
+            if not args.init_student.is_file():
+                print(f"Missing --init-student {args.init_student}",
+                      file=sys.stderr)
+                return 1
+            iblob = torch.load(args.init_student, map_location=dev,
+                               weights_only=False)
+            istate = iblob["state_dict"] if isinstance(iblob, dict) and "state_dict" in iblob else iblob
+            if any(k.startswith("student.") for k in istate):
+                istate = {k[len("student."):]: v for k, v in istate.items()
+                          if k.startswith("student.")}
+            # Drop CFM-only keys; expand head when adding gain channel.
+            istate = _warm_start_expand_head(student, istate)
+            missing, unexpected = student.load_state_dict(istate, strict=False)
+            print(f"Warm-start RawDenoiser from {args.init_student} "
+                  f"(missing={len(missing)} unexpected={len(unexpected)})",
+                  flush=True)
         n_params = sum(p.numel() for p in student.parameters())
-        print(f"Student RawDenoiser {in_ch}→{out_ch}  {n_params:,} params  "
-              f"({args.channels}ch × {args.depth})", flush=True)
+        print(f"Student {type(student).__name__} [{args.student_arch}] "
+              f"{in_ch}→{out_ch}  {n_params:,} params  "
+              f"({args.channels}ch × {args.depth})"
+              + ("  [gain channel]" if gain_channel else ""), flush=True)
         if args.dump_dir is not None:
-            dump_tensors = _load_dump_tensors(args.dump_dir)
+            dump_tensors, dump_pair_gains = _load_dump_tensors(args.dump_dir)
             student = _train_regression_from_dumps(
                 student, dump_tensors, args.steps,
                 crop=args.crop, batch=args.batch, lr=args.lr, device=dev,
                 panel_every=args.panel_every, panel_dir=args.panel_dir,
                 evals=evals, sample_loss=sample_loss,
                 sample_loss_name=sample_loss_name,
-                best_path=args.out / "cfm_student_best.pt")
+                best_path=args.out / "cfm_student_best.pt",
+                early_abort_soft=bool(args.early_abort_soft),
+                early_abort_after=int(args.early_abort_after),
+                pair_gains=dump_pair_gains if gain_channel else None,
+                gain_channel=gain_channel,
+                gt_hf_weight=float(args.gt_hf_weight),
+                gt_grad_energy_weight=float(args.gt_grad_energy_weight),
+                gt_lowfreq_weight=float(args.gt_lowfreq_weight))
         else:
+            if teacher is None:
+                print("regression_match without --dump-dir needs --teacher",
+                      file=sys.stderr)
+                return 1
             student = _train_regression_match(
                 student, teacher, pairs, args.steps,
                 crop=args.crop, batch=args.batch, lr=args.lr, device=dev,
@@ -1019,9 +1350,14 @@ def main() -> int:
                 evals=evals,
                 teacher_steps=args.teacher_steps, gt_weight=args.gt_weight,
                 sample_loss=sample_loss, sample_loss_name=sample_loss_name,
-                best_path=args.out / "cfm_student_best.pt")
+                best_path=args.out / "cfm_student_best.pt",
+                pair_gains=pair_gains if gain_channel else None,
+                gain_channel=gain_channel)
         deploy = student
-        family = "raw_denoiser_stream"
+        family = (
+            "cfm_lite_student" if args.student_arch == "lite"
+            else "raw_denoiser_stream"
+        )
 
     rows = evaluate(deploy, evals, dev, gain_channel=gain_channel)
     mean_in = float(np.mean([r["psnr_in"] for r in rows]))
@@ -1041,6 +1377,7 @@ def main() -> int:
         "state_dict": state,
         "model": {
             "family": family,
+            "student_arch": args.student_arch,
             "base_channels": args.channels,
             "block_depth": args.depth,
             "in_ch": in_ch,

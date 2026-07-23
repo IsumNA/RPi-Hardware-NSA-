@@ -83,7 +83,21 @@ def packed_to_rgb(packed: np.ndarray, gain: float = 1.0) -> np.ndarray:
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _bayer_cv_code(raw_format: str | None = None) -> int:
+def rb_swap_rgb(rgb: np.ndarray) -> np.ndarray:
+    """Swap R↔B channels (OpenCV Bayer name quirk ↔ physical RGB).
+
+    U-NAFNet / Hailo RGB HEFs were trained and calibrated in the legacy
+    OpenCV R/B-swapped domain. Convert physical RGB → model domain (and
+    model output → display) with this helper so left/right panes stay matched.
+    """
+    out = np.asarray(rgb, dtype=np.float32).copy()
+    if out.ndim != 3 or out.shape[-1] < 3:
+        return out
+    out[..., 0], out[..., 2] = out[..., 2].copy(), out[..., 0].copy()
+    return out
+
+
+def _bayer_cv_code(raw_format: str | None = None, *, legacy_opencv_bayer: bool = False) -> int:
     """Map a libcamera/FourCC Bayer name to ``cv2.COLOR_BAYER_*2RGB``."""
     import cv2
 
@@ -92,7 +106,9 @@ def _bayer_cv_code(raw_format: str | None = None) -> int:
     for suf in ("_CSI2P", "_PISP", "16", "14", "12", "10", "8"):
         if fmt.endswith(suf):
             fmt = fmt[: -len(suf)]
-    return {
+    # Physical CFA → OpenCV code. Legacy path swaps RG↔BG (and GR↔GB) to
+    # reproduce the historical OpenCV R/B name quirk used in U-NAFNet calib.
+    table = {
         "SRGGB": cv2.COLOR_BAYER_RG2RGB,
         "RGGB": cv2.COLOR_BAYER_RG2RGB,
         "SBGGR": cv2.COLOR_BAYER_BG2RGB,
@@ -101,7 +117,19 @@ def _bayer_cv_code(raw_format: str | None = None) -> int:
         "GRBG": cv2.COLOR_BAYER_GR2RGB,
         "SGBRG": cv2.COLOR_BAYER_GB2RGB,
         "GBRG": cv2.COLOR_BAYER_GB2RGB,
-    }.get(fmt, cv2.COLOR_BAYER_RG2RGB)
+    }
+    if legacy_opencv_bayer:
+        table = {
+            "SRGGB": cv2.COLOR_BAYER_BG2RGB,
+            "RGGB": cv2.COLOR_BAYER_BG2RGB,
+            "SBGGR": cv2.COLOR_BAYER_RG2RGB,
+            "BGGR": cv2.COLOR_BAYER_RG2RGB,
+            "SGRBG": cv2.COLOR_BAYER_GB2RGB,
+            "GRBG": cv2.COLOR_BAYER_GB2RGB,
+            "SGBRG": cv2.COLOR_BAYER_GR2RGB,
+            "GBRG": cv2.COLOR_BAYER_GR2RGB,
+        }
+    return table.get(fmt, cv2.COLOR_BAYER_BG2RGB if legacy_opencv_bayer else cv2.COLOR_BAYER_RG2RGB)
 
 
 def packed_to_rgb_demosaic(
@@ -109,18 +137,21 @@ def packed_to_rgb_demosaic(
     gain: float = 1.0,
     *,
     raw_format: str | None = None,
+    legacy_opencv_bayer: bool = False,
 ) -> np.ndarray:
     """Full-res linear RGB via OpenCV Bayer demosaic.
 
     Matches the NAFNet / U-NAFNet RGB training path (``nsa.raw_io`` DNG loader).
     Use this for RGB-domain live inference — not :func:`packed_to_rgb`.
     ``raw_format`` should be the camera CFA string (e.g. ``SRGGB16``).
+    Set ``legacy_opencv_bayer=True`` to demosaic directly into the historical
+    R/B-swapped training domain (equivalent to demosaic + :func:`rb_swap_rgb`).
     """
     import cv2
 
     bayer = unpack_raw(np.asarray(packed, dtype=np.float32))
     b16 = (np.clip(bayer, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
-    code = _bayer_cv_code(raw_format)
+    code = _bayer_cv_code(raw_format, legacy_opencv_bayer=legacy_opencv_bayer)
     rgb = cv2.cvtColor(b16, code).astype(np.float32) / 65535.0
     if gain != 1.0:
         rgb = rgb * float(gain)

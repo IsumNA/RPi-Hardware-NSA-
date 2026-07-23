@@ -3,8 +3,8 @@
 The pipeline builds ``(noisy, clean)`` pairs in the packed-Bayer float domain
 that ``train_stream_to_gt.py`` consumes directly, no lossy PNG round-trip:
 
-* ``noise.py``   — noise formation (Poisson shot + Gaussian read + row) with
-  per-channel system gain ``K`` and per-gain parameters.
+* ``noise.py``   — noise formation (Poisson shot + Gaussian read + row +
+  dark-FPN LP residual + soft LF chroma) with per-channel ``K``.
 * ``fit.py``     — per-gain, per-channel PTC fit **with intercept** from real
   data (flat pairs where available, burst pairs elsewhere).
 * ``sources.py`` — clean-image sources: burst-averaged own scenes, unprocessed

@@ -95,6 +95,136 @@ def _sample_cond_clean(tensors, crop, batch, g, weights, pair_gains=None):
     return cond, clean, torch.tensor(gs, dtype=torch.float32)
 
 
+def _load_dump_pairs(
+    dump_root: Path,
+    *,
+    max_pairs: int | None = None,
+    n_eval: int = 12,
+) -> tuple[
+    list[tuple[np.ndarray, np.ndarray]],
+    list[dict],
+    list[int],
+    dict,
+]:
+    """Load packed (noisy, gt) pairs from a synth_pairs / dump index.
+
+    Accepts shard keys ``noisy``/``gt`` (synth_pairs_hcg) or ``cond``/``teacher``.
+    Returns (pairs, evals, pair_gains, meta) in the same shape as ``build_pairs``.
+    """
+    idx_path = dump_root / "index.json"
+    if not idx_path.is_file():
+        raise FileNotFoundError(f"Missing dump index: {idx_path}")
+    index = json.loads(idx_path.read_text())
+    samples = list(index.get("samples") or [])
+    if not samples:
+        raise RuntimeError(f"No samples in {idx_path}")
+    if max_pairs is not None and max_pairs > 0:
+        samples = samples[: int(max_pairs)]
+
+    pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    pair_gains: list[int] = []
+    kept_recs: list[dict] = []
+    temporal = int(index.get("temporal") or 1)
+    t0 = time.time()
+    skipped_missing = 0
+    for i, rec in enumerate(samples):
+        rel = rec.get("file") or rec.get("path")
+        if not rel:
+            continue
+        path = dump_root / rel
+        if not path.is_file():
+            skipped_missing += 1
+            continue
+        blob = np.load(path)
+        keys = set(blob.files)
+        if "noisy" in keys and "gt" in keys:
+            noisy = np.asarray(blob["noisy"], dtype=np.float32)
+            gt = np.asarray(blob["gt"], dtype=np.float32)
+        elif "cond" in keys and "teacher" in keys:
+            noisy = np.asarray(blob["cond"], dtype=np.float32)
+            gt = np.asarray(blob["teacher"], dtype=np.float32)
+        else:
+            raise ValueError(
+                f"Unsupported npz keys in {path}: {sorted(keys)} "
+                f"(need noisy/gt or cond/teacher)")
+        if noisy.ndim == 4:
+            noisy = noisy.squeeze(0).transpose(1, 2, 0)
+        if gt.ndim == 4:
+            gt = gt.squeeze(0).transpose(1, 2, 0)
+        if gt.shape[-1] > 4:
+            gt = gt[..., :4]
+        pairs.append((noisy, gt))
+        kept_recs.append(rec)
+        gain = rec.get("gain")
+        if gain is None and "gain" in keys:
+            gain = int(blob["gain"])
+        pair_gains.append(int(gain) if gain is not None else 128)
+        if temporal == 1 and noisy.shape[-1] >= 4:
+            temporal = max(1, noisy.shape[-1] // 4)
+        if len(pairs) % 2000 == 0 or (i + 1) == len(samples):
+            print(f"  loaded {len(pairs)}/{len(samples)} dump pairs "
+                  f"(missing={skipped_missing}, {time.time() - t0:.1f}s)",
+                  flush=True)
+    if skipped_missing:
+        print(f"WARN: skipped {skipped_missing} missing shard files under "
+              f"{dump_root}", flush=True)
+    if not pairs:
+        raise RuntimeError(f"No loadable pairs under {dump_root}")
+    samples = kept_recs
+
+    # Stratified holdouts for panels: prefer HCG@512 / dark when tagged.
+    evals: list[dict] = []
+    want = [
+        ("imx662h", 512), ("imx662h", 256), ("imx662h", 128),
+        ("imx662", 512), ("imx662", 256), ("imx662", 128),
+    ]
+    used: set[int] = set()
+    for sensor, gain in want:
+        if len(evals) >= n_eval:
+            break
+        for i, rec in enumerate(samples):
+            if i in used:
+                continue
+            if rec.get("sensor") == sensor and int(rec.get("gain", -1)) == gain:
+                noisy, gt = pairs[i]
+                evals.append({
+                    "scene": f"dump_{sensor}_ag{gain}",
+                    "gain": gain,
+                    "gt": gt,
+                    "noisy": [(0, noisy)],
+                })
+                used.add(i)
+                break
+    if len(evals) < n_eval:
+        step = max(1, len(pairs) // n_eval)
+        for i in range(0, len(pairs), step):
+            if i in used:
+                continue
+            noisy, gt = pairs[i]
+            g = pair_gains[i]
+            evals.append({
+                "scene": f"dump_ag{g}",
+                "gain": g,
+                "gt": gt,
+                "noisy": [(0, noisy)],
+            })
+            used.add(i)
+            if len(evals) >= n_eval:
+                break
+
+    meta = {
+        "dump_dir": str(dump_root),
+        "schema": index.get("schema"),
+        "total_pairs": len(pairs),
+        "temporal": temporal,
+        "pair_gains": pair_gains,
+        "gt_mode": "dump",
+    }
+    print(f"Dump {dump_root}: {len(pairs)} pairs  temporal={temporal}  "
+          f"evals={len(evals)}", flush=True)
+    return pairs, evals, pair_gains, meta
+
+
 def measure_sigmas(
     pairs: list[tuple[np.ndarray, np.ndarray]],
     *,
@@ -361,6 +491,15 @@ def main() -> int:
     ap.add_argument("--init", type=Path, default=None,
                     help="Warm-start from an existing teacher checkpoint "
                          "(strict=False so new gain_mlp layers init to identity)")
+    ap.add_argument(
+        "--dump-dir", type=Path, default=None,
+        help="Train on packed dump / synth_pairs shards (index.json + "
+             "noisy/gt or cond/teacher). Skips real-burst build_pairs.",
+    )
+    ap.add_argument(
+        "--max-pairs", type=int, default=0,
+        help="Optional cap on dump pairs (0 = all). Ignored without --dump-dir.",
+    )
     args = ap.parse_args()
 
     scenes = tuple(s.strip() for s in args.scenes.split(",") if s.strip())
@@ -369,25 +508,44 @@ def main() -> int:
     gt_frames = int(args.gt_frames)
     if args.gt_mode == "alpha_trim" and gt_frames == 512:
         gt_frames = 16
-    cond_ch = 4 * temporal
     out_ch = 4
     dev = _device()
-    print(f"Device {dev}  recipe: CFM Teacher  noisy→GT | STREAM×{temporal}"
-          + ("  [gain FiLM]" if args.gain_film else ""),
-          flush=True)
-    print(f"Scenes {scenes}  gains {gains}  Euler steps={args.sample_steps}",
-          flush=True)
 
-    pairs, evals, meta = build_pairs(
-        args.bursts, scenes, gains,
-        gt_frames=gt_frames, stride=args.stride,
-        holdout_start=args.holdout_start, temporal=temporal,
-        gt_mode=args.gt_mode, gt_cache_root=args.gt_cache)
+    if args.dump_dir is not None:
+        if not args.dump_dir.is_dir():
+            print(f"Dump directory missing: {args.dump_dir}", file=sys.stderr)
+            return 1
+        print(f"Device {dev}  recipe: CFM Teacher  noisy→GT | DUMP "
+              f"{args.dump_dir}"
+              + ("  [gain FiLM]" if args.gain_film else "")
+              + ("  [EDM]" if args.edm else ""),
+              flush=True)
+        pairs, evals, pair_gains, meta = _load_dump_pairs(
+            args.dump_dir,
+            max_pairs=(args.max_pairs or None),
+        )
+        temporal = max(1, int(meta.get("temporal") or temporal))
+        # Override CLI temporal to match dump channel layout.
+        args.temporal = temporal
+    else:
+        print(f"Device {dev}  recipe: CFM Teacher  noisy→GT | STREAM×{temporal}"
+              + ("  [gain FiLM]" if args.gain_film else ""),
+              flush=True)
+        print(f"Scenes {scenes}  gains {gains}  Euler steps={args.sample_steps}",
+              flush=True)
+        pairs, evals, meta = build_pairs(
+            args.bursts, scenes, gains,
+            gt_frames=gt_frames, stride=args.stride,
+            holdout_start=args.holdout_start, temporal=temporal,
+            gt_mode=args.gt_mode, gt_cache_root=args.gt_cache)
+        pair_gains = meta.get("pair_gains")
+
     if not pairs:
-        print("No training pairs — check bursts/", file=sys.stderr)
+        print("No training pairs — check bursts/ or --dump-dir", file=sys.stderr)
         return 1
-    pair_gains = meta.get("pair_gains")
-    print(f"Total train pairs: {len(pairs)}  cond_ch={cond_ch}", flush=True)
+    cond_ch = 4 * temporal
+    print(f"Total train pairs: {len(pairs)}  cond_ch={cond_ch}  "
+          f"Euler steps={args.sample_steps}", flush=True)
 
     sigma_data = sigma_flow = None
     if args.edm:
