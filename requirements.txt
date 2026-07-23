@@ -13,6 +13,10 @@ rich>=13.0
 torch>=2.2
 onnx>=1.15
 
+# torch's ONNX exporter (torch>=2.6 default dynamo path) requires onnxscript to
+# translate the graph. Without it the Level 6 exported_model.onnx step is skipped.
+onnxscript>=0.7
+
 # Perceptual quality metrics reported alongside PSNR (SSIM is built-in; LPIPS
 # uses a pretrained AlexNet and downloads ~233 MB of weights on first use).
 # LPIPS penalises the over-smoothing/blur that PSNR happily rewards.
